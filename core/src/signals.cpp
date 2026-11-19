@@ -7,8 +7,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "zb/log.h"
 #include "zb/process.h"
@@ -170,6 +172,11 @@ bool Process::dispatch_pending_signals(GuestThread& thread) {
             return false;
         }
     }
+    if (thread.saved_sigmask.has_value()) {
+        thread.sigmask = *thread.saved_sigmask;
+        thread.saved_sigmask.reset();
+    }
+    thread.syscall_restartable = false;
     return true;
 }
 
@@ -179,6 +186,11 @@ bool Process::deliver_fault(GuestThread& thread, const Stop& stop) {
         info.si_signo = SIGSEGV;
         info.si_code = mem_.accessible(stop.fault_addr, 1, 0) ? SEGV_ACCERR : SEGV_MAPERR;
         info.fields[0] = stop.fault_addr;
+    } else if (stop.exception == Dynarmic::A32::Exception::NoExecuteFault) {
+        info.si_signo = SIGSEGV;
+        info.si_code = mem_.accessible(stop.pc, 1, 0) ? SEGV_ACCERR : SEGV_MAPERR;
+        info.fields[0] = stop.pc;
+        thread.regs()[15] = stop.pc;
     } else {
         const bool breakpoint = stop.exception == Dynarmic::A32::Exception::Breakpoint;
         info.si_signo = breakpoint ? SIGTRAP : SIGILL;
@@ -186,7 +198,52 @@ bool Process::deliver_fault(GuestThread& thread, const Stop& stop) {
         info.fields[0] = stop.pc;
         thread.regs()[15] = stop.pc;
     }
+    note_fault_details(thread, info, stop);
     return deliver_signal(thread, info, true);
+}
+
+// A guest fault that reaches its own handler is invisible in the report, and the engine's own
+// dump text is usually unreachable without root. Recording the signal, the faulting address and
+// the symbolized call site (pc and lr) is what turns "black screen" into a named library offset.
+// Only the first fault is recorded: a guest that faults repeatedly in a handler loop must not
+// push the real first cause out of the report.
+void Process::note_fault_details(GuestThread& thread, const g::siginfo32& info, const Stop& stop) {
+    // One fault per signal number: a guest that faults repeatedly in its own handler must not push
+    // the first cause out, while SIGILL and SIGSEGV stay separately visible.
+    static std::atomic<bool> noted[65];
+    if (info.si_signo < 1 || info.si_signo > 64) return;
+    if (noted[info.si_signo].exchange(true)) return;
+    const std::string suffix = std::to_string(info.si_signo);
+    const auto addr_of = [this](std::uint32_t addr) { return describe_address(addr); };
+    const auto& regs = thread.regs();
+    char line[600];
+    std::snprintf(line, sizeof line, "code=%d fault=0x%08x pc=%s", info.si_code, stop.fault_addr,
+                  addr_of(regs[15]).c_str());
+    runtime_report().note_crash_detail("fault-" + suffix, line);
+    std::snprintf(line, sizeof line, "r14(lr)=%s", addr_of(regs[14]).c_str());
+    runtime_report().note_crash_detail("fault-lr-" + suffix, line);
+    std::snprintf(line, sizeof line, "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x "
+                                     "r6=0x%08x r7=0x%08x r12=0x%08x sp=0x%08x",
+                  regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[12],
+                  regs[13]);
+    runtime_report().note_crash_detail("fault-regs-" + suffix, line);
+    std::snprintf(line, sizeof line, "tid=%d thumb=%d", thread.tid, (thread.cpsr() & kCpsrThumb) != 0);
+    runtime_report().note_crash_detail("fault-thread-" + suffix, line);
+
+    // The bytes the faulting instruction read from (the signature of a guest that dereferences a
+    // string as a pointer: WS3 reads the package-name characters as if they were the first field of
+    // an object). Only the first fault is worth this detail, and only for pointers still mapped.
+    for (int index = 0; index < 8; ++index) {
+        const std::uint32_t value = regs[index];
+        const std::uint8_t* bytes = mem_.host_ptr(value, 32, kPageRead);
+        if (bytes == nullptr) continue;
+        std::uint32_t words[8];
+        std::memcpy(words, bytes, sizeof words);
+        std::snprintf(line, sizeof line, "r%d[%08x]=%08x %08x %08x %08x %08x %08x %08x %08x", index,
+                      value, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                      words[7]);
+        runtime_report().note_crash_detail("fault-memory-" + std::to_string(index), line);
+    }
 }
 
 bool Process::deliver_signal(GuestThread& thread, const g::siginfo32& info, bool forced) {
@@ -229,14 +286,22 @@ bool Process::deliver_signal(GuestThread& thread, const g::siginfo32& info, bool
         thread.syscall_restartable = false;
     }
     const g::stack32& alt = thread.altstack;
-    const bool alt_enabled = alt.ss_flags != kSsDisable && alt.ss_size != 0;
-    const bool on_altstack = alt_enabled && regs[13] - alt.ss_sp < alt.ss_size;
-    std::uint32_t frame_top = regs[13];
-    if ((act.flags & kSaOnstack) && alt_enabled && !on_altstack) frame_top = alt.ss_sp + alt.ss_size;
+    const bool alt_enabled = alt.ss_flags != kSsDisable && alt.ss_size != 0 &&
+                             static_cast<std::uint64_t>(alt.ss_sp) + alt.ss_size <= kGuestSpaceSize;
+    const bool on_altstack = alt_enabled && regs[13] >= alt.ss_sp && regs[13] - alt.ss_sp < alt.ss_size;
+    std::uint64_t frame_top = regs[13];
+    if ((act.flags & kSaOnstack) && alt_enabled && !on_altstack) {
+        frame_top = static_cast<std::uint64_t>(alt.ss_sp) + alt.ss_size;
+    }
 
     const bool rt = (act.flags & kSaSiginfo) != 0;
     const std::uint32_t frame_size = rt ? sizeof(g::rt_sigframe32) : sizeof(g::sigframe32);
-    const std::uint32_t frame = (frame_top - frame_size) & ~7u;
+    if (frame_top < frame_size) {
+        log("cannot write the signal %d frame: stack pointer 0x%llx underflows", sig,
+            static_cast<unsigned long long>(frame_top));
+        return false;
+    }
+    const std::uint32_t frame = static_cast<std::uint32_t>((frame_top - frame_size) & ~7ULL);
 
     g::ucontext32 uc{};
     uc.uc_stack = alt;
@@ -277,8 +342,10 @@ bool Process::deliver_signal(GuestThread& thread, const g::siginfo32& info, bool
         regs[1] = frame;
         regs[2] = frame + sizeof(g::siginfo32);
     }
+    constexpr std::uint32_t kKuserSigreturn = 0xFFFF0F20u;
+    constexpr std::uint32_t kKuserRtSigreturn = 0xFFFF0F30u;
     regs[13] = frame;
-    regs[14] = (act.flags & kSaRestorer) ? act.restorer : 0;
+    regs[14] = (act.flags & kSaRestorer) ? act.restorer : (rt ? kKuserRtSigreturn : kKuserSigreturn);
     regs[15] = act.handler & ~1u;
     thread.set_cpsr((thread.cpsr() & ~(kCpsrThumb | kCpsrItMask | kCpsrEndian)) | ((act.handler & 1) ? kCpsrThumb : 0));
     return true;

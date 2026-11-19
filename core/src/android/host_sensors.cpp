@@ -108,7 +108,7 @@ bool HostSensors::handle_host_call(std::uint32_t index, GuestThread& thread) {
         regs[0] = 0;  // const char*: null, as for a sensor that is not there
         return true;
     case ZB_SENSOR_HC_ASensor_getType:
-        regs[0] = 0;  // ASENSOR_TYPE_INVALID
+        regs[0] = static_cast<std::uint32_t>(-1);  // ASENSOR_TYPE_INVALID
         return true;
     case ZB_SENSOR_HC_ASensor_getResolution:
         regs[0] = 0;  // 0.0f in AAPCS softfp

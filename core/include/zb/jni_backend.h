@@ -58,6 +58,10 @@ public:
     virtual Ref find_class(Env env, const char* name) = 0;
     virtual Ref get_superclass(Env env, Ref cls) = 0;
     virtual bool is_assignable_from(Env env, Ref from, Ref to) = 0;
+    // Returns true if `cls` is android/media/AudioManager (or a subclass).
+    virtual bool is_audio_manager_class(Env, Ref) { return false; }
+    // Filters Bluetooth/BLE audio devices out of an AudioDeviceInfo[] returned by AudioManager.
+    virtual Ref filter_bluetooth_audio_devices(Env, Ref devices) { return devices; }
     virtual Id get_method_id(Env env, Ref cls, const char* name, const char* signature, bool is_static) = 0;
     virtual Id get_field_id(Env env, Ref cls, const char* name, const char* signature, bool is_static) = 0;
     // signature receives a descriptor with the method's shorty (reference types may be erased).
@@ -83,6 +87,9 @@ public:
     virtual Ref get_object_class(Env env, Ref obj) = 0;
     virtual bool is_instance_of(Env env, Ref obj, Ref cls) = 0;
     virtual bool is_same_object(Env env, Ref a, Ref b) = 0;
+    // Diagnostics only: the binary name of the object's class ("android/os/Bundle"), for naming a
+    // null result by the receiver that answered it. Returns false when it cannot be learned.
+    virtual bool object_class_name(Env, Ref, std::string&) { return false; }
 
     // Calls and fields. call_method with NewObject returns the new object in `l`.
     virtual JValue call_method(Env env, JniCallKind kind, char type, Ref obj, Ref cls, Id method,

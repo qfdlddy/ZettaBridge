@@ -32,9 +32,14 @@ import java.util.List;
 final class PackageManagerHook implements InvocationHandler {
     private static final String TAG = "zb-launcher";
 
+    private static volatile Object installedProxy;
+
     private final Object real;
     private final String hostPackage;
     private final GuestRuntime runtime;
+    private final java.util.concurrent.atomic.AtomicInteger packageQueries =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final int MAX_LOGGED_PACKAGE_QUERIES = 12;
 
     private PackageManagerHook(Object real, String hostPackage, GuestRuntime runtime) {
         this.real = real;
@@ -52,14 +57,21 @@ final class PackageManagerHook implements InvocationHandler {
                     new PackageManagerHook(current, host.getPackageName(), runtime));
             Field field = Reflect.field(activityThread, "sPackageManager");
             field.set(null, proxy);
+            installedProxy = proxy;
             // ContextImpl caches an ApplicationPackageManager that holds the binder proxy directly.
             PackageManager pm = host.getPackageManager();
             Reflect.trySet(pm.getClass(), pm, "mPM", proxy);
             disableCaches();
-            Log.i(TAG, "package manager virtualization installed");
+            if (!BuildConfig.DISABLE_DIAGNOSTICS) Log.i(TAG, "package manager virtualization installed");
         } catch (ReflectiveOperationException | RuntimeException e) {
             Diagnostics.report(host, "cannot install package manager virtualization", e, false);
         }
+    }
+
+    /** Patch a package manager instance a plugin context hands out, so its binder is our proxy too. */
+    static void patch(PackageManager pm) {
+        Object proxy = installedProxy;
+        if (proxy != null && pm != null) Reflect.trySet(pm.getClass(), pm, "mPM", proxy);
     }
 
     /** Android 11+ caches application/package info per process; stale entries would bypass the hook. */
@@ -75,9 +87,23 @@ final class PackageManagerHook implements InvocationHandler {
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        final String name = method.getName();
+        if (!BuildConfig.DISABLE_DIAGNOSTICS && args != null && args.length > 0
+                && packageQueries.get() < MAX_LOGGED_PACKAGE_QUERIES
+                && ("getPackageInfo".equals(name) || "getApplicationInfo".equals(name)
+                        || "getInstallerPackageName".equals(name))) {
+            Log.i(TAG, "pm query " + name + " arg=" + args[0]
+                    + (args.length > 1 ? " flags=" + args[1] : ""));
+        }
         try {
             Object result = method.invoke(real, args);
-            return rewrite(method.getName(), args, result);
+            if (!BuildConfig.DISABLE_DIAGNOSTICS && args != null && args.length > 0
+                    && packageQueries.get() < MAX_LOGGED_PACKAGE_QUERIES
+                    && "getPackageInfo".equals(name) && result instanceof PackageInfo) {
+                PackageInfo pi = (PackageInfo) result;
+                Log.i(TAG, "pm answer pkg=" + pi.packageName + " versionCode=" + pi.getLongVersionCode());
+            }
+            return rewrite(name, args, result);
         } catch (InvocationTargetException e) {
             Object fallback = rewriteMissing(method.getName(), args);
             if (fallback != null) return fallback;
@@ -106,13 +132,28 @@ final class PackageManagerHook implements InvocationHandler {
                 return pluginActivityResolve(args[0]);
             }
             case "getApplicationInfo":
-                if (hostPackage.equals(args[0]) && result instanceof ApplicationInfo) {
+                if (args[0] instanceof String && result instanceof ApplicationInfo
+                        && (hostPackage.equals(args[0]) || isCurrentPluginPackage((String) args[0]))) {
                     return withPluginMetaData((ApplicationInfo) result);
                 }
                 return result;
             case "getPackageInfo":
-                if (args[0] instanceof String && hostPackage.equals(args[0]) && result instanceof PackageInfo) {
-                    return withPluginVersion((PackageInfo) result);
+                if (args[0] instanceof String && result instanceof PackageInfo
+                        && (hostPackage.equals(args[0]) || isCurrentPluginPackage((String) args[0]))) {
+                    PackageInfo rewritten = withPluginVersion((PackageInfo) result);
+                    notePackageQuery((String) args[0], rewritten);
+                    return rewritten;
+                }
+                return result;
+            case "getInstallerPackageName":
+                if (args[0] instanceof String
+                        && (hostPackage.equals(args[0]) || isCurrentPluginPackage((String) args[0]))) {
+                    if (!"com.android.vending".equals(result)) {
+                        if (!BuildConfig.DISABLE_DIAGNOSTICS) {
+                            Log.i(TAG, "pm installer spoofed for " + args[0] + " (" + result + ") -> com.android.vending");
+                        }
+                        return "com.android.vending";
+                    }
                 }
                 return result;
             default:
@@ -129,11 +170,41 @@ final class PackageManagerHook implements InvocationHandler {
             case "getReceiverInfo":
             case "getProviderInfo":
                 return pluginComponent(name, args[0]);
+            case "getPackageInfo": {
+                // The plugin package is not installed, so the real query throws. A guest asking
+                // about itself (Unity reads versionCode to build its OBB file name) must be
+                // answered from the parsed APK, or it gets null and builds a broken path.
+                if (!(args[0] instanceof String) || !isCurrentPluginPackage((String) args[0])) return null;
+                LoadedPlugin p = runtime.current();
+                if (p == null || p.info == null) return null;
+                PackageInfo copy = clonePackageInfo(p.info);
+                notePackageQuery((String) args[0], copy);
+                return copy;
+            }
+            case "getApplicationInfo": {
+                if (!(args[0] instanceof String) || !isCurrentPluginPackage((String) args[0])) return null;
+                LoadedPlugin p = runtime.current();
+                return p == null ? null : withPluginMetaData(p.appInfo);
+            }
+            case "getInstallerPackageName":
+                if (args[0] instanceof String && isCurrentPluginPackage((String) args[0])) {
+                    return "com.android.vending";
+                }
+                return null;
             default:
                 return null;
         }
     }
 
+    /** Bounded echo of what a plugin's own package query answered, so a device log proves it. */
+    private void notePackageQuery(String requested, PackageInfo answer) {
+        if (BuildConfig.DISABLE_DIAGNOSTICS) return;
+        int queries = packageQueries.incrementAndGet();
+        if (queries > MAX_LOGGED_PACKAGE_QUERIES) return;
+        Log.i(TAG, "package query " + queries + ": " + requested + " -> " + answer.packageName
+                + " versionCode=" + answer.getLongVersionCode()
+                + " versionName=" + answer.versionName);
+    }
     private Object pluginComponent(String method, Object arg) {
         if (!(arg instanceof ComponentName)) return null;
         ComponentName cn = (ComponentName) arg;
@@ -189,19 +260,42 @@ final class PackageManagerHook implements InvocationHandler {
         if (p == null) return hostInfo;
         ApplicationInfo copy = new ApplicationInfo(hostInfo);
         copy.metaData = p.appInfo.metaData;
+        copy.sourceDir = p.appInfo.sourceDir;
+        copy.publicSourceDir = p.appInfo.publicSourceDir;
+        copy.nativeLibraryDir = p.appInfo.nativeLibraryDir;
+        copy.dataDir = p.appInfo.dataDir;
         return copy;
+    }
+
+    private static PackageInfo clonePackageInfo(PackageInfo src) {
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        try {
+            src.writeToParcel(parcel, 0);
+            parcel.setDataPosition(0);
+            PackageInfo copy = PackageInfo.CREATOR.createFromParcel(parcel);
+            return copy != null ? copy : src;
+        } catch (RuntimeException e) {
+            return src;
+        } finally {
+            parcel.recycle();
+        }
     }
 
     private PackageInfo withPluginVersion(PackageInfo hostInfo) {
         LoadedPlugin p = runtime.current();
-        if (p == null) return hostInfo;
-        hostInfo.versionName = p.info.versionName;
+        if (p == null || p.info == null) return hostInfo;
+        // Clone before mutating so framework-cached PackageInfo instances are never altered in place.
+        PackageInfo copy = clonePackageInfo(hostInfo);
+        // The caller may be asking about the launcher package or about the plugin's own package;
+        // both must see the plugin's identity, or a guest reading its own versionCode gets 0.
+        copy.packageName = p.info.packageName;
+        copy.versionName = p.info.versionName;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            hostInfo.setLongVersionCode(p.info.getLongVersionCode());
+            copy.setLongVersionCode(p.info.getLongVersionCode());
         } else {
-            hostInfo.versionCode = p.info.versionCode;
+            copy.versionCode = p.info.versionCode;
         }
-        if (hostInfo.applicationInfo != null) hostInfo.applicationInfo = withPluginMetaData(hostInfo.applicationInfo);
-        return hostInfo;
+        if (copy.applicationInfo != null) copy.applicationInfo = withPluginMetaData(copy.applicationInfo);
+        return copy;
     }
 }

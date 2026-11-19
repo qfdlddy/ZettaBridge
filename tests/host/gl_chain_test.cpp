@@ -14,6 +14,7 @@
 #include "check.h"
 #include "mock_gles.h"
 #include "mock_jvm.h"
+#include "gl/gl_diagnostics.h"
 #include "zb/gl_hostcalls.h"
 #include "zb/host_gl.h"
 #include "zb/proxy_runtime.h"
@@ -66,6 +67,23 @@ int main(int argc, char** argv) {
     // A JNI-range index is not a GL call; HostGl declines it so the JNI half of the chain gets
     // a turn (mirrors what the lambda in the constructor does).
     CHECK(!engine->host_gl()->handle_host_call(0xFC00, thread));
+
+    // Presentation sample: the swap diagnostic reads the default framebuffer that the next
+    // eglSwapBuffers will show, so a black screen can be told apart from a black-framebuffer
+    // read. The report line appears at the scheduled swaps only. The sample needs the visibility
+    // diagnostics switched on and one diagnosed call to learn the backend: without them it
+    // records "no-gl-backend-seen-yet", which is a real device-mode answer, not this test's intent.
+    zb::enable_gl_diagnostics();
+    // A default context binds framebuffer 0, which is what the presentation sample must see; the
+    // mock answers driver queries only from values a test provides.
+    backend->set_integer(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, 0);
+    CHECK(engine->host_gl()->handle_host_call(zb::ZB_GL_HC_glClear, thread));
+    for (int swap = 0; swap < 20; ++swap) zb::gl_diagnose_swap();
+    const std::string report = zb::runtime_report().text();
+    const std::size_t present = report.find("gl-present-20: ");
+    CHECK(present != std::string::npos);
+    CHECK(report.find("gl-present-60: ") == std::string::npos);
+    CHECK(report.substr(present, 200).find("fb=0") != std::string::npos);
 
     zb::runtime_report().clear();
     std::puts("gl_chain_test with-backend PASS");

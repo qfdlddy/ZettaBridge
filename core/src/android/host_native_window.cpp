@@ -31,10 +31,38 @@ const void* HostNativeWindow::require_window(std::uint32_t handle) const {
 
 std::uint32_t HostNativeWindow::handle_for_window(const void* window) {
     if (window == nullptr) return 0;
+    // Acquire our own host reference so releasing the handle balances cleanly with Android.
+    backend_.acquire(const_cast<void*>(window));
     const std::uint32_t handle = windows_.add(from_pointer(window));
     std::lock_guard<std::mutex> lock(surfaces_mutex_);
     references_[handle] = 1;
     return handle;
+}
+
+void HostNativeWindow::release_window_handle(std::uint32_t handle) {
+    if (handle == 0) return;
+    bool last = false;
+    std::uint64_t surface_global = 0;
+    {
+        std::lock_guard<std::mutex> lock(surfaces_mutex_);
+        const auto reference = references_.find(handle);
+        if (reference == references_.end()) return;
+        last = --reference->second == 0;
+        if (last) {
+            references_.erase(reference);
+            const auto surf = surfaces_.find(handle);
+            if (surf != surfaces_.end()) {
+                surface_global = surf->second;
+                surfaces_.erase(surf);
+            }
+        }
+    }
+    const std::optional<std::uint64_t> value = last ? windows_.remove(handle) : windows_.get(handle);
+    if (value && *value != 0) backend_.release(as_pointer(*value));
+    if (surface_global != 0) {
+        const JniBackend::Env env = host_jni_.current_env();
+        if (env != 0) host_jni_.release_global_ref(env, surface_global);
+    }
 }
 
 bool HostNativeWindow::handle_host_call(std::uint32_t index, GuestThread& thread) {
@@ -42,51 +70,44 @@ bool HostNativeWindow::handle_host_call(std::uint32_t index, GuestThread& thread
     switch (index) {
     case ZB_WINDOW_HC_ANativeWindow_fromSurface: {
         // regs[0] is the guest JNIEnv*: ignored, we use the real host JNIEnv of this thread.
+        const JniBackend::Env jni_env = host_jni_.current_env();
         const JniBackend::Ref surface = host_jni_.resolve_ref(regs[1], "ANativeWindow_fromSurface");
         void* window = nullptr;
         if (surface != 0) {
-            void* env = as_pointer(static_cast<std::uint64_t>(host_jni_.current_env()));
+            void* env = as_pointer(static_cast<std::uint64_t>(jni_env));
             window = backend_.from_surface(env, as_pointer(surface));
         }
         std::uint32_t handle = 0;
         if (window != nullptr) {
+            const JniBackend::Ref surface_global = host_jni_.retain_global_ref(jni_env, surface);
             handle = windows_.add(from_pointer(window));
             std::lock_guard<std::mutex> lock(surfaces_mutex_);
-            surfaces_[handle] = surface;
+            if (surface_global != 0) surfaces_[handle] = surface_global;
             references_[handle] = 1;
         }
         regs[0] = handle;
         return true;
     }
     case ZB_WINDOW_HC_ANativeWindow_acquire: {
-        const void* window = require_window(regs[0]);
-        if (window != nullptr) {
-            backend_.acquire(const_cast<void*>(window));
+        const std::uint32_t handle = regs[0];
+        void* window = nullptr;
+        {
             std::lock_guard<std::mutex> lock(surfaces_mutex_);
-            ++references_[regs[0]];
+            const auto reference = references_.find(handle);
+            if (reference != references_.end()) {
+                const void* live = require_window(handle);
+                if (live != nullptr) {
+                    window = const_cast<void*>(live);
+                    ++reference->second;
+                }
+            }
         }
+        if (window != nullptr) backend_.acquire(window);
         regs[0] = 0;
         return true;
     }
     case ZB_WINDOW_HC_ANativeWindow_release: {
-        bool last = false;
-        {
-            std::lock_guard<std::mutex> lock(surfaces_mutex_);
-            const auto reference = references_.find(regs[0]);
-            if (reference == references_.end()) {
-                regs[0] = 0;  // not a live window handle
-                return true;
-            }
-            last = --reference->second == 0;
-            if (last) {
-                references_.erase(reference);
-                surfaces_.erase(regs[0]);
-            }
-        }
-        // The backend is told about every release, as the guest issued it; only the handle
-        // itself survives until the last one.
-        const std::optional<std::uint64_t> value = last ? windows_.remove(regs[0]) : windows_.get(regs[0]);
-        if (value && *value != 0) backend_.release(as_pointer(*value));
+        release_window_handle(regs[0]);
         regs[0] = 0;
         return true;
     }

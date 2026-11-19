@@ -28,7 +28,7 @@ final class GuestRuntime {
     private static final GuestRuntime INSTANCE = new GuestRuntime();
 
     private final Map<String, LoadedPlugin> plugins = new HashMap<>();
-    private final Map<String, Integer> liveActivities = new HashMap<>();
+    private final Map<String, java.util.Set<Activity>> liveActivities = new HashMap<>();
     private Application host;
     private boolean installed;
     private volatile LoadedPlugin current;
@@ -67,7 +67,7 @@ final class GuestRuntime {
                 field.set(thread, guest);
             }
             installed = true;
-            Log.i(TAG, "guest Instrumentation installed");
+            if (!BuildConfig.DISABLE_DIAGNOSTICS) Log.i(TAG, "guest Instrumentation installed");
             PackageManagerHook.install(app, this);
         } catch (ReflectiveOperationException | RuntimeException e) {
             Log.e(TAG, "cannot install the guest Instrumentation; plugins will not launch", e);
@@ -83,8 +83,15 @@ final class GuestRuntime {
         PluginRecord record = PluginStore.find(host, packageName);
         if (record == null) throw new IllegalStateException(packageName + " is not imported");
         // current is set inside LoadedPlugin.load before the plugin Application runs, so its
-        // package manager queries already see the plugin's meta-data.
-        p = LoadedPlugin.load(host, record, loaded -> current = loaded);
+        // package manager queries already see the plugin's meta-data. Roll back on failure so a
+        // partially initialized plugin never remains published as current.
+        LoadedPlugin previous = current;
+        try {
+            p = LoadedPlugin.load(host, record, loaded -> current = loaded);
+        } catch (Throwable t) {
+            current = previous;
+            throw t;
+        }
         plugins.put(packageName, p);
         ActivePlugin.record(host, packageName);
         return p;
@@ -125,8 +132,8 @@ final class GuestRuntime {
     }
 
     synchronized boolean isRunning(String packageName) {
-        Integer n = liveActivities.get(packageName);
-        return n != null && n > 0;
+        java.util.Set<Activity> set = liveActivities.get(packageName);
+        return set != null && !set.isEmpty();
     }
 
     /** Rewrites an intent that names a plugin activity to the matching stub; others pass through. */
@@ -221,7 +228,9 @@ final class GuestRuntime {
         LoadedPlugin p = pluginOf(activity);
         if (p == null) return;
         synchronized (this) {
-            liveActivities.merge(p.packageName, 1, Integer::sum);
+            liveActivities.computeIfAbsent(p.packageName,
+                    k -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))
+                    .add(activity);
         }
         ActivityInfo ai = p.activities.get(activity.getClass().getName());
 
@@ -236,7 +245,6 @@ final class GuestRuntime {
         activity.setTheme(theme != 0 ? theme : GuestWindowStyle.defaultTheme(p.appInfo.targetSdkVersion));
 
         GuestWindowStyle.apply(activity, p.record != null && p.record.isTranslated());
-        if (p.record != null && p.record.hideAds) AdHider.attach(activity);
 
         Intent original = activity.getIntent().getParcelableExtra(EXTRA_INTENT);
         if (original != null) {
@@ -265,11 +273,22 @@ final class GuestRuntime {
         activity.setTaskDescription(new ActivityManager.TaskDescription(p.label, p.icon()));
     }
 
+    /** Runs after onCreate when the plugin's window decor and content view have been built. */
+    void prepareActivityContent(Activity activity) {
+        LoadedPlugin p = pluginOf(activity);
+        if (p == null) return;
+        if (p.record != null && p.record.hideAds) AdHider.attach(activity);
+    }
+
     void onActivityDestroyed(Activity activity) {
         LoadedPlugin p = pluginOf(activity);
         if (p == null) return;
         synchronized (this) {
-            liveActivities.merge(p.packageName, -1, Integer::sum);
+            java.util.Set<Activity> set = liveActivities.get(p.packageName);
+            if (set != null) {
+                set.remove(activity);
+                if (set.isEmpty()) liveActivities.remove(p.packageName);
+            }
         }
     }
 }

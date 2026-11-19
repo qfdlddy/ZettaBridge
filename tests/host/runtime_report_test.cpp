@@ -157,6 +157,57 @@ void check_egl_section() {
     CHECK(line_with(text, "egl-first-error:") == "egl-first-error: (none)");
 }
 
+void check_audio_section() {
+    zb::RuntimeReport report;
+    report.note_audio_detail("engine", "result=0x0", true);
+    report.note_audio_detail("player", "result=0x0 channels=2 rate=48000000 buffers=8", true);
+    report.note_audio_detail("stream", "enqueued=1 returned=0", true);
+    std::string text = report.text();
+    CHECK(line_with(text, "audio-engine:") == "audio-engine: result=0x0");
+    CHECK(line_with(text, "audio-player:") ==
+          "audio-player: result=0x0 channels=2 rate=48000000 buffers=8");
+    CHECK(line_with(text, "audio-stream:") == "audio-stream: enqueued=1 returned=0");
+
+    // Overwrite replaces in place and keeps first-note order; an unknown key is appended.
+    report.note_audio_detail("stream", "enqueued=256 returned=255", true);
+    text = report.text();
+    CHECK(line_with(text, "audio-stream:") == "audio-stream: enqueued=256 returned=255");
+    CHECK(text.find("audio-stream: enqueued=1 ") == std::string::npos);
+
+    // Without `overwrite` the first value wins.
+    report.note_audio_detail("engine", "result=0x9", false);
+    CHECK(line_with(report.text(), "audio-engine:") == "audio-engine: result=0x0");
+
+    report.clear();
+    CHECK(report.text().find("audio-") == std::string::npos);
+}
+
+void check_slow_host_calls() {
+    zb::RuntimeReport report;
+    // Nothing is reported while every call returns quickly.
+    CHECK(report.text().find("host-slow-calls: 0") != std::string::npos);
+    CHECK(report.text().find("host-slow-1:") == std::string::npos);
+
+    report.note_slow_host_call("libGLESv2.so glReadPixels", 4242, 1500);
+    std::string text = report.text();
+    CHECK(line_with(text, "host-slow-calls:") == "host-slow-calls: 1");
+    CHECK(line_with(text, "host-slow-1:") ==
+          "host-slow-1: libGLESv2.so glReadPixels tid=4242 ms=1500");
+
+    // The count is exact even after the described entries run out, so a second stall of the same
+    // kind is still visible as a number.
+    for (int i = 0; i < 20; ++i) report.note_slow_host_call("libzbjni.so CallIntMethod", 7, 2000);
+    text = report.text();
+    CHECK(line_with(text, "host-slow-calls:") == "host-slow-calls: 21");
+    CHECK(text.find("host-slow-8: ") != std::string::npos);
+    CHECK(text.find("host-slow-9: ") == std::string::npos);
+
+    report.clear();
+    text = report.text();
+    CHECK(line_with(text, "host-slow-calls:") == "host-slow-calls: 0");
+    CHECK(text.find("host-slow-1:") == std::string::npos);
+}
+
 void check_crash_section() {
     zb::RuntimeReport report;
     report.note_crash_detail("pc", "libc.so vaddr 0x674c0");
@@ -239,6 +290,27 @@ void check_loads_and_natives() {
     CHECK(line_with(text, "registered-natives:") == "registered-natives: 20");
 }
 
+void check_jni_null_section() {
+    zb::RuntimeReport report;
+    CHECK(!contains(report.text(), "jni-null-results:"));
+    // A null JNI result is named by the Java method that produced it, once per distinct name,
+    // because the guest crashes far away from the call.
+    report.note_jni_detail("null-results", "3", true);
+    report.note_jni_detail("null-1", "getObbDir", true);
+    report.note_jni_detail("null-2", "GetMethodID getPackageName()Ljava/lang/String;", true);
+    std::string text = report.text();
+    CHECK(line_with(text, "jni-null-results:") == "jni-null-results: 3");
+    CHECK(line_with(text, "jni-null-1:") == "jni-null-1: getObbDir");
+    CHECK(contains(text, "jni-null-2: GetMethodID getPackageName()Ljava/lang/String;"));
+
+    // Re-noting the same key replaces the value rather than adding a line.
+    report.note_jni_detail("null-results", "4", true);
+    CHECK(line_with(report.text(), "jni-null-results:") == "jni-null-results: 4");
+
+    report.clear();
+    CHECK(!contains(report.text(), "jni-null-results:"));
+}
+
 void check_native_calls_and_opens() {
     zb::RuntimeReport report;
     zb::NativeCallCounter& touch = report.native_call_counter("org/haxe/lime/Lime.onTouch");
@@ -316,6 +388,67 @@ void check_signal_restart_section() {
           "delivered-no-restart=0 rewound=0");
     CHECK(report.text().find("signal-restart-last-eintr:") == std::string::npos);
     CHECK(report.text().find("signal-restart-last-delivery:") == std::string::npos);
+}
+
+void check_futex_section() {
+    zb::RuntimeReport report;
+    // Two waiters on one word, one of them woken, one timed out and waiting again; then a wake
+    // that finds nobody, and a second word woken without a waiter.
+    report.note_futex_wait(0xfb4139f8u, 0x00000001u, 101);
+    report.note_futex_wait(0xfb4139f8u, 0x00000001u, 102);
+    report.note_futex_returned(0xfb4139f8u, 0);
+    report.note_futex_wait(0xfb4139f8u, 0x00000001u, 102);
+    report.note_futex_returned(0xfb4139f8u, -110);
+    report.note_futex_wake(0xfb4139f8u, 1);
+    report.note_futex_wake(0xfa4a063cu, 0);
+
+    const std::string text = report.text();
+    CHECK(line_with(text, "futex-waits:") == "futex-waits: entered=3 returned=2 live=1 timeouts=1");
+    CHECK(line_with(text, "futex-wakes:") == "futex-wakes: called=2 woken=1 empty=1");
+    CHECK(line_with(text, "futex: addr=0xfb4139f8") ==
+          "futex: addr=0xfb4139f8 live=1 entered=3 returned=2 timeouts=1 wakes=1 woken=1 "
+          "empty=0 expect=0x00000001 tid=102");
+    CHECK(line_with(text, "futex: addr=0xfa4a063c") ==
+          "futex: addr=0xfa4a063c live=0 entered=0 returned=0 timeouts=0 wakes=1 woken=0 "
+          "empty=1 expect=0x00000000 tid=0");
+
+    report.clear();
+    CHECK(line_with(report.text(), "futex-waits:") == "futex-waits: entered=0 returned=0 live=0 timeouts=0");
+    CHECK(line_with(report.text(), "futex-wakes:") == "futex-wakes: called=0 woken=0 empty=0");
+    CHECK(count_with(report.text(), "futex: addr=") == 0);
+
+    // The address table is bounded, and the extra addresses share one overflow entry instead of
+    // being dropped: a missing line looks exactly like an event that never happened.
+    zb::RuntimeReport many;
+    const std::uint32_t extra = 3;
+    for (std::uint32_t i = 0; i < zb::RuntimeReport::kMaxFutexAddresses + extra; ++i) {
+        many.note_futex_wait(0xf0000000u + i * 4u, i, 1000 + i);
+    }
+    const std::string many_text = many.text();
+    CHECK(count_with(many_text, "futex: addr=") == zb::RuntimeReport::kMaxFutexAddresses + 1);
+    CHECK(line_with(many_text, "futex: addr=overflow").find(" live=3 entered=3 ") != std::string::npos);
+    CHECK(line_with(many_text, "futex-waits:") ==
+          "futex-waits: entered=" + std::to_string(zb::RuntimeReport::kMaxFutexAddresses + extra) +
+              " returned=0 live=" + std::to_string(zb::RuntimeReport::kMaxFutexAddresses + extra) +
+              " timeouts=0");
+
+    // A word that still has parked waiters never loses its slot; once those waits return, the
+    // slot is reusable, so the table keeps naming the words that matter now instead of the first
+    // ones the process ever touched.
+    zb::RuntimeReport reuse;
+    for (std::uint32_t i = 0; i < zb::RuntimeReport::kMaxFutexAddresses; ++i) {
+        reuse.note_futex_wait(0xe0000000u + i * 4u, 0, 1);
+        reuse.note_futex_returned(0xe0000000u + i * 4u, 0);
+    }
+    reuse.note_futex_wait(0xe0001000u, 7, 2);
+    const std::string reuse_text = reuse.text();
+    CHECK(line_with(reuse_text, "futex: addr=0xe0001000").find(" live=1 ") != std::string::npos);
+    // The evicted word keeps its history in the overflow entry, but no longer has a line of its
+    // own: the table holds parked words, not first-seen ones.
+    CHECK(reuse_text.find("futex: addr=0xe0000000") == std::string::npos);
+    CHECK(line_with(reuse_text, "futex: addr=overflow") ==
+          "futex: addr=overflow live=0 entered=1 returned=1 timeouts=0 wakes=0 woken=0 "
+          "empty=0 expect=0x00000000 tid=0");
 }
 
 void check_observer() {
@@ -424,9 +557,11 @@ int main() {
     check_unimplemented_host_calls();
     check_host_call_bound();
     check_loads_and_natives();
+    check_jni_null_section();
     check_native_calls_and_opens();
     check_exit_reason();
     check_signal_restart_section();
+    check_futex_section();
     check_observer();
     check_file_writer(dir);
     check_throttle(dir);
@@ -434,6 +569,8 @@ int main() {
     check_threads();
     check_gl_section();
     check_egl_section();
+    check_audio_section();
+    check_slow_host_calls();
     check_crash_section();
 
     fs::remove_all(dir);

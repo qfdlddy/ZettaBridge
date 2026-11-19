@@ -53,6 +53,7 @@ bool read_exact(int fd, void* data, std::size_t size) {
     std::size_t done = 0;
     while (done < size) {
         const ssize_t n = ::read(fd, static_cast<char*>(data) + done, size - done);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         done += static_cast<std::size_t>(n);
     }
@@ -209,7 +210,7 @@ ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
     }
     if (eh.e_machine != EM_ARM) return skipped("not an ARM ELF file");
     if (eh.e_ident[EI_VERSION] != EV_CURRENT || eh.e_version != EV_CURRENT ||
-        eh.e_phentsize != sizeof(Elf32_Phdr) || eh.e_phnum == 0 || eh.e_phnum > 1024) {
+        eh.e_phnum == 0 || eh.e_phnum > 1024) {
         return error("invalid ELF header");
     }
     const std::uint64_t phdr_size = static_cast<std::uint64_t>(eh.e_phnum) * sizeof(Elf32_Phdr);

@@ -151,31 +151,10 @@ bool HostGl::dispatch(Call& call) {
         return true;
     }
     case ZB_GL_HC_glCompressedTexImage2D: {
-        const GLenum target = call.scalar<GLenum>(0);
-        const GLint level = call.scalar<GLint>(1);
-        const GLenum internalformat = call.scalar<GLenum>(2);
-        const GLsizei width = call.scalar<GLsizei>(3);
-        const GLsizei height = call.scalar<GLsizei>(4);
-        const GLint border = call.scalar<GLint>(5);
-        const GLsizei imageSize = call.scalar<GLsizei>(6);
-        const void * data = call.pointer<const void>(7, call.length(imageSize, 1u), kPageRead);
-        if (!call.valid()) return true;
-        backend_.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
-        return true;
+        return zbgl_manual_glCompressedTexImage2D(*this, call);
     }
     case ZB_GL_HC_glCompressedTexSubImage2D: {
-        const GLenum target = call.scalar<GLenum>(0);
-        const GLint level = call.scalar<GLint>(1);
-        const GLint xoffset = call.scalar<GLint>(2);
-        const GLint yoffset = call.scalar<GLint>(3);
-        const GLsizei width = call.scalar<GLsizei>(4);
-        const GLsizei height = call.scalar<GLsizei>(5);
-        const GLenum format = call.scalar<GLenum>(6);
-        const GLsizei imageSize = call.scalar<GLsizei>(7);
-        const void * data = call.pointer<const void>(8, call.length(imageSize, 1u), kPageRead);
-        if (!call.valid()) return true;
-        backend_.glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
-        return true;
+        return zbgl_manual_glCompressedTexSubImage2D(*this, call);
     }
     case ZB_GL_HC_glCopyTexImage2D: {
         const GLenum target = call.scalar<GLenum>(0);
@@ -225,6 +204,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint * buffers = call.pointer<const GLuint>(1, call.length(n, 1u), kPageRead);
         if (!call.valid()) return true;
         backend_.glDeleteBuffers(n, buffers);
+        note_delete_buffers(n, buffers);
         return true;
     }
     case ZB_GL_HC_glDeleteFramebuffers: {
@@ -1034,6 +1014,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint buffer = call.scalar<GLuint>(2);
         if (!call.valid()) return true;
         backend_.glBindBufferBase(target, index, buffer);
+        note_bind_buffer(target, buffer);
         return true;
     }
     case ZB_GL_HC_glBindBufferRange: {
@@ -1044,6 +1025,7 @@ bool HostGl::dispatch(Call& call) {
         const GLsizeiptr size = call.scalar<GLsizeiptr>(4);
         if (!call.valid()) return true;
         backend_.glBindBufferRange(target, index, buffer, offset, size);
+        note_bind_buffer(target, buffer);
         return true;
     }
     case ZB_GL_HC_glBindSampler: {
@@ -1064,6 +1046,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint array = call.scalar<GLuint>(0);
         if (!call.valid()) return true;
         backend_.glBindVertexArray(array);
+        note_bind_vertex_array(array);
         return true;
     }
     case ZB_GL_HC_glBlitFramebuffer: {
@@ -1103,34 +1086,10 @@ bool HostGl::dispatch(Call& call) {
         return zbgl_manual_glClientWaitSync(*this, call);
     }
     case ZB_GL_HC_glCompressedTexImage3D: {
-        const GLenum target = call.scalar<GLenum>(0);
-        const GLint level = call.scalar<GLint>(1);
-        const GLenum internalformat = call.scalar<GLenum>(2);
-        const GLsizei width = call.scalar<GLsizei>(3);
-        const GLsizei height = call.scalar<GLsizei>(4);
-        const GLsizei depth = call.scalar<GLsizei>(5);
-        const GLint border = call.scalar<GLint>(6);
-        const GLsizei imageSize = call.scalar<GLsizei>(7);
-        const void * data = call.pointer<const void>(8, call.length(imageSize, 1u), kPageRead);
-        if (!call.valid()) return true;
-        backend_.glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
-        return true;
+        return zbgl_manual_glCompressedTexImage3D(*this, call);
     }
     case ZB_GL_HC_glCompressedTexSubImage3D: {
-        const GLenum target = call.scalar<GLenum>(0);
-        const GLint level = call.scalar<GLint>(1);
-        const GLint xoffset = call.scalar<GLint>(2);
-        const GLint yoffset = call.scalar<GLint>(3);
-        const GLint zoffset = call.scalar<GLint>(4);
-        const GLsizei width = call.scalar<GLsizei>(5);
-        const GLsizei height = call.scalar<GLsizei>(6);
-        const GLsizei depth = call.scalar<GLsizei>(7);
-        const GLenum format = call.scalar<GLenum>(8);
-        const GLsizei imageSize = call.scalar<GLsizei>(9);
-        const void * data = call.pointer<const void>(10, call.length(imageSize, 1u), kPageRead);
-        if (!call.valid()) return true;
-        backend_.glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
-        return true;
+        return zbgl_manual_glCompressedTexSubImage3D(*this, call);
     }
     case ZB_GL_HC_glCopyBufferSubData: {
         const GLenum readTarget = call.scalar<GLenum>(0);
@@ -1185,6 +1144,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint * arrays = call.pointer<const GLuint>(1, call.length(n, 1u), kPageRead);
         if (!call.valid()) return true;
         backend_.glDeleteVertexArrays(n, arrays);
+        note_delete_vertex_arrays(n, arrays);
         return true;
     }
     case ZB_GL_HC_glDrawArraysInstanced: {
@@ -1389,7 +1349,7 @@ bool HostGl::dispatch(Call& call) {
     case ZB_GL_HC_glGetVertexAttribIiv: {
         const GLuint index = call.scalar<GLuint>(0);
         const GLenum pname = call.scalar<GLenum>(1);
-        GLint * params = call.pointer<GLint>(2, 1u, kPageRead | kPageWrite);
+        GLint * params = call.pointer<GLint>(2, (pname == 0x8626u ? 4u : 1u), kPageRead | kPageWrite);
         if (!call.valid()) return true;
         backend_.glGetVertexAttribIiv(index, pname, params);
         return true;
@@ -1397,7 +1357,7 @@ bool HostGl::dispatch(Call& call) {
     case ZB_GL_HC_glGetVertexAttribIuiv: {
         const GLuint index = call.scalar<GLuint>(0);
         const GLenum pname = call.scalar<GLenum>(1);
-        GLuint * params = call.pointer<GLuint>(2, 1u, kPageRead | kPageWrite);
+        GLuint * params = call.pointer<GLuint>(2, (pname == 0x8626u ? 4u : 1u), kPageRead | kPageWrite);
         if (!call.valid()) return true;
         backend_.glGetVertexAttribIuiv(index, pname, params);
         return true;
@@ -1768,6 +1728,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint array = call.scalar<GLuint>(0);
         if (!call.valid()) return true;
         backend_.glBindVertexArrayOES(array);
+        note_bind_vertex_array(array);
         return true;
     }
     case ZB_GL_HC_glDeleteVertexArraysOES: {
@@ -1775,6 +1736,7 @@ bool HostGl::dispatch(Call& call) {
         const GLuint * arrays = call.pointer<const GLuint>(1, call.length(n, 1u), kPageRead);
         if (!call.valid()) return true;
         backend_.glDeleteVertexArraysOES(n, arrays);
+        note_delete_vertex_arrays(n, arrays);
         return true;
     }
     case ZB_GL_HC_glGenVertexArraysOES: {

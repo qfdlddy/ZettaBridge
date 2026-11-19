@@ -1,0 +1,1490 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index 673dba0f..1c96617a 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -53,13 +53,17 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
+     constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+ 
+     void* target = code.xptr<void*>();
+-    ABI_PushRegisters(code, save_regs, 0);
++    ABI_PushRegisters(code, save_regs, 16);
+     code.LDR(X0, l_this);
+     code.MOV(X1, Xscratch0);
++    code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++    code.STR(Xscratch1, SP, 0);
+     code.LDR(Xscratch0, l_addr);
+     code.BLR(Xscratch0);
++    code.LDR(Xscratch1, SP, 0);
++    code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
+     code.MOV(Xscratch0, X0);
+-    ABI_PopRegisters(code, save_regs, 0);
++    ABI_PopRegisters(code, save_regs, 16);
+     code.RET();
+ 
+     code.align(8);
+@@ -71,6 +75,43 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
+     return target;
+ }
+ 
++template<auto callback, typename T>
++static void* EmitWrappedExclusiveReadCallTrampoline(oaknut::CodeGenerator& code, const A32::UserConfig& conf) {
++    using namespace oaknut::util;
++
++    oaknut::Label l_addr, l_this;
++
++    auto fn = [](const A32::UserConfig& conf, A32::VAddr vaddr) -> T {
++        return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
++            return (conf.callbacks->*callback)(vaddr);
++        });
++    };
++
++    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
++
++    void* target = code.xptr<void*>();
++    ABI_PushRegisters(code, save_regs, 16);
++    code.LDR(X0, l_this);
++    code.MOV(X1, Xscratch0);
++    code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++    code.STR(Xscratch1, SP, 0);
++    code.LDR(Xscratch0, l_addr);
++    code.BLR(Xscratch0);
++    code.LDR(Xscratch1, SP, 0);
++    code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
++    code.MOV(Xscratch0, X0);
++    ABI_PopRegisters(code, save_regs, 16);
++    code.RET();
++
++    code.align(8);
++    code.l(l_this);
++    code.dx(mcl::bit_cast<u64>(&conf));
++    code.l(l_addr);
++    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++
++    return target;
++}
++
+ template<auto callback, typename T>
+ static void* EmitExclusiveReadCallTrampoline(oaknut::CodeGenerator& code, const A32::UserConfig& conf) {
+     using namespace oaknut::util;
+@@ -108,13 +149,17 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
+     constexpr u64 save_regs = ABI_CALLER_SAVE;
+ 
+     void* target = code.xptr<void*>();
+-    ABI_PushRegisters(code, save_regs, 0);
++    ABI_PushRegisters(code, save_regs, 16);
+     code.LDR(X0, l_this);
+     code.MOV(X1, Xscratch0);
+     code.MOV(X2, Xscratch1);
++    code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++    code.STR(Xscratch1, SP, 0);
+     code.LDR(Xscratch0, l_addr);
+     code.BLR(Xscratch0);
+-    ABI_PopRegisters(code, save_regs, 0);
++    code.LDR(Xscratch1, SP, 0);
++    code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
++    ABI_PopRegisters(code, save_regs, 16);
+     code.RET();
+ 
+     code.align(8);
+@@ -126,6 +171,47 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
+     return target;
+ }
+ 
++template<auto callback, typename T>
++static void* EmitWrappedExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const A32::UserConfig& conf) {
++    using namespace oaknut::util;
++
++    oaknut::Label l_addr, l_this;
++
++    auto fn = [](const A32::UserConfig& conf, A32::VAddr vaddr, T value) -> u32 {
++        return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr,
++                                                            [&](T expected) -> bool {
++                                                                return (conf.callbacks->*callback)(vaddr, value, expected);
++                                                            })
++                 ? 0
++                 : 1;
++    };
++
++    constexpr u64 save_regs = ABI_CALLER_SAVE;
++
++    void* target = code.xptr<void*>();
++    ABI_PushRegisters(code, save_regs, 16);
++    code.LDR(X0, l_this);
++    code.MOV(X1, Xscratch0);
++    code.MOV(X2, Xscratch1);
++    code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++    code.STR(Xscratch1, SP, 0);
++    code.LDR(Xscratch0, l_addr);
++    code.BLR(Xscratch0);
++    code.MOV(Wscratch0, W0);
++    code.LDR(Xscratch1, SP, 0);
++    code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
++    ABI_PopRegisters(code, save_regs, 16);
++    code.RET();
++
++    code.align(8);
++    code.l(l_this);
++    code.dx(mcl::bit_cast<u64>(&conf));
++    code.l(l_addr);
++    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++
++    return target;
++}
++
+ template<auto callback, typename T>
+ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const A32::UserConfig& conf) {
+     using namespace oaknut::util;
+@@ -200,6 +286,10 @@ void A32AddressSpace::EmitPrelude() {
+     prelude_info.wrapped_read_memory_16 = EmitWrappedReadCallTrampoline<&A32::UserCallbacks::MemoryRead16>(code, conf.callbacks);
+     prelude_info.wrapped_read_memory_32 = EmitWrappedReadCallTrampoline<&A32::UserCallbacks::MemoryRead32>(code, conf.callbacks);
+     prelude_info.wrapped_read_memory_64 = EmitWrappedReadCallTrampoline<&A32::UserCallbacks::MemoryRead64>(code, conf.callbacks);
++    prelude_info.wrapped_exclusive_read_memory_8 = EmitWrappedExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead8, u8>(code, conf);
++    prelude_info.wrapped_exclusive_read_memory_16 = EmitWrappedExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead16, u16>(code, conf);
++    prelude_info.wrapped_exclusive_read_memory_32 = EmitWrappedExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead32, u32>(code, conf);
++    prelude_info.wrapped_exclusive_read_memory_64 = EmitWrappedExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead64, u64>(code, conf);
+     prelude_info.exclusive_read_memory_8 = EmitExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead8, u8>(code, conf);
+     prelude_info.exclusive_read_memory_16 = EmitExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead16, u16>(code, conf);
+     prelude_info.exclusive_read_memory_32 = EmitExclusiveReadCallTrampoline<&A32::UserCallbacks::MemoryRead32, u32>(code, conf);
+@@ -212,6 +302,10 @@ void A32AddressSpace::EmitPrelude() {
+     prelude_info.wrapped_write_memory_16 = EmitWrappedWriteCallTrampoline<&A32::UserCallbacks::MemoryWrite16>(code, conf.callbacks);
+     prelude_info.wrapped_write_memory_32 = EmitWrappedWriteCallTrampoline<&A32::UserCallbacks::MemoryWrite32>(code, conf.callbacks);
+     prelude_info.wrapped_write_memory_64 = EmitWrappedWriteCallTrampoline<&A32::UserCallbacks::MemoryWrite64>(code, conf.callbacks);
++    prelude_info.wrapped_exclusive_write_memory_8 = EmitWrappedExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive8, u8>(code, conf);
++    prelude_info.wrapped_exclusive_write_memory_16 = EmitWrappedExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive16, u16>(code, conf);
++    prelude_info.wrapped_exclusive_write_memory_32 = EmitWrappedExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive32, u32>(code, conf);
++    prelude_info.wrapped_exclusive_write_memory_64 = EmitWrappedExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive64, u64>(code, conf);
+     prelude_info.exclusive_write_memory_8 = EmitExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive8, u8>(code, conf);
+     prelude_info.exclusive_write_memory_16 = EmitExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive16, u16>(code, conf);
+     prelude_info.exclusive_write_memory_32 = EmitExclusiveWriteCallTrampoline<&A32::UserCallbacks::MemoryWriteExclusive32, u32>(code, conf);
+@@ -257,6 +351,10 @@ void A32AddressSpace::EmitPrelude() {
+         code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
+         code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+ 
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpsr));
++        code.MSR(oaknut::SystemReg::FPSR, XZR);
++
+         code.LDAR(Wscratch0, Xhalt);
+         code.CBNZ(Wscratch0, return_from_run_code);
+ 
+@@ -295,6 +393,10 @@ void A32AddressSpace::EmitPrelude() {
+         code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
+         code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+ 
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpsr));
++        code.MSR(oaknut::SystemReg::FPSR, XZR);
++
+         oaknut::Label step_hr_loop;
+         code.l(step_hr_loop);
+         code.LDAXR(Wscratch0, Xhalt);
+@@ -318,10 +420,16 @@ void A32AddressSpace::EmitPrelude() {
+             code.B(LE, return_from_run_code);
+         }
+ 
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.SUB(SP, SP, 16);
++        code.STR(Xscratch1, SP, 0);
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+         code.BLR(Xscratch0);
++        code.LDR(Xscratch1, SP, 0);
++        code.ADD(SP, SP, 16);
++        code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
+         code.BR(X0);
+ 
+         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
+@@ -335,10 +443,76 @@ void A32AddressSpace::EmitPrelude() {
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+     }
+ 
++    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++        fast_dispatch_table.assign(fast_dispatch_table_size, FastDispatchEntry{});
++
++        prelude_info.fast_dispatch = code.xptr<void*>();
++        oaknut::Label l_this, l_addr, l_table, l_miss;
++
++        code.LDAR(Wscratch0, Xhalt);
++        code.CBNZ(Wscratch0, return_from_run_code);
++
++        if (conf.enable_cycle_counting) {
++            code.CMP(Xticks, 0);
++            code.B(LE, return_from_run_code);
++        }
++
++        static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++        code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++
++        code.EOR(Xscratch0, X0, X0, LSR, 14);
++        code.EOR(Xscratch0, Xscratch0, X0, LSR, 28);
++        code.LSL(Xscratch0, Xscratch0, 3);
++        code.AND(Xscratch0, Xscratch0, fast_dispatch_table_mask);
++        code.LDR(Xscratch1, l_table);
++        code.ADD(Xscratch1, Xscratch1, Xscratch0);
++
++        code.LDP(X1, Xscratch2, Xscratch1);
++        code.CMP(X1, X0);
++        code.B(NE, l_miss);
++        code.BR(Xscratch2);
++
++        code.l(l_miss);
++        code.SUB(SP, SP, 32);
++        code.STP(X0, Xscratch1, SP, 0);
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.STR(Xscratch1, SP, 16);
++        code.LDR(X0, l_this);
++        code.MOV(X1, Xstate);
++        code.LDR(Xscratch0, l_addr);
++        code.BLR(Xscratch0);
++        code.LDR(Xscratch1, SP, 16);
++        code.MSR(oaknut::SystemReg::FPSR, Xscratch1);
++        code.LDP(X1, Xscratch1, SP, 0);
++        code.ADD(SP, SP, 32);
++        code.STP(X1, X0, Xscratch1);
++        code.BR(X0);
++
++        const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
++            return self.GetOrEmit(context.GetLocationDescriptor());
++        };
++
++        code.align(8);
++        code.l(l_this);
++        code.dx(mcl::bit_cast<u64>(this));
++        code.l(l_addr);
++        code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++        code.l(l_table);
++        code.dx(mcl::bit_cast<u64>(fast_dispatch_table.data()));
++    }
++
+     prelude_info.return_from_run_code = code.xptr<void*>();
+     {
+         code.l(return_from_run_code);
+ 
++        code.LDR(Wscratch0, Xstate, offsetof(A32JitState, fpsr));
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.ORR(Wscratch0, Wscratch0, Wscratch1);
++        code.STR(Wscratch0, Xstate, offsetof(A32JitState, fpsr));
++
++        code.LDR(Wscratch0, SP, offsetof(StackLayout, save_host_fpsr));
++        code.MSR(oaknut::SystemReg::FPSR, Xscratch0);
++
+         if (conf.enable_cycle_counting) {
+             code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
+             code.SUB(X1, X1, Xticks);
+@@ -394,6 +568,11 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
+         .fastmem_address_space_bits = 32,
+         .silently_mirror_fastmem = true,
++        .fastmem_exclusive_access = conf.fastmem_exclusive_access,
++        .recompile_on_exclusive_fastmem_failure = conf.recompile_on_exclusive_fastmem_failure,
++        .exclusive_monitor = conf.global_monitor
++            ? std::optional<ExclusiveMonitor::InlineArm64Layout>{conf.global_monitor->GetInlineArm64Layout(conf.processor_id)}
++            : std::nullopt,
+ 
+         .wall_clock_cntpct = conf.wall_clock_cntpct,
+         .enable_cycle_counting = conf.enable_cycle_counting,
+@@ -409,6 +588,12 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+         .state_nzcv_offset = offsetof(A32JitState, cpsr_nzcv),
+         .state_fpsr_offset = offsetof(A32JitState, fpsr),
+         .state_exclusive_state_offset = offsetof(A32JitState, exclusive_state),
++        .state_exclusive_vaddr_offset = offsetof(A32JitState, exclusive_vaddr),
++        .state_exclusive_value_offset = offsetof(A32JitState, exclusive_value),
++        .state_exclusive_lock_ptr_offset = offsetof(A32JitState, exclusive_lock_ptr),
++        .state_exclusive_scratch0_offset = offsetof(A32JitState, exclusive_scratch0),
++        .state_exclusive_scratch1_offset = offsetof(A32JitState, exclusive_scratch1),
++        .state_exclusive_scratch2_offset = offsetof(A32JitState, exclusive_scratch2),
+ 
+         .coprocessors = conf.coprocessors,
+ 
+diff --git a/src/dynarmic/backend/arm64/a32_jitstate.h b/src/dynarmic/backend/arm64/a32_jitstate.h
+index 978bf84a..48a93119 100644
+--- a/src/dynarmic/backend/arm64/a32_jitstate.h
++++ b/src/dynarmic/backend/arm64/a32_jitstate.h
+@@ -30,6 +30,12 @@ struct A32JitState {
+     alignas(16) std::array<u32, 64> ext_regs{};
+ 
+     u32 exclusive_state = 0;
++    u32 exclusive_vaddr = 0;
++    u64 exclusive_value = 0;
++    u64 exclusive_lock_ptr = 0;
++    u64 exclusive_scratch0 = 0;
++    u64 exclusive_scratch1 = 0;
++    u64 exclusive_scratch2 = 0;
+ 
+     u32 Cpsr() const;
+     void SetCpsr(u32 cpsr);
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..8e977cfc 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -74,6 +74,13 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
++        if (!fast_dispatch_table.empty()) {
++            auto& entry = fast_dispatch_table[FastDispatchIndex(descriptor.Value())];
++            if (entry.location_descriptor == descriptor.Value()) {
++                entry = {};
++            }
++        }
++
+         const auto iter = block_entries.find(descriptor);
+         if (iter == block_entries.end()) {
+             continue;
+@@ -94,6 +101,9 @@ void AddressSpace::ClearCache() {
+     reverse_block_entries.clear();
+     block_infos.clear();
+     block_references.clear();
++    if (!fast_dispatch_table.empty()) {
++        std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), FastDispatchEntry{});
++    }
+     code.set_offset(prelude_info.end_of_prelude);
+ }
+ 
+@@ -143,6 +153,9 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         case LinkTarget::ReturnToDispatcher:
+             c.B(prelude_info.return_to_dispatcher);
+             break;
++        case LinkTarget::FastDispatch:
++            c.B(prelude_info.fast_dispatch ? prelude_info.fast_dispatch : prelude_info.return_to_dispatcher);
++            break;
+         case LinkTarget::ReturnFromRunCode:
+             c.B(prelude_info.return_from_run_code);
+             break;
+@@ -176,6 +189,18 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         case LinkTarget::WrappedReadMemory128:
+             c.BL(prelude_info.wrapped_read_memory_128);
+             break;
++        case LinkTarget::WrappedExclusiveReadMemory8:
++            c.BL(prelude_info.wrapped_exclusive_read_memory_8);
++            break;
++        case LinkTarget::WrappedExclusiveReadMemory16:
++            c.BL(prelude_info.wrapped_exclusive_read_memory_16);
++            break;
++        case LinkTarget::WrappedExclusiveReadMemory32:
++            c.BL(prelude_info.wrapped_exclusive_read_memory_32);
++            break;
++        case LinkTarget::WrappedExclusiveReadMemory64:
++            c.BL(prelude_info.wrapped_exclusive_read_memory_64);
++            break;
+         case LinkTarget::ExclusiveReadMemory8:
+             c.BL(prelude_info.exclusive_read_memory_8);
+             break;
+@@ -221,6 +246,18 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         case LinkTarget::WrappedWriteMemory128:
+             c.BL(prelude_info.wrapped_write_memory_128);
+             break;
++        case LinkTarget::WrappedExclusiveWriteMemory8:
++            c.BL(prelude_info.wrapped_exclusive_write_memory_8);
++            break;
++        case LinkTarget::WrappedExclusiveWriteMemory16:
++            c.BL(prelude_info.wrapped_exclusive_write_memory_16);
++            break;
++        case LinkTarget::WrappedExclusiveWriteMemory32:
++            c.BL(prelude_info.wrapped_exclusive_write_memory_32);
++            break;
++        case LinkTarget::WrappedExclusiveWriteMemory64:
++            c.BL(prelude_info.wrapped_exclusive_write_memory_64);
++            break;
+         case LinkTarget::ExclusiveWriteMemory8:
+             c.BL(prelude_info.exclusive_write_memory_8);
+             break;
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566bd..e5f7c630 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -80,6 +80,19 @@ protected:
+     tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
+     tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
+ 
++    struct alignas(16) FastDispatchEntry {
++        u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;
++        void* code_ptr = nullptr;
++    };
++    static_assert(sizeof(FastDispatchEntry) == 16);
++    static constexpr size_t fast_dispatch_table_size = 0x4000;
++    static constexpr u64 fast_dispatch_table_mask = (fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry);
++    static size_t FastDispatchIndex(u64 location_descriptor) {
++        const u64 h = location_descriptor ^ (location_descriptor >> 14) ^ (location_descriptor >> 28);
++        return static_cast<size_t>((h >> 1) & (fast_dispatch_table_size - 1));
++    }
++    std::vector<FastDispatchEntry> fast_dispatch_table;
++
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+ 
+@@ -90,6 +103,7 @@ protected:
+         RunCodeFuncType run_code;
+         RunCodeFuncType step_code;
+         void* return_to_dispatcher;
++        void* fast_dispatch = nullptr;
+         void* return_from_run_code;
+ 
+         void* read_memory_8;
+@@ -102,6 +116,10 @@ protected:
+         void* wrapped_read_memory_32;
+         void* wrapped_read_memory_64;
+         void* wrapped_read_memory_128;
++        void* wrapped_exclusive_read_memory_8 = nullptr;
++        void* wrapped_exclusive_read_memory_16 = nullptr;
++        void* wrapped_exclusive_read_memory_32 = nullptr;
++        void* wrapped_exclusive_read_memory_64 = nullptr;
+         void* exclusive_read_memory_8;
+         void* exclusive_read_memory_16;
+         void* exclusive_read_memory_32;
+@@ -117,6 +135,10 @@ protected:
+         void* wrapped_write_memory_32;
+         void* wrapped_write_memory_64;
+         void* wrapped_write_memory_128;
++        void* wrapped_exclusive_write_memory_8 = nullptr;
++        void* wrapped_exclusive_write_memory_16 = nullptr;
++        void* wrapped_exclusive_write_memory_32 = nullptr;
++        void* wrapped_exclusive_write_memory_64 = nullptr;
+         void* exclusive_write_memory_8;
+         void* exclusive_write_memory_16;
+         void* exclusive_write_memory_32;
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+index 1ecb5424..7ef76b0e 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -250,7 +250,9 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+         }
+     }
+ 
+-    fpsr_manager.Spill();
++    // Preserve persistent-FPSR invariant at block exit: if an in-block call spilled FPSR,
++    // clear any host-leftover sticky flags; otherwise keep hardware FPSR live across blocks.
++    fpsr_manager.Load();
+ 
+     reg_alloc.AssertNoMoreUses();
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index 58ccb0e4..dd9e59bf 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -8,6 +8,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ #include <mcl/stdint.hpp>
+@@ -15,6 +16,7 @@
+ 
+ #include "dynarmic/backend/arm64/fastmem.h"
+ #include "dynarmic/interface/A32/coprocessor.h"
++#include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/interface/optimization_flags.h"
+ #include "dynarmic/ir/location_descriptor.h"
+ 
+@@ -42,6 +44,7 @@ using CodePtr = std::byte*;
+ 
+ enum class LinkTarget {
+     ReturnToDispatcher,
++    FastDispatch,
+     ReturnFromRunCode,
+     ReadMemory8,
+     ReadMemory16,
+@@ -53,6 +56,10 @@ enum class LinkTarget {
+     WrappedReadMemory32,
+     WrappedReadMemory64,
+     WrappedReadMemory128,
++    WrappedExclusiveReadMemory8,
++    WrappedExclusiveReadMemory16,
++    WrappedExclusiveReadMemory32,
++    WrappedExclusiveReadMemory64,
+     ExclusiveReadMemory8,
+     ExclusiveReadMemory16,
+     ExclusiveReadMemory32,
+@@ -68,6 +75,10 @@ enum class LinkTarget {
+     WrappedWriteMemory32,
+     WrappedWriteMemory64,
+     WrappedWriteMemory128,
++    WrappedExclusiveWriteMemory8,
++    WrappedExclusiveWriteMemory16,
++    WrappedExclusiveWriteMemory32,
++    WrappedExclusiveWriteMemory64,
+     ExclusiveWriteMemory8,
+     ExclusiveWriteMemory16,
+     ExclusiveWriteMemory32,
+@@ -136,6 +147,9 @@ struct EmitConfig {
+     bool recompile_on_fastmem_failure;
+     size_t fastmem_address_space_bits;
+     bool silently_mirror_fastmem;
++    bool fastmem_exclusive_access = false;
++    bool recompile_on_exclusive_fastmem_failure = false;
++    std::optional<ExclusiveMonitor::InlineArm64Layout> exclusive_monitor;
+ 
+     // Timing
+     bool wall_clock_cntpct;
+@@ -155,6 +169,12 @@ struct EmitConfig {
+     size_t state_nzcv_offset;
+     size_t state_fpsr_offset;
+     size_t state_exclusive_state_offset;
++    size_t state_exclusive_vaddr_offset = 0;
++    size_t state_exclusive_value_offset = 0;
++    size_t state_exclusive_lock_ptr_offset = 0;
++    size_t state_exclusive_scratch0_offset = 0;
++    size_t state_exclusive_scratch1_offset = 0;
++    size_t state_exclusive_scratch2_offset = 0;
+ 
+     // A32 specific
+     std::array<std::shared_ptr<A32::Coprocessor>, 16> coprocessors{};
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde73..c8e8d434 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -115,13 +115,17 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
+         code.l(fail);
+     }
+ 
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++    EmitRelocation(code, ctx,
++                   ctx.conf.HasOptimization(OptimizationFlag::FastDispatch) && !is_single_step
++                       ? LinkTarget::FastDispatch
++                       : LinkTarget::ReturnToDispatcher);
+ }
+ 
+-void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool) {
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+-
+-    // TODO: Implement FastDispatchHint optimization
++void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
++    EmitRelocation(code, ctx,
++                   ctx.conf.HasOptimization(OptimizationFlag::FastDispatch) && !is_single_step
++                       ? LinkTarget::FastDispatch
++                       : LinkTarget::ReturnToDispatcher);
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+@@ -654,12 +658,10 @@ template<>
+ void EmitIR<IR::Opcode::A32GetFpscr>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+     auto Wfpscr = ctx.reg_alloc.WriteW(inst);
+     RegAlloc::Realize(Wfpscr);
+-    ctx.fpsr.Spill();
+-
+-    static_assert(offsetof(A32JitState, fpsr) + sizeof(u32) == offsetof(A32JitState, fpsr_nzcv));
++    ctx.fpsr.GetFpsr(Wscratch0);
+ 
+     code.LDR(Wfpscr, Xstate, offsetof(A32JitState, upper_location_descriptor));
+-    code.LDP(Wscratch0, Wscratch1, Xstate, offsetof(A32JitState, fpsr));
++    code.LDR(Wscratch1, Xstate, offsetof(A32JitState, fpsr_nzcv));
+     code.AND(Wfpscr, Wfpscr, 0xffff'0000);
+     code.ORR(Wscratch0, Wscratch0, Wscratch1);
+     code.ORR(Wfpscr, Wfpscr, Wscratch0);
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index 339e2c59..6b4537ab 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -17,6 +17,7 @@
+ #include "dynarmic/backend/arm64/fastmem.h"
+ #include "dynarmic/backend/arm64/fpsr_manager.h"
+ #include "dynarmic/backend/arm64/reg_alloc.h"
++#include "dynarmic/common/spin_lock_arm64.h"
+ #include "dynarmic/ir/acc_type.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/microinstruction.h"
+@@ -96,6 +97,34 @@ LinkTarget WrappedWriteMemoryLinkTarget(size_t bitsize) {
+     UNREACHABLE();
+ }
+ 
++LinkTarget WrappedExclusiveWriteMemoryLinkTarget(size_t bitsize) {
++    switch (bitsize) {
++    case 8:
++        return LinkTarget::WrappedExclusiveWriteMemory8;
++    case 16:
++        return LinkTarget::WrappedExclusiveWriteMemory16;
++    case 32:
++        return LinkTarget::WrappedExclusiveWriteMemory32;
++    case 64:
++        return LinkTarget::WrappedExclusiveWriteMemory64;
++    }
++    UNREACHABLE();
++}
++
++LinkTarget WrappedExclusiveReadMemoryLinkTarget(size_t bitsize) {
++    switch (bitsize) {
++    case 8:
++        return LinkTarget::WrappedExclusiveReadMemory8;
++    case 16:
++        return LinkTarget::WrappedExclusiveReadMemory16;
++    case 32:
++        return LinkTarget::WrappedExclusiveReadMemory32;
++    case 64:
++        return LinkTarget::WrappedExclusiveReadMemory64;
++    }
++    UNREACHABLE();
++}
++
+ LinkTarget ExclusiveReadMemoryLinkTarget(size_t bitsize) {
+     switch (bitsize) {
+     case 8:
+@@ -414,7 +443,6 @@ void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx
+         }
+     }();
+     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -454,7 +482,6 @@ void InlinePageTableEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ct
+         }
+     }();
+     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -533,7 +560,6 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
+         }
+     }();
+     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -583,7 +609,6 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+         }
+     }();
+     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
+-    ctx.fpsr.Spill();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -625,6 +650,423 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+     code.l(*end);
+ }
+ 
++// Computes stripe = StripeIndex(u64(u32(Waddr))) into Xscratch0. Clobbers Xscratch1.
++void EmitComputeStripeIndex(oaknut::CodeGenerator& code, oaknut::WReg Waddr) {
++    code.MOV(Wscratch0, Waddr);
++    code.LSR(Xscratch0, Xscratch0, 2);
++    code.MOV(Xscratch1, 0x9e3779b97f4a7c15ull);
++    code.MUL(Xscratch0, Xscratch0, Xscratch1);
++    code.LSR(Xscratch0, Xscratch0, 58);
++}
++
++// Sets Xscratch0 = &stripe_active[stripe * words_per_stripe + word_offset], where
++// stripe = (Xlock - stripes_ptr) >> 6. Clobbers Xscratch1. Xlock must not be Xscratch0/1.
++void EmitStripeActiveWordPtr(oaknut::CodeGenerator& code, const ExclusiveMonitor::InlineArm64Layout& mon,
++                             oaknut::XReg Xlock, size_t word_offset) {
++    static_assert(ExclusiveMonitor::StripeByteStride() == 64);
++    code.MOV(Xscratch1, mon.stripes_ptr);
++    code.SUB(Xscratch0, Xlock, Xscratch1);
++    code.LSR(Xscratch0, Xscratch0, 6);
++    if (mon.words_per_stripe != 1) {
++        code.MOV(Xscratch1, mon.words_per_stripe);
++        code.MUL(Xscratch0, Xscratch0, Xscratch1);
++    }
++    if (word_offset != 0) {
++        if (word_offset <= 0xfff) {
++            code.ADD(Xscratch0, Xscratch0, word_offset);
++        } else {
++            code.MOV(Xscratch1, word_offset);
++            code.ADD(Xscratch0, Xscratch0, Xscratch1);
++        }
++    }
++    code.LSL(Xscratch0, Xscratch0, 3);
++    code.MOV(Xscratch1, mon.stripe_active_ptr);
++    code.ADD(Xscratch0, Xscratch1, Xscratch0);
++}
++
++// Clears this processor's reservation inside its stripe lock (matching CheckAndClear when value fails).
++// Clobbers Xscratch0, Xscratch1, Xscratch2.
++void EmitClearSelfMonitorState(oaknut::CodeGenerator& code, EmitContext& ctx,
++                               const ExclusiveMonitor::InlineArm64Layout& mon) {
++    const size_t proc_word = mon.processor_id >> 6;
++    const u64 proc_bit_mask = u64{1} << (mon.processor_id & 63);
++
++    code.MOV(Xscratch0, mon.excl_addr_proc_ptr);
++    code.MOV(Xscratch1, ExclusiveMonitor::InvalidExclusiveAddress());
++    code.STR(Xscratch1, Xscratch0);
++
++    code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++    EmitStripeActiveWordPtr(code, mon, Xscratch2, proc_word);
++    code.LDR(Xscratch1, Xscratch0);
++    code.MOV(Xscratch2, ~proc_bit_mask);
++    code.AND(Xscratch1, Xscratch1, Xscratch2);
++    code.STR(Xscratch1, Xscratch0);
++
++    code.MOV(Xscratch0, mon.proc_stripe_ptr);
++    code.MOV(Xscratch1, ExclusiveMonitor::InvalidStripe());
++    code.STR(Xscratch1, Xscratch0);
++}
++
++template<size_t bitsize>
++void FastmemEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
++    static_assert(bitsize == 8 || bitsize == 16 || bitsize == 32 || bitsize == 64);
++    static_assert(ExclusiveMonitor::StripeByteStride() == 64);
++    const auto& mon = *ctx.conf.exclusive_monitor;
++    const size_t proc_word = mon.processor_id >> 6;
++    const u64 proc_bit_mask = u64{1} << (mon.processor_id & 63);
++
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Rvalue = ctx.reg_alloc.WriteReg<std::max<std::size_t>(bitsize, 32)>(inst);
++    const bool ordered = IsOrdered(args[2].GetImmediateAccType());
++    ctx.reg_alloc.SpillFlags();
++    RegAlloc::Realize(Xaddr, Rvalue);
++
++    oaknut::Label l_same_or_invalid;
++    SharedLabel fallback_locked = GenSharedLabel(), fallback = GenSharedLabel(), end = GenSharedLabel();
++
++    if constexpr (bitsize >= 16) {
++        code.TST(Xaddr->toW(), (bitsize / 8) - 1);
++        code.B(NE, *fallback);
++    }
++
++    // Fast path only when processor currently holds no stripe lock or holds the same stripe.
++    // Cross-stripe nested LDREX falls back to C++ LockForRead (canonical lock order).
++    EmitComputeStripeIndex(code, Xaddr->toW());  // Xscratch0 = new_stripe
++    code.MOV(Xscratch1, mon.proc_stripe_ptr);
++    code.LDR(Xscratch1, Xscratch1);
++    code.MOV(Xscratch2, ExclusiveMonitor::InvalidStripe());
++    code.CMP(Xscratch1, Xscratch2);
++    code.B(EQ, l_same_or_invalid);
++    code.CMP(Xscratch1, Xscratch0);
++    code.B(NE, *fallback);
++    code.l(l_same_or_invalid);
++
++    code.LSL(Xscratch0, Xscratch0, 6);
++    code.MOV(Xscratch1, mon.stripes_ptr);
++    code.ADD(Xscratch2, Xscratch1, Xscratch0);  // Xscratch2 = &stripes[new_stripe].lock
++    EmitSpinLockLock(code, Xscratch2);
++
++    // Load into Xscratch1 first so Xaddr is untouched on SIGSEGV or Rvalue == Xaddr aliasing.
++    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, *Xaddr, fallback_locked);
++    const auto fastmem_location = EmitMemoryLdr<bitsize>(code, Xscratch1.index(), Xbase, Xoffset, true, ShouldExt32(ctx));
++
++    code.MOV(Wscratch0, Xaddr->toW());
++    code.MOV(Rvalue->toX(), Xscratch1);
++
++    code.MOV(Xscratch1, mon.excl_addr_proc_ptr);
++    code.STR(Xscratch0, Xscratch1);
++    code.MOV(Xscratch1, mon.excl_val_proc_ptr);
++    code.STR(Rvalue->toX(), Xscratch1);
++
++    code.MOV(Wscratch0, 1);
++    code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
++
++    code.MOV(Xscratch0, mon.stripes_ptr);
++    code.SUB(Xscratch0, Xscratch2, Xscratch0);
++    code.LSR(Xscratch0, Xscratch0, 6);  // new_stripe
++    code.MOV(Xscratch1, mon.proc_stripe_ptr);
++    code.STR(Xscratch0, Xscratch1);
++
++    if (mon.words_per_stripe != 1) {
++        code.MOV(Xscratch1, mon.words_per_stripe);
++        code.MUL(Xscratch0, Xscratch0, Xscratch1);
++    }
++    if (proc_word != 0) {
++        if (proc_word <= 0xfff) {
++            code.ADD(Xscratch0, Xscratch0, proc_word);
++        } else {
++            code.MOV(Xscratch1, proc_word);
++            code.ADD(Xscratch0, Xscratch0, Xscratch1);
++        }
++    }
++    code.LSL(Xscratch0, Xscratch0, 3);
++    code.MOV(Xscratch1, mon.stripe_active_ptr);
++    code.ADD(Xscratch0, Xscratch1, Xscratch0);
++    code.LDR(Xscratch1, Xscratch0);
++    code.ORR(Xscratch1, Xscratch1, proc_bit_mask);
++    code.STR(Xscratch1, Xscratch0);
++
++    EmitSpinLockUnlock(code, Xscratch2);
++
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback_locked, fallback, end, fastmem_location] {
++        code.l(*fallback_locked);
++        const u64 locked_call_pc = mcl::bit_cast<u64>(code.xptr<void*>());
++        EmitSpinLockUnlock(code, Xscratch2);
++
++        ctx.ebi.fastmem_patch_info.emplace(
++            fastmem_location - ctx.ebi.entry_point,
++            FastmemPatchInfo{
++                .marker = marker,
++                .fc = FakeCall{
++                    .call_pc = locked_call_pc,
++                },
++                .recompile = ctx.conf.recompile_on_exclusive_fastmem_failure,
++            });
++
++        code.l(*fallback);
++        code.MOV(Xscratch0, Xaddr);
++        EmitRelocation(code, ctx, WrappedExclusiveReadMemoryLinkTarget(bitsize));
++        if (ordered) {
++            code.DMB(oaknut::BarrierOp::ISH);
++        }
++        code.MOV(Wscratch1, 1);
++        code.STRB(Wscratch1, Xstate, ctx.conf.state_exclusive_state_offset);
++        code.MOV(Rvalue.toX(), Xscratch0);
++        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
++        code.B(*end);
++    });
++
++    code.l(*end);
++}
++
++template<size_t bitsize>
++void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
++    static_assert(bitsize == 8 || bitsize == 16 || bitsize == 32 || bitsize == 64);
++    static_assert(ExclusiveMonitor::StripeByteStride() == 64);
++    const auto& mon = *ctx.conf.exclusive_monitor;
++    const size_t proc_word = mon.processor_id >> 6;
++    const u64 proc_bit_mask = u64{1} << (mon.processor_id & 63);
++
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Rvalue = ctx.reg_alloc.ReadReg<std::max<std::size_t>(bitsize, 32)>(args[2]);
++    auto Wresult = ctx.reg_alloc.WriteW(inst);
++    const bool ordered = IsOrdered(args[3].GetImmediateAccType());
++    ctx.reg_alloc.SpillFlags();
++    RegAlloc::Realize(Xaddr, Rvalue, Wresult);
++
++    oaknut::Label l_fail_cas_unlock, l_fail_unlock, l_fail_no_unlock, l_cas_loop;
++    SharedLabel fallback_locked = GenSharedLabel(), fallback = GenSharedLabel(), end = GenSharedLabel();
++
++    code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.CBZ(Wscratch0, l_fail_no_unlock);
++
++    if constexpr (bitsize >= 16) {
++        code.TST(Xaddr->toW(), (bitsize / 8) - 1);
++        code.B(NE, *fallback);
++    }
++
++    EmitComputeStripeIndex(code, Xaddr->toW());  // Xscratch0 = stripe
++    code.MOV(Xscratch1, mon.proc_stripe_ptr);
++    code.LDR(Xscratch1, Xscratch1);
++    code.CMP(Xscratch1, Xscratch0);
++    code.B(NE, l_fail_no_unlock);
++
++    code.LSL(Xscratch0, Xscratch0, 6);
++    code.MOV(Xscratch1, mon.stripes_ptr);
++    code.ADD(Xscratch2, Xscratch1, Xscratch0);  // Xscratch2 = &stripes[stripe].lock
++    EmitSpinLockLock(code, Xscratch2);
++
++    // Check exclusive_addresses[proc] == masked_vaddr while holding stripe lock (prevents ABA).
++    code.MOV(Wscratch0, Xaddr->toW());
++    code.MOV(Xscratch1, mon.excl_addr_proc_ptr);
++    code.LDR(Xscratch1, Xscratch1);
++    code.CMP(Xscratch1, Xscratch0);
++    code.B(NE, l_fail_unlock);
++
++    code.STR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++
++    // Load expected value into Xscratch1 / Wscratch1 (catches concurrent non-exclusive stores).
++    code.MOV(Xscratch0, mon.excl_val_proc_ptr);
++    if constexpr (bitsize == 64) {
++        code.LDR(Xscratch1, Xscratch0);
++    } else {
++        code.LDR(Wscratch1, Xscratch0);
++        if constexpr (bitsize == 8) {
++            code.AND(Wscratch1, Wscratch1, 0xffu);
++        } else if constexpr (bitsize == 16) {
++            code.AND(Wscratch1, Wscratch1, 0xffffu);
++        }
++    }
++
++    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, *Xaddr, fallback_locked);
++    const auto add_ext = ShouldExt32(ctx) ? oaknut::AddSubExt::UXTW : oaknut::AddSubExt::LSL;
++    const auto Roffset = ShouldExt32(ctx) ? oaknut::RReg{Xoffset.toW()} : oaknut::RReg{Xoffset};
++    code.ADD(Xscratch0, Xbase, Roffset, add_ext);
++
++    code.l(l_cas_loop);
++    const auto ldaxr_location = code.xptr<CodePtr>();
++    switch (bitsize) {
++    case 8:
++        code.LDAXRB(Wscratch2, Xscratch0);
++        code.CMP(Wscratch2, Wscratch1);
++        break;
++    case 16:
++        code.LDAXRH(Wscratch2, Xscratch0);
++        code.CMP(Wscratch2, Wscratch1);
++        break;
++    case 32:
++        code.LDAXR(Wscratch2, Xscratch0);
++        code.CMP(Wscratch2, Wscratch1);
++        break;
++    case 64:
++        code.LDAXR(Xscratch2, Xscratch0);
++        code.CMP(Xscratch2, Xscratch1);
++        break;
++    }
++    code.B(NE, l_fail_cas_unlock);
++    const auto stlxr_location = code.xptr<CodePtr>();
++    switch (bitsize) {
++    case 8:
++        code.STLXRB(Wscratch2, Rvalue->toW(), Xscratch0);
++        break;
++    case 16:
++        code.STLXRH(Wscratch2, Rvalue->toW(), Xscratch0);
++        break;
++    case 32:
++        code.STLXR(Wscratch2, Rvalue->toW(), Xscratch0);
++        break;
++    case 64:
++        code.STLXR(Wscratch2, Rvalue->toX(), Xscratch0);
++        break;
++    }
++    code.CBNZ(Wscratch2, l_cas_loop);
++
++    // Store succeeded! Clear all matching reservations in this stripe before unlocking.
++    // Xaddr and Rvalue are dead now; Wresult (as Xresult) holds zero-extended masked_vaddr.
++    code.MOV(*Wresult, Xaddr->toW());
++    const oaknut::XReg Xvaddr = Wresult->toX();
++
++    code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++    EmitStripeActiveWordPtr(code, mon, Xscratch2, 0);  // Xscratch0 = &stripe_active[base]
++    if (mon.words_per_stripe > 1) {
++        code.STR(Xscratch0, Xstate, ctx.conf.state_exclusive_scratch0_offset);
++    }
++
++    for (size_t w = 0; w < mon.words_per_stripe; ++w) {
++        oaknut::Label l_word_done, l_bit_loop;
++        if (w > 0) {
++            code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_scratch0_offset);
++        }
++        code.LDR(Xscratch1, Xscratch0, w * 8);
++        code.CBZ(Xscratch1, l_word_done);
++
++        if (w == proc_word) {
++            oaknut::Label l_not_solo;
++            code.MOV(Xscratch2, proc_bit_mask);
++            code.CMP(Xscratch1, Xscratch2);
++            code.B(NE, l_not_solo);
++            code.STR(XZR, Xscratch0, w * 8);
++            code.MOV(Xscratch1, mon.excl_addr_proc_ptr);
++            code.MOV(Xscratch2, ExclusiveMonitor::InvalidExclusiveAddress());
++            code.STR(Xscratch2, Xscratch1);
++            code.B(l_word_done);
++            code.l(l_not_solo);
++        }
++
++        if (mon.words_per_stripe == 1) {
++            code.STR(Xscratch0, Xstate, ctx.conf.state_exclusive_scratch0_offset);
++        }
++        code.STR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch1_offset);  // keep
++
++        code.l(l_bit_loop);
++        oaknut::Label l_skip_clear;
++        code.RBIT(Xscratch0, Xscratch1);
++        code.CLZ(Xscratch0, Xscratch0);  // bit (0..63)
++        code.MOV(Xscratch2, 1);
++        code.LSL(Xscratch2, Xscratch2, Xscratch0);  // mask
++        code.BIC(Xscratch1, Xscratch1, Xscratch2);  // cur &= ~mask
++        code.STR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch2_offset);
++
++        if (w != 0) {
++            const size_t base_idx = w << 6;
++            if (base_idx <= 0xfff) {
++                code.ADD(Xscratch0, Xscratch0, base_idx);
++            } else {
++                code.MOV(Xscratch1, base_idx);
++                code.ADD(Xscratch0, Xscratch0, Xscratch1);
++            }
++        }
++        code.LSL(Xscratch0, Xscratch0, 3);
++        code.MOV(Xscratch1, mon.excl_addr_base_ptr);
++        code.ADD(Xscratch0, Xscratch1, Xscratch0);
++        code.LDR(Xscratch1, Xscratch0);
++        code.CMP(Xscratch1, Xvaddr);
++        code.B(NE, l_skip_clear);
++        code.MOV(Xscratch1, ExclusiveMonitor::InvalidExclusiveAddress());
++        code.STR(Xscratch1, Xscratch0);
++        code.LDR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch1_offset);
++        code.BIC(Xscratch1, Xscratch1, Xscratch2);
++        code.STR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch1_offset);
++        code.l(l_skip_clear);
++
++        code.LDR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch2_offset);
++        code.CBNZ(Xscratch1, l_bit_loop);
++
++        code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_scratch0_offset);
++        code.LDR(Xscratch1, Xstate, ctx.conf.state_exclusive_scratch1_offset);
++        code.STR(Xscratch1, Xscratch0, w * 8);
++
++        code.l(l_word_done);
++    }
++
++    code.MOV(Xscratch0, mon.proc_stripe_ptr);
++    code.MOV(Xscratch1, ExclusiveMonitor::InvalidStripe());
++    code.STR(Xscratch1, Xscratch0);
++
++    code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++    EmitSpinLockUnlock(code, Xscratch2);
++    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.MOV(*Wresult, 0);
++    code.B(*end);
++
++    code.l(l_fail_cas_unlock);
++    code.CLREX();
++    EmitClearSelfMonitorState(code, ctx, mon);
++    code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++    code.l(l_fail_unlock);
++    EmitSpinLockUnlock(code, Xscratch2);
++    code.l(l_fail_no_unlock);
++    code.CLREX();
++    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.MOV(*Wresult, 1);
++    code.B(*end);
++
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wresult = *Wresult, ordered, fallback_locked, fallback, end, ldaxr_location, stlxr_location] {
++        code.l(*fallback_locked);
++        const u64 locked_call_pc = mcl::bit_cast<u64>(code.xptr<void*>());
++        code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_lock_ptr_offset);
++        EmitSpinLockUnlock(code, Xscratch2);
++
++        const FakeCall fc{
++            .call_pc = locked_call_pc,
++        };
++        ctx.ebi.fastmem_patch_info.emplace(
++            ldaxr_location - ctx.ebi.entry_point,
++            FastmemPatchInfo{
++                .marker = marker,
++                .fc = fc,
++                .recompile = ctx.conf.recompile_on_exclusive_fastmem_failure,
++            });
++        ctx.ebi.fastmem_patch_info.emplace(
++            stlxr_location - ctx.ebi.entry_point,
++            FastmemPatchInfo{
++                .marker = marker,
++                .fc = fc,
++                .recompile = ctx.conf.recompile_on_exclusive_fastmem_failure,
++            });
++
++        code.l(*fallback);
++        code.CLREX();
++        code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
++        code.MOV(Xscratch0, Xaddr);
++        code.MOV(Xscratch1, Rvalue.toX());
++        if (ordered) {
++            code.DMB(oaknut::BarrierOp::ISH);
++        }
++        EmitRelocation(code, ctx, WrappedExclusiveWriteMemoryLinkTarget(bitsize));
++        if (ordered) {
++            code.DMB(oaknut::BarrierOp::ISH);
++        }
++        code.MOV(Wresult, Wscratch0);
++        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
++        code.B(*end);
++    });
++
++    code.l(*end);
++}
++
+ }  // namespace
+ 
+ template<size_t bitsize>
+@@ -640,6 +1082,14 @@ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
+ 
+ template<size_t bitsize>
+ void EmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if constexpr (bitsize != 128) {
++        if (ctx.conf.fastmem_exclusive_access && ctx.conf.exclusive_monitor.has_value()) {
++            if (const auto marker = ShouldFastmem(ctx, inst)) {
++                FastmemEmitExclusiveReadMemory<bitsize>(code, ctx, inst, *marker);
++                return;
++            }
++        }
++    }
+     CallbackOnlyEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
+ }
+ 
+@@ -656,6 +1106,14 @@ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* in
+ 
+ template<size_t bitsize>
+ void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if constexpr (bitsize != 128) {
++        if (ctx.conf.fastmem_exclusive_access && ctx.conf.exclusive_monitor.has_value()) {
++            if (const auto marker = ShouldFastmem(ctx, inst)) {
++                FastmemEmitExclusiveWriteMemory<bitsize>(code, ctx, inst, *marker);
++                return;
++            }
++        }
++    }
+     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_packed.cpp b/src/dynarmic/backend/arm64/emit_arm64_packed.cpp
+index b9f13ac6..acee4651 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_packed.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_packed.cpp
+@@ -39,7 +39,7 @@ static void EmitSaturatedPackedOp(oaknut::CodeGenerator&, EmitContext& ctx, IR::
+     auto Va = ctx.reg_alloc.ReadD(args[0]);
+     auto Vb = ctx.reg_alloc.ReadD(args[1]);
+     RegAlloc::Realize(Vresult, Va, Vb);
+-    ctx.fpsr.Spill();
++    ctx.fpsr.Load();
+ 
+     emit(Vresult, Va, Vb);
+ }
+diff --git a/src/dynarmic/backend/arm64/exclusive_monitor.cpp b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+index d57a29cd..495a3b74 100644
+--- a/src/dynarmic/backend/arm64/exclusive_monitor.cpp
++++ b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+@@ -12,7 +12,15 @@
+ namespace Dynarmic {
+ 
+ ExclusiveMonitor::ExclusiveMonitor(size_t processor_count)
+-        : exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS), exclusive_values(processor_count) {}
++        : exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS)
++        , exclusive_values(processor_count)
++        , words_per_stripe((processor_count + 63) / 64)
++        , stripe_active(kStripeCount * words_per_stripe, 0)
++        , processor_stripe(std::make_unique<std::atomic<size_t>[]>(processor_count)) {
++    for (size_t i = 0; i < processor_count; ++i) {
++        processor_stripe[i].store(kInvalidStripe, std::memory_order_relaxed);
++    }
++}
+ 
+ size_t ExclusiveMonitor::GetProcessorCount() const {
+     return exclusive_addresses.size();
+@@ -26,33 +34,89 @@ void ExclusiveMonitor::Unlock() {
+     lock.Unlock();
+ }
+ 
++void ExclusiveMonitor::LockForRead(size_t processor_id, size_t new_stripe, VAddr masked_address) {
++    const size_t old_stripe = processor_stripe[processor_id].load(std::memory_order_relaxed);
++    if (old_stripe == kInvalidStripe || old_stripe == new_stripe) {
++        stripes[new_stripe].lock.Lock();
++    } else {
++        const size_t lo = std::min(old_stripe, new_stripe);
++        const size_t hi = std::max(old_stripe, new_stripe);
++        stripes[lo].lock.Lock();
++        stripes[hi].lock.Lock();
++        exclusive_addresses[processor_id] = INVALID_EXCLUSIVE_ADDRESS;
++        stripe_active[old_stripe * words_per_stripe + (processor_id >> 6)] &=
++            ~(std::uint64_t{1} << (processor_id & 63));
++        stripes[old_stripe].lock.Unlock();
++    }
++    exclusive_addresses[processor_id] = masked_address;
++    stripe_active[new_stripe * words_per_stripe + (processor_id >> 6)] |=
++        std::uint64_t{1} << (processor_id & 63);
++    processor_stripe[processor_id].store(new_stripe, std::memory_order_relaxed);
++}
++
+ bool ExclusiveMonitor::CheckAndClear(size_t processor_id, VAddr address) {
+     const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
++    const size_t stripe = StripeIndex(masked_address);
+ 
+-    Lock();
++    stripes[stripe].lock.Lock();
+     if (exclusive_addresses[processor_id] != masked_address) {
+-        Unlock();
++        stripes[stripe].lock.Unlock();
+         return false;
+     }
+ 
+-    for (VAddr& other_address : exclusive_addresses) {
+-        if (other_address == masked_address) {
+-            other_address = INVALID_EXCLUSIVE_ADDRESS;
++    const size_t base = stripe * words_per_stripe;
++    for (size_t w = 0; w < words_per_stripe; ++w) {
++        std::uint64_t active = stripe_active[base + w];
++        while (active != 0) {
++            const unsigned bit = static_cast<unsigned>(__builtin_ctzll(active));
++            active &= active - 1;
++            const size_t other = (w << 6) | bit;
++            if (exclusive_addresses[other] == masked_address) {
++                exclusive_addresses[other] = INVALID_EXCLUSIVE_ADDRESS;
++                stripe_active[base + w] &= ~(std::uint64_t{1} << bit);
++            }
+         }
+     }
++    processor_stripe[processor_id].store(kInvalidStripe, std::memory_order_relaxed);
+     return true;
+ }
+ 
+ void ExclusiveMonitor::Clear() {
+-    Lock();
+-    std::fill(exclusive_addresses.begin(), exclusive_addresses.end(), INVALID_EXCLUSIVE_ADDRESS);
+-    Unlock();
++    for (size_t s = 0; s < kStripeCount; ++s) {
++        stripes[s].lock.Lock();
++    }
++    for (size_t s = 0; s < kStripeCount; ++s) {
++        const size_t base = s * words_per_stripe;
++        for (size_t w = 0; w < words_per_stripe; ++w) {
++            std::uint64_t active = stripe_active[base + w];
++            if (active == 0) continue;
++            stripe_active[base + w] = 0;
++            while (active != 0) {
++                const unsigned bit = static_cast<unsigned>(__builtin_ctzll(active));
++                active &= active - 1;
++                exclusive_addresses[(w << 6) | bit] = INVALID_EXCLUSIVE_ADDRESS;
++            }
++        }
++    }
++    for (size_t i = 0; i < exclusive_addresses.size(); ++i) {
++        processor_stripe[i].store(kInvalidStripe, std::memory_order_relaxed);
++    }
++    for (size_t s = kStripeCount; s-- > 0;) {
++        stripes[s].lock.Unlock();
++    }
+ }
+ 
+ void ExclusiveMonitor::ClearProcessor(size_t processor_id) {
+-    Lock();
++    const size_t stripe = processor_stripe[processor_id].load(std::memory_order_relaxed);
++    if (stripe == kInvalidStripe) {
++        return;
++    }
++    stripes[stripe].lock.Lock();
+     exclusive_addresses[processor_id] = INVALID_EXCLUSIVE_ADDRESS;
+-    Unlock();
++    stripe_active[stripe * words_per_stripe + (processor_id >> 6)] &=
++        ~(std::uint64_t{1} << (processor_id & 63));
++    processor_stripe[processor_id].store(kInvalidStripe, std::memory_order_relaxed);
++    stripes[stripe].lock.Unlock();
+ }
+ 
+ }  // namespace Dynarmic
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.cpp b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+index 1c614745..76418879 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.cpp
++++ b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+@@ -37,6 +37,12 @@ void FpsrManager::Load() {
+     fpsr_loaded = true;
+ }
+ 
++void FpsrManager::Overwrite() {
++    code.MSR(oaknut::SystemReg::FPSR, XZR);
++
++    fpsr_loaded = true;
++}
++
+ void FpsrManager::GetFpsr(oaknut::WReg dest) {
+     code.LDR(dest, Xstate, state_fpsr_offset);
+ 
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.h b/src/dynarmic/backend/arm64/fpsr_manager.h
+index 9e5d68bf..44c28991 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.h
++++ b/src/dynarmic/backend/arm64/fpsr_manager.h
+@@ -20,14 +20,15 @@ public:
+ 
+     void Spill();
+     void Load();
+-    void Overwrite() { fpsr_loaded = false; }
++    void Overwrite();
+ 
+     void GetFpsr(oaknut::WReg);
+ 
+ private:
+     oaknut::CodeGenerator& code;
+     size_t state_fpsr_offset;
+-    bool fpsr_loaded = false;
++    // Persistent FPSR invariant: every block entry/exit keeps hardware FPSR live.
++    bool fpsr_loaded = true;
+ };
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/backend/arm64/stack_layout.h b/src/dynarmic/backend/arm64/stack_layout.h
+index cf7f3259..a0bd1ee3 100644
+--- a/src/dynarmic/backend/arm64/stack_layout.h
++++ b/src/dynarmic/backend/arm64/stack_layout.h
+@@ -37,6 +37,8 @@ struct alignas(16) StackLayout {
+ 
+     u32 save_host_fpcr;
+ 
++    u32 save_host_fpsr;
++
+     bool check_bit;
+ };
+ 
+diff --git a/src/dynarmic/common/spin_lock_arm64.cpp b/src/dynarmic/common/spin_lock_arm64.cpp
+index ccf807e2..449b7792 100644
+--- a/src/dynarmic/common/spin_lock_arm64.cpp
++++ b/src/dynarmic/common/spin_lock_arm64.cpp
+@@ -3,9 +3,8 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
+-#include <mutex>
++#include <sched.h>
+ 
+-#include <oaknut/code_block.hpp>
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/abi.h"
+@@ -35,52 +34,27 @@ void EmitSpinLockUnlock(oaknut::CodeGenerator& code, oaknut::XReg ptr) {
+     code.STLR(WZR, ptr);
+ }
+ 
+-namespace {
+-
+-struct SpinLockImpl {
+-    SpinLockImpl();
+-
+-    void Initialize();
+-
+-    oaknut::CodeBlock mem;
+-    oaknut::CodeGenerator code;
+-
+-    void (*lock)(volatile int*);
+-    void (*unlock)(volatile int*);
+-};
+-
+-std::once_flag flag;
+-SpinLockImpl impl;
+-
+-SpinLockImpl::SpinLockImpl()
+-        : mem{4096}
+-        , code{mem.ptr(), mem.ptr()} {}
+-
+-void SpinLockImpl::Initialize() {
+-    mem.unprotect();
+-
+-    lock = code.xptr<void (*)(volatile int*)>();
+-    EmitSpinLockLock(code, X0);
+-    code.RET();
+-
+-    unlock = code.xptr<void (*)(volatile int*)>();
+-    EmitSpinLockUnlock(code, X0);
+-    code.RET();
+-
+-    mem.protect();
+-    mem.invalidate_all();
+-}
+-
+-}  // namespace
+-
+ void SpinLock::Lock() {
+-    std::call_once(flag, &SpinLockImpl::Initialize, impl);
+-    impl.lock(&storage);
++    if (__builtin_expect(__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) == 0, 1)) {
++        return;
++    }
++    unsigned spins = 0;
++    for (;;) {
++        if (__atomic_load_n(&storage, __ATOMIC_RELAXED) == 0 &&
++            __atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) == 0) {
++            return;
++        }
++        if (++spins >= 2048) {
++            spins = 0;
++            ::sched_yield();
++        } else {
++            __asm__ volatile("yield" ::: "memory");
++        }
++    }
+ }
+ 
+ void SpinLock::Unlock() {
+-    std::call_once(flag, &SpinLockImpl::Initialize, impl);
+-    impl.unlock(&storage);
++    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
+ }
+ 
+ }  // namespace Dynarmic
+diff --git a/src/dynarmic/interface/exclusive_monitor.h b/src/dynarmic/interface/exclusive_monitor.h
+index 48136758..014638a8 100644
+--- a/src/dynarmic/interface/exclusive_monitor.h
++++ b/src/dynarmic/interface/exclusive_monitor.h
+@@ -10,6 +10,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <memory>
+ #include <vector>
+ 
+ #include <dynarmic/common/spin_lock.h>
+@@ -35,12 +36,21 @@ public:
+         static_assert(std::is_trivially_copyable_v<T>);
+         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
+ 
++#if defined(__aarch64__)
++        const size_t stripe = StripeIndex(masked_address);
++        LockForRead(processor_id, stripe, masked_address);
++        const T value = op();
++        std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
++        stripes[stripe].lock.Unlock();
++        return value;
++#else
+         Lock();
+         exclusive_addresses[processor_id] = masked_address;
+         const T value = op();
+         std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+         Unlock();
+         return value;
++#endif
+     }
+ 
+     /// Checks to see if processor processor_id has exclusive access to the
+@@ -58,7 +68,11 @@ public:
+         std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
+         const bool result = op(saved_value);
+ 
++#if defined(__aarch64__)
++        stripes[StripeIndex(address & RESERVATION_GRANULE_MASK)].lock.Unlock();
++#else
+         Unlock();
++#endif
+         return result;
+     }
+ 
+@@ -67,6 +81,36 @@ public:
+     /// Unmark processor id
+     void ClearProcessor(size_t processor_id);
+ 
++#if defined(__aarch64__)
++    struct InlineArm64Layout {
++        std::uint64_t stripes_ptr;
++        std::uint64_t excl_addr_base_ptr;
++        std::uint64_t excl_addr_proc_ptr;
++        std::uint64_t excl_val_proc_ptr;
++        std::uint64_t stripe_active_ptr;
++        std::uint64_t proc_stripe_ptr;
++        size_t words_per_stripe;
++        size_t processor_id;
++    };
++
++    InlineArm64Layout GetInlineArm64Layout(size_t processor_id) const {
++        return InlineArm64Layout{
++            .stripes_ptr = reinterpret_cast<std::uint64_t>(stripes.data()),
++            .excl_addr_base_ptr = reinterpret_cast<std::uint64_t>(exclusive_addresses.data()),
++            .excl_addr_proc_ptr = reinterpret_cast<std::uint64_t>(exclusive_addresses.data() + processor_id),
++            .excl_val_proc_ptr = reinterpret_cast<std::uint64_t>(exclusive_values.data() + processor_id),
++            .stripe_active_ptr = reinterpret_cast<std::uint64_t>(stripe_active.data()),
++            .proc_stripe_ptr = reinterpret_cast<std::uint64_t>(processor_stripe.get() + processor_id),
++            .words_per_stripe = words_per_stripe,
++            .processor_id = processor_id,
++        };
++    }
++
++    static constexpr std::uint64_t InvalidExclusiveAddress() { return INVALID_EXCLUSIVE_ADDRESS; }
++    static constexpr size_t InvalidStripe() { return kInvalidStripe; }
++    static constexpr size_t StripeByteStride() { return sizeof(Stripe); }
++#endif
++
+ private:
+     bool CheckAndClear(size_t processor_id, VAddr address);
+ 
+@@ -83,6 +127,26 @@ private:
+     SpinLock lock;
+     std::vector<VAddr> exclusive_addresses;
+     std::vector<Vector> exclusive_values;
++
++#if defined(__aarch64__)
++    static constexpr size_t kStripeCount = 64;
++    static constexpr size_t kInvalidStripe = ~size_t{0};
++
++    struct alignas(64) Stripe {
++        SpinLock lock;
++    };
++
++    static size_t StripeIndex(VAddr masked_address) {
++        return static_cast<size_t>(((masked_address >> 2) * 0x9e3779b97f4a7c15ull) >> 58);
++    }
++
++    void LockForRead(size_t processor_id, size_t new_stripe, VAddr masked_address);
++
++    std::array<Stripe, kStripeCount> stripes{};
++    size_t words_per_stripe = 0;
++    std::vector<std::uint64_t> stripe_active;
++    std::unique_ptr<std::atomic<size_t>[]> processor_stripe;
++#endif
+ };
+ 
+ }  // namespace Dynarmic

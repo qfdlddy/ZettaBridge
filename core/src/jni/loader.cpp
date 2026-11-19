@@ -182,8 +182,10 @@ void JniLoader::bind_guest_loaded_libraries(JniBackend::Env env, JniLoadReport& 
         if (!bind_exports(env, symbols, handle, swept, has_onload)) {
             log("cannot bind the exports of %s, which the guest loaded itself: %s", path.c_str(),
                 swept.error.c_str());
+            if (backend_.exception_check(env)) backend_.exception_clear(env);
             continue;
         }
+        if (backend_.exception_check(env)) backend_.exception_clear(env);
         report.bound_methods += swept.bound_methods;
         report.skipped_classes += swept.skipped_classes;
         report.skipped_exports += swept.skipped_exports;
@@ -202,16 +204,22 @@ JniLoadReport JniLoader::load(JniBackend::Env env, const std::string& path,
         return report;
     }
 
+    // Claim path before dlopen so a concurrent loader's bind_guest_loaded_libraries() sweep
+    // cannot bind the same library while this call is loading it.
+    {
+        std::lock_guard<std::mutex> lock(missing_mutex_);
+        swept_libraries_.insert(path);
+    }
     report.guest_handle = host_jni_.load_library_on_current(env, path, guest_flags, report.error);
     if (report.guest_handle == 0) {
+        {
+            std::lock_guard<std::mutex> lock(missing_mutex_);
+            swept_libraries_.erase(path);
+        }
         report.error = "guest dlopen failed: " + report.error;
         return report;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(missing_mutex_);
-        swept_libraries_.insert(path);  // never bind the library ART asked for twice
-    }
     bool has_onload = false;
     if (!bind_exports(env, symbols, report.guest_handle, report, has_onload)) return report;
 

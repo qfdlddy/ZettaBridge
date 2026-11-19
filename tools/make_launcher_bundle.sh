@@ -8,7 +8,8 @@ OUT="$ROOT/build/launcher"
 ASSETS="$OUT/assets"
 ZB="$ASSETS/zb"
 JNI="$OUT/jniLibs/arm64-v8a"
-ANDROID="$ROOT/build/android-arm64/core"
+# Overridable so a checkout can build into its own directory (e.g. build/android-arm64-local).
+ANDROID="${ZB_ANDROID_BUILD:-$ROOT/build/android-arm64}/core"
 GUEST="$ROOT/build/guest"
 
 SYSROOT_FILES="
@@ -27,7 +28,7 @@ system/lib/libz.so
 for required in "$ANDROID/libzbridge.so" "$ANDROID/libzbproxy.so" "$GUEST/zbhost" \
         "$GUEST/lib/libzbcompat.so" "$GUEST/lib/libzbjni.so" "$GUEST/lib/libGLESv2.so" \
         "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libEGL.so" "$GUEST/lib/libandroid.so" \
-        "$GUEST/lib/libjnigraphics.so"; do
+        "$GUEST/lib/libjnigraphics.so" "$GUEST/lib/libOpenSLES.so"; do
     if [ ! -f "$required" ]; then
         echo "missing $required (build the Android core and guest artifacts first)" >&2
         exit 1
@@ -49,7 +50,7 @@ done
 cp "$GUEST/zbhost" "$ZB/guest/zbhost"
 cp "$GUEST/lib/libzbcompat.so" "$GUEST/lib/libzbjni.so" \
     "$GUEST/lib/libGLESv2.so" "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libEGL.so" "$GUEST/lib/libandroid.so" \
-    "$GUEST/lib/libjnigraphics.so" \
+    "$GUEST/lib/libjnigraphics.so" "$GUEST/lib/libOpenSLES.so" \
     "$ZB/guest/lib/"
 cp "$ANDROID/libzbproxy.so" "$ZB/host/libzbproxy.so"
 cp "$ANDROID/libzbridge.so" "$JNI/libzbridge.so"
@@ -58,5 +59,12 @@ cp "$ANDROID/libzbridge.so" "$JNI/libzbridge.so"
 VERSION=$(cd "$ASSETS" && while IFS= read -r file; do sha256sum "$file"; done < zb-files.txt | sha256sum | cut -d' ' -f1)
 printf '%s\n' "$VERSION" > "$ASSETS/zb-version.txt"
 
-"$ROOT/tools/check_launcher_bundle.py" "$OUT"
+STANDALONE_LIB="$ROOT/build/android-arm64-standalone/core/libzbridge.so"
+if [ -f "$STANDALONE_LIB" ]; then
+    mkdir -p "$ASSETS/zb-standalone"
+    cp "$STANDALONE_LIB" "$ASSETS/zb-standalone/libzbridge.so"
+fi
+
+PYTHON=$(command -v python3 || command -v python)
+"$PYTHON" "$ROOT/tools/check_launcher_bundle.py" "$OUT"
 du -sh "$OUT"

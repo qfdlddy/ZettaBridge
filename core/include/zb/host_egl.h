@@ -143,6 +143,7 @@ public:
     // the same handle, so guest equality comparisons behave like a real driver's.
     std::uint32_t handle_for(const void* value) { return handle_for(value, EglObject::Surface); }
     std::uint32_t handle_for(const void* value, EglObject kind);
+    void forget_handle(std::uint32_t handle);
     const void* value_for(std::uint32_t handle) const;
     // nullopt when the handle is unknown or holds an object of another class.
     std::optional<const void*> lookup(std::uint32_t handle, EglObject kind) const;
@@ -167,7 +168,6 @@ private:
     std::unordered_map<std::uint32_t, EglObject> kinds_;
     std::uint32_t libegl_ = 0;
     std::uint32_t libgles_ = 0;
-    bool libegl_tried_ = false;
 };
 
 }  // namespace zb

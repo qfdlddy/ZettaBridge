@@ -32,7 +32,8 @@ inline constexpr std::uint32_t kHostReturnAddress = 0xFFFF0F00;
 int host_interrupt_signal();
 
 // Translated-code cache of one JIT. Carrier JITs only run thread start-up and parking.
-inline constexpr std::size_t kDefaultCodeCacheSize = 32 * 1024 * 1024;
+inline constexpr std::size_t kDefaultCodeCacheSize = 128 * 1024 * 1024;
+inline constexpr std::size_t kWorkerCodeCacheSize = 64 * 1024 * 1024;
 inline constexpr std::size_t kCarrierCodeCacheSize = 2 * 1024 * 1024;
 
 struct GuestResult {
@@ -84,7 +85,14 @@ public:
     std::optional<GuestResult> call(std::uint32_t target, const GuestCall& args,
                                     const GuestStopHandler& handle_stop);
     // Drop translated code for [addr, addr + len). Safe to call from other host threads.
-    void invalidate(std::uint32_t addr, std::uint32_t len);
+    void invalidate(std::uint32_t addr, std::uint64_t len);
+
+    using FastSvcHandler = bool (*)(void* ctx, GuestThread& thread, std::uint32_t swi);
+    void set_fast_svc_handler(FastSvcHandler handler, void* ctx) {
+        fast_svc_handler_ = handler;
+        fast_svc_ctx_ = ctx;
+    }
+    bool in_fast_svc() const { return in_fast_svc_; }
 
     // Queues a signal for this thread, interrupts its JIT, wakes park() and interrupts a host
     // syscall this thread blocks in. Async-signal-safe.
@@ -135,6 +143,25 @@ public:
     std::size_t child_code_cache_size = 0;
     // Host tid of the host thread running this guest thread.
     std::int32_t tid = 0;
+    // Kernel tid of the host thread currently executing guest code on this GuestThread. Matches
+    // `tid` for regular guest pthreads, and temporarily holds the borrowing Java thread's tid
+    // (such as UnityMain) inside Carrier::call(). Diagnostics only; signals still route by `tid`.
+    std::atomic<std::int32_t> host_tid{0};
+
+    std::int32_t diagnostic_tid() const {
+        const std::int32_t active = host_tid.load(std::memory_order_relaxed);
+        return active != 0 ? active : tid;
+    }
+
+    std::uint32_t gl_batch_addr() const { return gl_batch_addr_; }
+    void set_gl_batch_addr(std::uint32_t addr) {
+        gl_batch_addr_ = addr;
+        if (addr == 0) gl_batch_host_ptr_ = nullptr;
+    }
+    void* gl_batch_host_ptr() const { return gl_batch_host_ptr_; }
+    void set_gl_batch_host_ptr(void* ptr) { gl_batch_host_ptr_ = ptr; }
+    std::uint32_t gl_slot_addr() const { return gl_slot_addr_; }
+    void set_gl_slot_addr(std::uint32_t addr) { gl_slot_addr_ = addr; }
 
     std::uint8_t MemoryRead8(std::uint32_t vaddr) override;
     std::uint16_t MemoryRead16(std::uint32_t vaddr) override;
@@ -149,6 +176,7 @@ public:
     bool MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) override;
     bool MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) override;
     std::optional<std::uint32_t> MemoryReadCode(std::uint32_t vaddr) override;
+    bool IsReadOnlyMemory(std::uint32_t vaddr) override;
     void InterpreterFallback(std::uint32_t pc, std::size_t num_instructions) override;
     void CallSVC(std::uint32_t swi) override;
     void ExceptionRaised(std::uint32_t pc, Dynarmic::A32::Exception exception) override;
@@ -165,12 +193,23 @@ private:
     std::uint32_t tpidrurw_ = 0;
     std::shared_ptr<Cp15> cp15_;
     std::unique_ptr<Dynarmic::A32::Jit> jit_;
+    FastSvcHandler fast_svc_handler_ = nullptr;
+    void* fast_svc_ctx_ = nullptr;
+    bool in_fast_svc_ = false;
     Stop pending_;
     std::atomic<std::uint64_t> pending_signals_{0};
+    // Per-signal lock-free publication state: 0 = free, 1 = writing, 2 = ready.
+    std::array<std::atomic<std::uint8_t>, 65> pending_state_{};
     std::array<g::siginfo32, 65> pending_info_{};
     // futex word; std::atomic<std::uint32_t> has the layout of std::uint32_t.
     std::atomic<std::uint32_t> park_word_{0};
     std::atomic<std::uint32_t> blocking_{0};
+    std::uint32_t gl_batch_addr_ = 0;
+    void* gl_batch_host_ptr_ = nullptr;
+    std::uint32_t gl_slot_addr_ = 0;
 };
+
+// Thread-safe runtime override for ZB_UNSAFE_FP (avoids ::setenv in multi-threaded processes).
+void set_unsafe_fp_override(bool enabled);
 
 }  // namespace zb

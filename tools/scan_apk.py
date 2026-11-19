@@ -40,13 +40,16 @@ NATIVE_ACTIVITY = "Landroid/app/NativeActivity;"
 def read_uleb128(data, offset):
     result = 0
     shift = 0
-    while True:
+    while shift < 35:
+        if offset >= len(data):
+            raise ValueError("truncated uleb128")
         byte = data[offset]
         offset += 1
         result |= (byte & 0x7F) << shift
         if byte < 0x80:
             return result, offset
         shift += 7
+    raise ValueError("uleb128 exceeds 5 bytes")
 
 
 def dex_superclasses(data):
@@ -134,20 +137,18 @@ def badging(path):
 
 
 def scan(path):
+    info = badging(path)
+    activity = info.get("activity", "")
     try:
         with zipfile.ZipFile(path) as apk:
             names = apk.namelist()
+            native_activity, chain = descends_from_native_activity(apk, names, activity)
     except (zipfile.BadZipFile, OSError) as e:
         return "%s: not readable (%s)" % (path, e)
 
     abis = sorted({n.split("/")[1] for n in names if n.startswith("lib/") and n.count("/") >= 2})
     libs = [n.rsplit("/", 1)[-1] for n in names if n.startswith("lib/") and n.endswith(".so")]
     engine = next((label for marker, label in ENGINE_MARKERS if any(marker in lib for lib in libs)), "")
-
-    info = badging(path)
-    activity = info.get("activity", "")
-    with zipfile.ZipFile(path) as apk:
-        native_activity, chain = descends_from_native_activity(apk, names, activity)
 
     if not abis:
         verdict = "no native code: runs as an ordinary app, nothing to translate"

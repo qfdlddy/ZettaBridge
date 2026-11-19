@@ -86,6 +86,9 @@ public class GuestLaunchActivity extends Activity {
         Intent target = new Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
                 .setClassName(packageName, record.launcherActivity);
+        if (record.unityMt) {
+            target.putExtra("unity", "-force-gfx-mt");
+        }
         Intent routed = runtime.route(target);
         if (routed == target) throw new IllegalStateException(record.launcherActivity + " is not a plugin activity");
         startActivity(routed);

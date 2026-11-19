@@ -49,6 +49,15 @@ final class Reflect {
         }
     }
 
+    /** Best-effort field read: null instead of failing. */
+    static Object tryGet(Class<?> cls, Object target, String name) {
+        try {
+            return field(cls, name).get(target);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
+        }
+    }
+
     /** Invokes a method, rethrowing the target's own exception unwrapped. */
     static Object invoke(Method m, Object target, Object... args) {
         try {

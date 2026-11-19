@@ -18,7 +18,7 @@ import java.io.IOException;
  */
 final class ManifestReader {
     private static final String ANDROID_NS = "http://schemas.android.com/apk/res/android";
-    private static final int MAX_COOKIES = 64;
+    private static final int MAX_COOKIES = 256;
 
     private ManifestReader() {}
 
@@ -61,9 +61,17 @@ final class ManifestReader {
                     if (!packageName.equals(p.getAttributeValue(null, "package"))) return result;
                     result.matched = true;
                 } else if (tag.equals("activity")) {
-                    component = resolve(packageName, p.getAttributeValue(ANDROID_NS, "name"));
+                    if ("false".equals(p.getAttributeValue(ANDROID_NS, "enabled"))) {
+                        component = null;
+                    } else {
+                        component = resolve(packageName, p.getAttributeValue(ANDROID_NS, "name"));
+                    }
                 } else if (tag.equals("activity-alias")) {
-                    component = resolve(packageName, p.getAttributeValue(ANDROID_NS, "targetActivity"));
+                    if ("false".equals(p.getAttributeValue(ANDROID_NS, "enabled"))) {
+                        component = null;
+                    } else {
+                        component = resolve(packageName, p.getAttributeValue(ANDROID_NS, "targetActivity"));
+                    }
                 } else if (tag.equals("intent-filter") && component != null) {
                     inFilter = true;
                     main = false;

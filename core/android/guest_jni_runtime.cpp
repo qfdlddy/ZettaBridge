@@ -34,7 +34,7 @@ GuestJniRuntime* GuestJniRuntime::peek() {
 GuestJniRuntime::GuestJniRuntime(JavaVM* vm)
     : backend_(vm),
       engine_(backend_, gl_backend_, asset_backend_, egl_backend_, window_backend_, looper_backend_,
-              input_backend_, configuration_backend_),
+              input_backend_, configuration_backend_, opensl_backend_),
       native_activity_glue_(*engine_.host_native_activity(), engine_.host_native_window(), engine_.host_input()),
       proxies_(engine_) {
     engine_.set_native_activity_platform(&native_activity_glue_);

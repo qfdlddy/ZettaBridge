@@ -23,6 +23,8 @@ final class PluginRecord {
     String packageName;
     String label;
     String launcherActivity;
+    /** Optional override for the plugin Application class (e.g. to neutralize a mod's PMS hook). */
+    String application;
     String versionName;
     int targetSdk;
     /** ABI extracted into lib/, or null for Java-only/unsupported/legacy imports. */
@@ -33,6 +35,10 @@ final class PluginRecord {
     boolean preciseFaults = false;
     /** Debugging: GL instrumentation (framebuffer readbacks, per-draw pixel diffs). Very slow. */
     boolean diagnostics = false;
+    /** Performance: allow relaxed IEEE-754 FP optimizations (ZB_UNSAFE_FP) in the translator. */
+    boolean unsafeFp = false;
+    /** Experimental: pass -force-gfx-mt to UnityPlayer to request multi-threaded rendering. */
+    boolean unityMt = false;
     /** Every ABI directory found under lib/ in the APK. */
     final Set<String> abis = new TreeSet<>();
 
@@ -101,6 +107,7 @@ final class PluginRecord {
         p.setProperty("package", packageName);
         p.setProperty("label", label);
         if (launcherActivity != null) p.setProperty("launcher", launcherActivity);
+        if (application != null) p.setProperty("application", application);
         if (versionName != null) p.setProperty("version", versionName);
         p.setProperty("targetSdk", Integer.toString(targetSdk));
         p.setProperty("abis", String.join(",", abis));
@@ -108,9 +115,11 @@ final class PluginRecord {
         p.setProperty("hideAds", Boolean.toString(hideAds));
         p.setProperty("preciseFaults", Boolean.toString(preciseFaults));
         p.setProperty("diagnostics", Boolean.toString(diagnostics));
-        try (OutputStream out = new FileOutputStream(new File(dir, "meta.properties"))) {
-            p.store(out, "ZettaBridge plugin");
-        }
+        p.setProperty("unsafeFp", Boolean.toString(unsafeFp));
+        p.setProperty("unityMt", Boolean.toString(unityMt));
+        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        p.store(buffer, "ZettaBridge plugin");
+        PluginFiles.copyAtomic(new java.io.ByteArrayInputStream(buffer.toByteArray()), new File(dir, "meta.properties"));
     }
 
     static PluginRecord load(File dir) {
@@ -127,6 +136,7 @@ final class PluginRecord {
         if (r.packageName == null) return null;
         r.label = p.getProperty("label", r.packageName);
         r.launcherActivity = p.getProperty("launcher");
+        r.application = p.getProperty("application");
         r.versionName = p.getProperty("version");
         try {
             r.targetSdk = Integer.parseInt(p.getProperty("targetSdk", "0"));
@@ -140,6 +150,8 @@ final class PluginRecord {
         r.hideAds = !"false".equals(p.getProperty("hideAds"));
         r.preciseFaults = "true".equals(p.getProperty("preciseFaults"));
         r.diagnostics = "true".equals(p.getProperty("diagnostics"));
+        r.unsafeFp = "true".equals(p.getProperty("unsafeFp"));
+        r.unityMt = "true".equals(p.getProperty("unityMt"));
         // Phase 0 arm64 imports are already complete. Old 32-bit records must be reimported so
         // every library passes through the non-atomic ELF fixer before metadata says ready.
         if (r.selectedAbi == null && r.abis.contains(ABI_ARM64)) r.selectedAbi = ABI_ARM64;

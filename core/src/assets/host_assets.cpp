@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -11,6 +12,7 @@
 #include "zb/guest_memory.h"
 #include "zb/host_jni.h"
 #include "zb/log.h"
+#include "zb/runtime_report.h"
 
 namespace zb {
 
@@ -51,9 +53,12 @@ std::uint64_t HostAssets::require_asset(std::uint32_t handle) const {
     return assets_.get(handle).value_or(0);
 }
 
-std::uint32_t HostAssets::asset_buffer(std::uint64_t asset) {
-    const auto cached = asset_buffers_.find(asset);
-    if (cached != asset_buffers_.end()) return cached->second;
+std::uint32_t HostAssets::asset_buffer(std::uint32_t asset_handle, std::uint64_t asset) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto cached = asset_buffers_.find(asset_handle);
+        if (cached != asset_buffers_.end()) return cached->second.guest_addr;
+    }
 
     const std::int64_t length = backend_.length(asset);
     const void* host = backend_.buffer(asset);
@@ -62,9 +67,12 @@ std::uint32_t HostAssets::asset_buffer(std::uint64_t asset) {
         return 0;
     }
     const auto size = static_cast<std::uint64_t>(length);
-    if (size > kMaxBufferedBytes || buffered_bytes_ + size > kMaxBufferedBytes) {
-        log("AAsset_getBuffer: %llu bytes exceed the buffer budget", static_cast<unsigned long long>(size));
-        return 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (size > kMaxBufferedBytes || buffered_bytes_ + size > kMaxBufferedBytes) {
+            log("AAsset_getBuffer: %llu bytes exceed the buffer budget", static_cast<unsigned long long>(size));
+            return 0;
+        }
     }
     // Guest malloc runs guest code on this thread; HostAssets holds no lock here.
     GuestCall args;
@@ -75,15 +83,115 @@ std::uint32_t HostAssets::asset_buffer(std::uint64_t asset) {
             static_cast<unsigned long long>(size));
         return 0;
     }
-    std::uint8_t* destination = runtime_.memory().host_ptr(allocated->r0, size, kPageRead | kPageWrite);
+    const std::uint32_t guest_addr = allocated->r0;
+    std::uint8_t* destination = runtime_.memory().host_ptr(guest_addr, size, kPageRead | kPageWrite);
     if (destination == nullptr) {
         log("AAsset_getBuffer: the guest allocator returned an unusable buffer");
+        GuestCall free_args;
+        free_args.regs = {guest_addr, 0, 0, 0};
+        (void)runtime_.call_on_current(runtime_.service_api().free_fn, free_args);
         return 0;
     }
     std::memcpy(destination, host, size);
-    asset_buffers_.emplace(asset, allocated->r0);
-    buffered_bytes_ += size;
-    return allocated->r0;
+
+    std::uint32_t result_addr = 0;
+    bool discard = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto existing = asset_buffers_.find(asset_handle);
+        if (existing != asset_buffers_.end()) {
+            result_addr = existing->second.guest_addr;
+            discard = true;
+        } else if (size > kMaxBufferedBytes || buffered_bytes_ + size > kMaxBufferedBytes) {
+            discard = true;
+        } else {
+            asset_buffers_.emplace(asset_handle, BufferedAsset{guest_addr, size});
+            buffered_bytes_ += size;
+            result_addr = guest_addr;
+        }
+    }
+    if (discard) {
+        GuestCall free_args;
+        free_args.regs = {guest_addr, 0, 0, 0};
+        (void)runtime_.call_on_current(runtime_.service_api().free_fn, free_args);
+    }
+    return result_addr;
+}
+
+void HostAssets::note_open(const std::string& name, std::int32_t mode, std::uint64_t asset,
+                           std::int64_t length) {
+    std::uint64_t index = 0;
+    std::uint64_t opens = 0, open_failures = 0, reads = 0, read_bytes = 0, read_errors = 0, short_reads = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        index = ++opens_;
+        if (asset == 0) ++open_failures_;
+        opens = opens_;
+        open_failures = open_failures_;
+        reads = reads_;
+        read_bytes = read_bytes_;
+        read_errors = read_errors_;
+        short_reads = short_reads_;
+    }
+#if !defined(ZB_NO_TELEMETRY)
+    if (index <= kMaxLoggedOpens) {
+        char text[RuntimeReport::kMaxDetail];
+        std::snprintf(text, sizeof text, "%s mode=%d %s len=%lld", name.c_str(),
+                      static_cast<int>(mode), asset == 0 ? "FAILED" : "ok",
+                      static_cast<long long>(length));
+        runtime_report().note_io_detail("asset-open-" + std::to_string(index), text);
+    }
+    if (index <= kMaxLoggedOpens || (index & (index - 1)) == 0 || asset == 0) {
+        char counts[RuntimeReport::kMaxDetail];
+        std::snprintf(counts, sizeof counts,
+                      "opens=%llu failed=%llu reads=%llu bytes=%llu errors=%llu short=%llu",
+                      static_cast<unsigned long long>(opens),
+                      static_cast<unsigned long long>(open_failures),
+                      static_cast<unsigned long long>(reads),
+                      static_cast<unsigned long long>(read_bytes),
+                      static_cast<unsigned long long>(read_errors),
+                      static_cast<unsigned long long>(short_reads));
+        runtime_report().note_io_detail("asset-counts", counts);
+    }
+#else
+    (void)name; (void)mode; (void)length; (void)index;
+    (void)opens; (void)open_failures; (void)reads; (void)read_bytes; (void)read_errors; (void)short_reads;
+#endif
+}
+
+void HostAssets::note_read(std::int64_t result, std::uint32_t requested) {
+    std::uint64_t opens = 0, open_failures = 0, reads = 0, read_bytes = 0, read_errors = 0, short_reads = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reads = ++reads_;
+        if (result < 0) {
+            ++read_errors_;
+        } else {
+            read_bytes_ += static_cast<std::uint64_t>(result);
+            if (static_cast<std::uint64_t>(result) < requested) ++short_reads_;
+        }
+        opens = opens_;
+        open_failures = open_failures_;
+        read_bytes = read_bytes_;
+        read_errors = read_errors_;
+        short_reads = short_reads_;
+    }
+#if !defined(ZB_NO_TELEMETRY)
+    if (reads <= 8 || (reads & (reads - 1)) == 0 || (reads % 1024) == 0 || result < 0) {
+        char counts[RuntimeReport::kMaxDetail];
+        std::snprintf(counts, sizeof counts,
+                      "opens=%llu failed=%llu reads=%llu bytes=%llu errors=%llu short=%llu",
+                      static_cast<unsigned long long>(opens),
+                      static_cast<unsigned long long>(open_failures),
+                      static_cast<unsigned long long>(reads),
+                      static_cast<unsigned long long>(read_bytes),
+                      static_cast<unsigned long long>(read_errors),
+                      static_cast<unsigned long long>(short_reads));
+        runtime_report().note_io_detail("asset-counts", counts);
+    }
+#else
+    (void)opens; (void)open_failures; (void)reads; (void)read_bytes; (void)read_errors; (void)short_reads;
+#endif
 }
 
 bool HostAssets::handle_host_call(std::uint32_t index, GuestThread& thread) {
@@ -100,16 +208,34 @@ bool HostAssets::handle_host_call(std::uint32_t index, GuestThread& thread) {
     }
     case ZB_ASSET_HC_AAssetManager_open: {
         const std::uint64_t manager = require_manager(regs[0]);
+        const std::int32_t mode = static_cast<std::int32_t>(regs[2]);
         bool ok = false;
         std::string filename;
         if (manager != 0) filename = read_guest_string(runtime_.memory(), regs[1], ok);
         std::uint64_t asset = 0;
-        if (manager != 0 && ok) asset = backend_.open(manager, filename, static_cast<std::int32_t>(regs[2]));
+        if (manager != 0 && ok) asset = backend_.open(manager, filename, mode);
+        note_open(filename, mode, asset, asset == 0 ? -1 : backend_.length(asset));
         regs[0] = asset == 0 ? 0 : assets_.add(asset);
         return true;
     }
     case ZB_ASSET_HC_AAsset_close: {
-        const std::optional<std::uint64_t> asset = assets_.remove(regs[0]);
+        const std::uint32_t handle = regs[0];
+        const std::optional<std::uint64_t> asset = assets_.remove(handle);
+        std::uint32_t guest_buf = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto buf_it = asset_buffers_.find(handle);
+            if (buf_it != asset_buffers_.end()) {
+                guest_buf = buf_it->second.guest_addr;
+                if (buffered_bytes_ >= buf_it->second.size) buffered_bytes_ -= buf_it->second.size;
+                asset_buffers_.erase(buf_it);
+            }
+        }
+        if (guest_buf != 0) {
+            GuestCall free_args;
+            free_args.regs = {guest_buf, 0, 0, 0};
+            (void)runtime_.call_on_current(runtime_.service_api().free_fn, free_args);
+        }
         if (asset && *asset != 0) backend_.close(*asset);
         regs[0] = 0;
         return true;
@@ -142,11 +268,13 @@ bool HostAssets::handle_host_call(std::uint32_t index, GuestThread& thread) {
             }
         }
         regs[0] = static_cast<std::uint32_t>(static_cast<std::int32_t>(result));
+        note_read(result, count);
         return true;
     }
     case ZB_ASSET_HC_AAsset_getBuffer: {
-        const std::uint64_t asset = require_asset(regs[0]);
-        regs[0] = asset != 0 ? asset_buffer(asset) : 0;
+        const std::uint32_t handle = regs[0];
+        const std::uint64_t asset = require_asset(handle);
+        regs[0] = asset != 0 ? asset_buffer(handle, asset) : 0;
         return true;
     }
     case ZB_ASSET_HC_AAsset_openFileDescriptor: {

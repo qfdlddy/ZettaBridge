@@ -1,7 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
-#include <vector>
+#include <memory>
 
 namespace zb {
 
@@ -17,6 +18,7 @@ enum PageFlags : std::uint8_t {
 };
 
 inline std::uint64_t page_round_up(std::uint64_t v) {
+    if (v > ~static_cast<std::uint64_t>(kPageMask)) return ~static_cast<std::uint64_t>(0);
     return (v + kPageMask) & ~static_cast<std::uint64_t>(kPageMask);
 }
 
@@ -52,16 +54,34 @@ public:
     bool range_free(std::uint32_t addr, std::uint64_t len) const;
 
     // True if every page touched by [addr, addr + len) is mapped with all `need` flags.
-    bool accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const;
+    inline bool accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const {
+        if (__builtin_expect(len == 0, 0)) return true;
+        if (__builtin_expect(len > kGuestSpaceSize - static_cast<std::uint64_t>(addr), 0)) return false;
+        const std::uint64_t end = static_cast<std::uint64_t>(addr) + len;
+        const std::uint8_t mask = need | kPageMapped;
+        const std::uint64_t first = addr >> 12;
+        const std::uint64_t last = (end - 1) >> 12;
+        if (__builtin_expect(first == last, 1)) {
+            return (pages_[first].load(std::memory_order_acquire) & mask) == mask;
+        }
+        return accessible_span(first, last, mask);
+    }
+    // True if any page touched by [addr, addr + len) has all bits in `flags`.
+    bool any_flag(std::uint32_t addr, std::uint64_t len, std::uint8_t flags) const;
     // Host pointer to [addr, addr + len) if accessible, else nullptr.
-    std::uint8_t* host_ptr(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const;
-    std::uint8_t page_flags(std::uint32_t addr) const { return pages_[addr >> 12]; }
+    inline std::uint8_t* host_ptr(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const {
+        return accessible(addr, len, need) ? base_ + addr : nullptr;
+    }
+    std::uint8_t page_flags(std::uint32_t addr) const {
+        return pages_[addr >> 12].load(std::memory_order_acquire);
+    }
 
 private:
+    bool accessible_span(std::uint64_t first, std::uint64_t last, std::uint8_t mask) const;
     void set_flags(std::uint32_t addr, std::uint64_t len, std::uint8_t flags);
 
     std::uint8_t* base_ = nullptr;
-    std::vector<std::uint8_t> pages_;
+    std::unique_ptr<std::atomic<std::uint8_t>[]> pages_;
 };
 
 }  // namespace zb

@@ -31,6 +31,23 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
+    buildFeatures {
+        buildConfig = true
+    }
+
+    flavorDimensions += "mode"
+    productFlavors {
+        create("launcher") {
+            dimension = "mode"
+            buildConfigField("boolean", "STANDALONE_MODE", "false")
+            buildConfigField("boolean", "DISABLE_DIAGNOSTICS", "false")
+        }
+    }
+
+    androidResources {
+        noCompress += listOf("apk", "obb", "so")
+    }
+
     signingConfigs {
         if (hasReleaseKey) {
             create("release") {
@@ -43,21 +60,26 @@ android {
     }
     buildTypes {
         release {
+            isDebuggable = false
             isMinifyEnabled = false
-            if (hasReleaseKey) signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (hasReleaseKey) signingConfigs.getByName("release") else null
         }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    sourceSets.getByName("main") {
-        assets.srcDir(rootProject.file("../../build/launcher/assets"))
-        jniLibs.srcDir(rootProject.file("../../build/launcher/jniLibs"))
+    sourceSets {
+        getByName("launcher") {
+            assets.srcDir(rootProject.file("../../build/launcher/assets"))
+            jniLibs.srcDir(rootProject.file("../../build/launcher/jniLibs"))
+        }
     }
 }
 
 dependencies {
     // Apache-2.0. Lifts hidden API restrictions for the framework hooks in the :guest process.
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
+    // Apache-2.0. Pure-Java v1/v2/v3 APK signer for on-device standalone APK export.
+    implementation("com.android.tools.build:apksig:8.7.3")
 }

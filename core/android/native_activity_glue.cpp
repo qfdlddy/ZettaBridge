@@ -148,9 +148,14 @@ void NativeActivityGlue::on_window_destroyed(ANativeActivity* activity, ANativeW
     // The guest is told before the handle dies, so it can still query the window it is losing.
     attachment.activities->deliver(attachment.guest_activity, GuestCallback::OnNativeWindowDestroyed,
                                    attachment.window_handle);
-    std::lock_guard<std::mutex> lock(g_mutex);
-    const auto entry = g_attachments.find(activity);
-    if (entry != g_attachments.end()) entry->second.window_handle = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto entry = g_attachments.find(activity);
+        if (entry != g_attachments.end()) entry->second.window_handle = 0;
+    }
+    if (attachment.windows != nullptr && attachment.window_handle != 0) {
+        attachment.windows->release_window_handle(attachment.window_handle);
+    }
 }
 
 void NativeActivityGlue::on_input_queue_created(ANativeActivity* activity, AInputQueue* queue) {

@@ -131,12 +131,33 @@ std::uint32_t HostEgl::handle_for(const void* value, EglObject kind) {
     if (value == nullptr) return 0;
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = by_value_.find(value);
-    if (found != by_value_.end()) return found->second;
+    if (found != by_value_.end()) {
+        const auto kind_it = kinds_.find(found->second);
+        if (kind_it != kinds_.end() && kind_it->second == kind) {
+            return found->second;
+        }
+        // Host address was recycled for a different EGL object kind; retire the stale mapping.
+        objects_.remove(found->second);
+        kinds_.erase(found->second);
+        by_value_.erase(found);
+    }
     const std::uint32_t handle = objects_.add(reinterpret_cast<std::uint64_t>(value));
     if (handle == 0) return 0;
     by_value_.emplace(value, handle);
     kinds_.emplace(handle, kind);
     return handle;
+}
+
+void HostEgl::forget_handle(std::uint32_t handle) {
+    if (handle == 0) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::optional<std::uint64_t> value = objects_.remove(handle);
+    kinds_.erase(handle);
+    if (value && *value != 0) {
+        const void* ptr = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(*value));
+        const auto it = by_value_.find(ptr);
+        if (it != by_value_.end() && it->second == handle) by_value_.erase(it);
+    }
 }
 
 const void* HostEgl::value_for(std::uint32_t handle) const {
@@ -159,14 +180,16 @@ std::optional<const void*> HostEgl::lookup(std::uint32_t handle, EglObject kind)
 
 std::uint32_t HostEgl::stub_address(const std::string& name) {
     if (stubs_) return stubs_(name);
-    // Any guest library already loaded, which covers gl* in libGLESv2.so as well as egl*: Skia and
-    // Impeller resolve every GL entry point through eglGetProcAddress, so an EGL-only lookup left
-    // them without a single GL function.
+    // Search our own stub libraries FIRST so a guest library exporting a gl* variable/helper
+    // (common in GLAD/GLEW loaders) cannot shadow the real stub in libGLESv2.so/libEGL.so.
     std::string error;
-    const std::uint32_t global = runtime_.find_symbol(ZB_GUEST_RTLD_DEFAULT, name, error);
-    if (global != 0) return global;
     for (const char* library : {"libEGL.so", "libGLESv2.so"}) {
-        std::uint32_t& handle = std::strcmp(library, "libEGL.so") == 0 ? libegl_ : libgles_;
+        const bool is_egl = std::strcmp(library, "libEGL.so") == 0;
+        std::uint32_t handle = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            handle = is_egl ? libegl_ : libgles_;
+        }
         if (handle == 0) {
             std::string load_error;
             handle = runtime_.load_library(library, ZB_GUEST_RTLD_NOW, load_error);
@@ -174,11 +197,15 @@ std::uint32_t HostEgl::stub_address(const std::string& name) {
                 log("eglGetProcAddress: guest %s is not loadable: %s", library, load_error.c_str());
                 continue;
             }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (is_egl) libegl_ = handle;
+            else libgles_ = handle;
         }
         const std::uint32_t address = runtime_.find_symbol(handle, name, error);
         if (address != 0) return address;
     }
-    return 0;
+    const std::uint32_t global = runtime_.find_symbol(ZB_GUEST_RTLD_DEFAULT, name, error);
+    return global;
 }
 
 std::optional<std::uint32_t> HostEgl::allocate_guest(std::size_t size) {
@@ -236,6 +263,9 @@ bool HostEgl::handle_host_call(std::uint32_t index, GuestThread& thread) {
     }
     if (index == ZB_EGL_HC_eglMakeCurrent) {
         runtime_report().note_egl_current(static_cast<std::uint64_t>(::syscall(SYS_gettid)));
+        runtime_.bump_gl_epoch();
+    } else if (index == ZB_EGL_HC_eglReleaseThread) {
+        runtime_.bump_gl_epoch();
     }
     Call call(*this, thread, index);
     if (dispatch(call)) {

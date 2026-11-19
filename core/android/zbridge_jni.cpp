@@ -8,26 +8,105 @@
 
 #include "guest_jni_runtime.h"
 #include "zb/elf_fixups.h"
+#include "zb/guest_thread.h"
 #include "zb/log.h"
+#include "zb/process.h"
 #include "zb/runtime_report.h"
 #include "zb/zbridge.h"
 
 namespace {
 
+// Converts arbitrary UTF-8 (which may contain 4-byte supplementary code points or invalid bytes)
+// into valid Modified UTF-8 (CESU-8) accepted by ART CheckJNI's NewStringUTF / ThrowNew.
+std::string to_mutf8(const std::string& input) {
+    std::string out;
+    out.reserve(input.size());
+    const auto* s = reinterpret_cast<const unsigned char*>(input.data());
+    const std::size_t n = input.size();
+    std::size_t i = 0;
+    auto push_utf16 = [&](std::uint16_t u) {
+        if (u != 0 && u <= 0x7Fu) {
+            out.push_back(static_cast<char>(u));
+        } else if (u <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | ((u >> 6) & 0x1Fu)));
+            out.push_back(static_cast<char>(0x80u | (u & 0x3Fu)));
+        } else {
+            out.push_back(static_cast<char>(0xE0u | ((u >> 12) & 0x0Fu)));
+            out.push_back(static_cast<char>(0x80u | ((u >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (u & 0x3Fu)));
+        }
+    };
+    while (i < n) {
+        const unsigned char c = s[i];
+        if (c == 0) {
+            out.push_back(static_cast<char>(0xC0));
+            out.push_back(static_cast<char>(0x80));
+            ++i;
+        } else if (c < 0x80u) {
+            out.push_back(static_cast<char>(c));
+            ++i;
+        } else if ((c & 0xE0u) == 0xC0u && i + 1 < n && (s[i + 1] & 0xC0u) == 0x80u) {
+            const std::uint32_t cp = ((c & 0x1Fu) << 6) | (s[i + 1] & 0x3Fu);
+            if (cp >= 0x80u) {
+                push_utf16(static_cast<std::uint16_t>(cp));
+                i += 2;
+            } else {
+                out.push_back('?');
+                ++i;
+            }
+        } else if ((c & 0xF0u) == 0xE0u && i + 2 < n && (s[i + 1] & 0xC0u) == 0x80u &&
+                   (s[i + 2] & 0xC0u) == 0x80u) {
+            const std::uint32_t cp = ((c & 0x0Fu) << 12) | ((s[i + 1] & 0x3Fu) << 6) | (s[i + 2] & 0x3Fu);
+            if (cp >= 0x800u && !(cp >= 0xD800u && cp <= 0xDFFFu)) {
+                push_utf16(static_cast<std::uint16_t>(cp));
+                i += 3;
+            } else {
+                out.push_back('?');
+                ++i;
+            }
+        } else if ((c & 0xF8u) == 0xF0u && i + 3 < n && (s[i + 1] & 0xC0u) == 0x80u &&
+                   (s[i + 2] & 0xC0u) == 0x80u && (s[i + 3] & 0xC0u) == 0x80u) {
+            const std::uint32_t cp = ((c & 0x07u) << 18) | ((s[i + 1] & 0x3Fu) << 12) |
+                                     ((s[i + 2] & 0x3Fu) << 6) | (s[i + 3] & 0x3Fu);
+            if (cp >= 0x10000u && cp <= 0x10FFFFu) {
+                const std::uint32_t v = cp - 0x10000u;
+                push_utf16(static_cast<std::uint16_t>(0xD800u + (v >> 10)));
+                push_utf16(static_cast<std::uint16_t>(0xDC00u + (v & 0x3FFu)));
+                i += 4;
+            } else {
+                out.push_back('?');
+                ++i;
+            }
+        } else {
+            out.push_back('?');
+            ++i;
+        }
+    }
+    return out;
+}
+
 std::vector<std::string> to_strings(JNIEnv* env, jobjectArray array) {
     std::vector<std::string> out;
-    if (array == nullptr) return out;
+    if (array == nullptr || env->ExceptionCheck()) return out;
     const jsize count = env->GetArrayLength(array);
     out.reserve(static_cast<std::size_t>(count));
     for (jsize i = 0; i < count; ++i) {
         auto value = static_cast<jstring>(env->GetObjectArrayElement(array, i));
+        if (env->ExceptionCheck()) {
+            if (value != nullptr) env->DeleteLocalRef(value);
+            return {};
+        }
         if (value == nullptr) {
             out.emplace_back();
             continue;
         }
         const char* chars = env->GetStringUTFChars(value, nullptr);
-        out.emplace_back(chars != nullptr ? chars : "");
-        if (chars != nullptr) env->ReleaseStringUTFChars(value, chars);
+        if (chars == nullptr) {
+            env->DeleteLocalRef(value);
+            return {};
+        }
+        out.emplace_back(chars);
+        env->ReleaseStringUTFChars(value, chars);
         env->DeleteLocalRef(value);
     }
     return out;
@@ -55,7 +134,8 @@ void throw_new(JNIEnv* env, const char* class_name, const std::string& message) 
     if (env->ExceptionCheck()) return;
     jclass cls = env->FindClass(class_name);
     if (cls == nullptr) return;  // NoClassDefFoundError pending
-    env->ThrowNew(cls, message.c_str());
+    const std::string safe = to_mutf8(message);
+    env->ThrowNew(cls, safe.c_str());
     env->DeleteLocalRef(cls);
 }
 
@@ -63,8 +143,13 @@ zb::JniBackend::Env to_env(JNIEnv* env) {
     return static_cast<zb::JniBackend::Env>(reinterpret_cast<std::uintptr_t>(env));
 }
 
+jstring new_safe_string(JNIEnv* env, const std::string& value) {
+    const std::string safe = to_mutf8(value);
+    return env->NewStringUTF(safe.c_str());
+}
+
 jstring optional_string(JNIEnv* env, const std::optional<std::string>& value) {
-    return value ? env->NewStringUTF(value->c_str()) : nullptr;
+    return value ? new_safe_string(env, *value) : nullptr;
 }
 
 }  // namespace
@@ -78,20 +163,20 @@ JNIEXPORT jint JNICALL Java_com_zettabridge_core_ZBridge_runExecutable(JNIEnv* e
     std::string sysroot_path;
     if (sysroot != nullptr) {
         const char* chars = env->GetStringUTFChars(sysroot, nullptr);
-        if (chars != nullptr) {
-            sysroot_path = chars;
-            env->ReleaseStringUTFChars(sysroot, chars);
-        }
+        if (chars == nullptr) return 2;
+        sysroot_path = chars;
+        env->ReleaseStringUTFChars(sysroot, chars);
     }
 
     const std::vector<std::string> args = to_strings(env, argv);
-    if (args.empty()) return 2;
+    if (env->ExceptionCheck() || args.empty()) return 2;
     const std::vector<const char*> arg_pointers = to_pointers(args);
 
     std::vector<std::string> env_strings;
     std::vector<const char*> env_pointers;
     if (envp != nullptr) {
         env_strings = to_strings(env, envp);
+        if (env->ExceptionCheck()) return 2;
         env_pointers = to_pointers(env_strings);
     }
 
@@ -182,7 +267,7 @@ JNIEXPORT jboolean JNICALL Java_com_zettabridge_core_ZBridge_setReportFile(JNIEn
 
 // static native String runtimeReport(): the same text that setReportFile persists.
 JNIEXPORT jstring JNICALL Java_com_zettabridge_core_ZBridge_runtimeReport(JNIEnv* env, jclass) {
-    return env->NewStringUTF(zb::runtime_report().text().c_str());
+    return new_safe_string(env, zb::runtime_report().text());
 }
 
 // static native String fixGuestLibrary(String path) throws IOException
@@ -214,20 +299,26 @@ JNIEXPORT jstring JNICALL Java_com_zettabridge_core_ZBridge_fixGuestLibrary(JNIE
         throw_new(env, "java/io/IOException", *file + ": " + report.message);
         return nullptr;
     }
-    return env->NewStringUTF(summary.c_str());
+    return new_safe_string(env, summary);
 }
 
 // static native void setPreciseFaults(boolean enabled)
 // Must be called before the guest runtime/Process is constructed: LibraryRuntime is
-// process-lifetime and reads ZB_PRECISE_FAULTS only at Process construction.
+// process-lifetime and reads the override only at Process construction.
 JNIEXPORT void JNICALL Java_com_zettabridge_core_ZBridge_setPreciseFaults(JNIEnv*, jclass, jboolean enabled) {
-    ::setenv("ZB_PRECISE_FAULTS", enabled ? "1" : "0", 1);
+    zb::set_precise_faults_override(enabled != JNI_FALSE);
 }
 
 // static native void setGlDiagnostics(boolean enabled)
-// Must be called before the guest JNI runtime is constructed: it reads ZB_GL_DIAGNOSTICS once.
+// Must be called before the guest JNI runtime is constructed: it reads the override once.
 JNIEXPORT void JNICALL Java_com_zettabridge_core_ZBridge_setGlDiagnostics(JNIEnv*, jclass, jboolean enabled) {
-    ::setenv("ZB_GL_DIAGNOSTICS", enabled ? "1" : "0", 1);
+    zb::GuestJniRuntime::set_gl_diagnostics_override(enabled != JNI_FALSE);
+}
+
+// static native void setUnsafeFp(boolean enabled)
+// Must be called before the guest runtime/Process is constructed: GuestThread reads the override once.
+JNIEXPORT void JNICALL Java_com_zettabridge_core_ZBridge_setUnsafeFp(JNIEnv*, jclass, jboolean enabled) {
+    zb::set_unsafe_fp_override(enabled != JNI_FALSE);
 }
 
 }  // extern "C"

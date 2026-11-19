@@ -15,6 +15,16 @@ if (ANDROID)
     set(CMAKE_C_VISIBILITY_PRESET hidden)
     set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
     add_compile_options(-ffunction-sections -fdata-sections)
+    if (ANDROID_ABI STREQUAL "arm64-v8a")
+        # Use outline LSE atomics so ARMv8.1+ SoCs use hardware ldadd/casal while staying
+        # binary-compatible with baseline ARMv8.0 devices.
+        add_compile_options(-moutline-atomics)
+    endif()
+    option(ZB_ENABLE_LTO "Enable ThinLTO for Android Release builds" ON)
+    if (ZB_ENABLE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+        add_compile_options(-flto=thin)
+        add_link_options(-flto=thin)
+    endif()
 endif()
 
 set(DYNARMIC_FRONTENDS "A32" CACHE STRING "" FORCE)

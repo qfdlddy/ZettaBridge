@@ -42,6 +42,7 @@ bool read_exact(int fd, void* buf, std::size_t len, off_t offset) {
     std::size_t done = 0;
     while (done < len) {
         const ssize_t n = ::pread(fd, static_cast<char*>(buf) + done, len - done, offset + static_cast<off_t>(done));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         done += static_cast<std::size_t>(n);
     }
@@ -53,6 +54,7 @@ bool write_exact(int fd, const void* buf, std::size_t len, off_t offset) {
     while (done < len) {
         const ssize_t n = ::pwrite(fd, static_cast<const char*>(buf) + done, len - done,
                                    offset + static_cast<off_t>(done));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         done += static_cast<std::size_t>(n);
     }
@@ -135,10 +137,12 @@ ElfFixupReport fix_guest_library(const std::string& path) {
     }
     if (eh.e_machine != EM_ARM) return skipped("not an ARM ELF file");
     if (eh.e_ident[EI_VERSION] != EV_CURRENT || eh.e_version != EV_CURRENT ||
-        eh.e_phentsize != sizeof(Elf32_Phdr) || eh.e_phnum == 0 || eh.e_phnum > 1024) {
+        eh.e_phnum == 0 || eh.e_phnum > 1024) {
         return error("invalid ELF header");
     }
 
+    // Some packed Android .so files (e.g. libRMS.so) spoof e_phentsize != 32 while keeping
+    // standard 32-byte Elf32_Phdr entries at e_phoff (matching the bionic linker).
     const std::uint64_t phdr_size = static_cast<std::uint64_t>(eh.e_phnum) * sizeof(Elf32_Phdr);
     if (!range_fits(eh.e_phoff, phdr_size, file_size)) return error("truncated program headers");
 
@@ -290,7 +294,7 @@ bool elf_has_textrel_marker(int fd) {
     Elf32_Ehdr eh;
     if (!read_exact(fd, &eh, sizeof eh, 0)) return false;
     if (std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS32 ||
-        eh.e_phentsize != sizeof(Elf32_Phdr) || eh.e_phnum == 0 || eh.e_phnum > 64) {
+        eh.e_phnum == 0 || eh.e_phnum > 1024) {
         return false;
     }
     std::vector<Elf32_Phdr> phdrs(eh.e_phnum);

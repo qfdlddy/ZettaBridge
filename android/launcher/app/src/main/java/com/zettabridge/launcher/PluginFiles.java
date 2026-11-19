@@ -116,8 +116,7 @@ final class PluginFiles {
         // missing whatever that version's proxy could not do: an app updated after the proxy grew
         // ANativeActivity_onCreate would keep failing with "undefined symbol" forever.
         if (proxy.isFile() && proxy.lastModified() >= proxyTemplate.lastModified()) return proxy;
-        if (proxy.isFile() && !proxy.delete()) throw new IOException("cannot replace the stale proxy " + proxy);
-        if (proxy.exists()) throw new IOException("proxy path is not a file: " + proxy);
+        if (proxy.exists() && !proxy.isFile()) throw new IOException("proxy path is not a file: " + proxy);
 
         File temporary = Files.createTempFile(proxyDir.toPath(), "." + fileName + ".", ".tmp").toFile();
         try {
@@ -127,11 +126,7 @@ final class PluginFiles {
             if (!temporary.setReadOnly() || !temporary.setExecutable(true, true)) {
                 throw new IOException("cannot set proxy permissions: " + temporary);
             }
-            try {
-                move(temporary, proxy, false);
-            } catch (FileAlreadyExistsException ignored) {
-                // Another Java thread published the same immutable proxy first.
-            }
+            move(temporary, proxy, true);
         } finally {
             temporary.delete();
         }
@@ -150,6 +145,21 @@ final class PluginFiles {
         } finally {
             if (!published) temporary.delete();
         }
+    }
+
+    static void moveOrCopy(File from, File to) throws IOException {
+        File parent = to.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("cannot create " + parent);
+        try {
+            move(from, to, true);
+            return;
+        } catch (IOException ignored) {
+            // Fall back to copy + delete when staging and target span filesystems.
+        }
+        try (InputStream in = Files.newInputStream(from.toPath())) {
+            copyAtomic(in, to);
+        }
+        from.delete();
     }
 
     /** Publishes a complete staging directory, restoring the old target if publication fails. */
@@ -188,6 +198,7 @@ final class PluginFiles {
         deleteRecursive(stagedChild);
         deleteRecursive(backup);
         boolean movedOld = false;
+        boolean movedStaging = false;
         boolean movedChild = false;
         try {
             if (target.exists()) {
@@ -195,6 +206,7 @@ final class PluginFiles {
                 movedOld = true;
             }
             move(staging, target, false);
+            movedStaging = true;
             File oldChild = new File(backup, childName);
             File newChild = new File(target, childName);
             if (oldChild.exists()) {
@@ -207,15 +219,19 @@ final class PluginFiles {
         } catch (IOException failure) {
             File newChild = new File(target, childName);
             File oldChild = new File(backup, childName);
+            boolean childSafe = !movedChild;
             if (movedChild && newChild.exists() && !oldChild.exists()) {
                 try {
                     move(newChild, oldChild, false);
+                    childSafe = true;
                 } catch (IOException restoreChild) {
                     failure.addSuppressed(restoreChild);
                 }
             }
-            deleteRecursive(target);
-            if (movedOld && backup.exists()) {
+            if (movedStaging && childSafe) {
+                deleteRecursive(target);
+            }
+            if (movedOld && !target.exists() && backup.exists()) {
                 try {
                     move(backup, target, false);
                 } catch (IOException restore) {

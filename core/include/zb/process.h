@@ -23,10 +23,22 @@ class ExclusiveMonitor;
 
 namespace zb {
 
+// The library and function a generated host-call index names, or {"?", "?"} when it is unknown.
+// Shared with the watchdog so a stuck thread is reported as `host:libGLESv2.so glDrawArrays` rather
+// than as a bare index.
+std::pair<const char*, const char*> host_call_name(std::uint32_t index);
+
+// True for a host call that is a handshake rather than work: the carrier park returns only when the
+// borrowing Java thread releases the carrier, so its wall time is that thread's lifetime and never
+// evidence of a guest blocked in the bridge. Timing it as a slow call spends the report's budget on
+// a normal multi-minute lease.
+bool host_call_is_lease(std::uint32_t index);
+
 // One guest process: its address space, emulated kernel state and threads.
 class Process {
 public:
     using HostCallHandler = std::function<bool(std::uint32_t index, GuestThread& thread)>;
+    using FastHostCallHandler = bool (*)(void* ctx, std::uint32_t index, GuestThread& thread);
 
     static constexpr std::uint32_t kStackTop = 0xFF000000;
     static constexpr std::uint32_t kStackSize = 8 * 1024 * 1024;
@@ -52,6 +64,12 @@ public:
     // Handles svc #(0x5A0000 | index) before the generated host-call table; returns true if it
     // handled the index. Set before run().
     void set_host_call_handler(HostCallHandler handler) { host_call_handler_ = std::move(handler); }
+    // Optional lock-free, zero-halt fast host-call handler executed synchronously inside
+    // GuestThread::CallSVC. Must never block, request thread/process exit, or invoke call_guest().
+    void set_fast_host_call_handler(FastHostCallHandler handler, void* ctx) {
+        fast_host_call_handler_ = handler;
+        fast_host_call_ctx_ = ctx;
+    }
     // Runs a guest function on `thread`, which is stopped outside Dynarmic (typically inside a
     // host call), through the same stop dispatch as the thread's own loop. Returns nullopt when
     // the call cannot be laid out or the guest cannot continue:
@@ -152,7 +170,9 @@ public:
     bool in_guest_linker(std::uint32_t addr) const { return addr >= linker_start_ && addr < linker_end_; }
 
     // Drops translated code for the range in every thread.
-    void invalidate(std::uint32_t addr, std::uint32_t len);
+    void invalidate(std::uint32_t addr, std::uint64_t len);
+    // Delivers a process-directed signal to an unblocked guest thread, falling back to `fallback`.
+    void post_process_signal(GuestThread& fallback, const g::siginfo32& info);
     // True the first time `key` is seen; used to log each unsupported case once.
     bool first_time(std::uint64_t key);
 
@@ -164,12 +184,33 @@ public:
     void forget_mappings(std::uint32_t start, std::uint64_t length);
     // "libc.so offset 0x1234" style description, or "?" if the address is not file-backed.
     std::string describe_address(std::uint32_t addr) const;
+    // Compact "libunity.so+0x1a2b3" (ELF virtual address, for images our loader placed) or
+    // "libunity.so@0x1a2b3" (file offset, for images the guest's own linker mapped), empty
+    // otherwise. Diagnostics only: a guest stack holds no symbol table, so every candidate
+    // return address has to be recognized by the image it falls in.
+    std::string describe_code_address(std::uint32_t addr) const;
+
+    // Diagnostics only: the guest registers of `tid` plus stack words that look like Thumb return
+    // addresses into a loaded image, innermost first. False when `tid` is not a guest thread.
+    // Registers are copied under the thread registry lock so an exiting thread cannot be freed
+    // mid-read; the stack scan then reads guest memory only.
+    struct ThreadStateSample {
+        std::uint32_t pc = 0;
+        std::uint32_t lr = 0;
+        std::uint32_t sp = 0;
+        std::uint32_t fp = 0;
+        std::uint32_t arg[4] = {};  // r0-r3: the syscall arguments of a thread blocked in one
+        std::uint32_t arg_word = 0;  // the word r0 points at, when it is readable
+        bool arg_word_valid = false;
+        std::vector<std::string> chain;
+    };
+    static constexpr std::size_t kMaxChain = 16;
+    bool sample_thread_state(std::int32_t tid, ThreadStateSample& out);
 
     // Executable segments of libraries marked DT_ZB_TEXTREL (see elf_fixups.h). They stay
     // writable inside the emulator so text relocations can be applied. forget_mappings drops them.
     void add_textrel_range(std::uint32_t start, std::uint32_t length);
     bool overlaps_textrel_range(std::uint32_t start, std::uint64_t length) const;
-
     std::uint32_t brk_start = 0;
     std::uint32_t brk_current = 0;
     std::uint32_t mmap_limit = kMmapLimit;
@@ -187,6 +228,9 @@ private:
     };
 
     int allocate_processor_id();
+    void configure_thread(GuestThread& thread);
+    static bool fast_svc_entry(void* ctx, GuestThread& thread, std::uint32_t swi);
+    bool try_fast_svc(GuestThread& thread, std::uint32_t swi);
     void register_thread(GuestThread* thread);
     // Handles one stop; true if the thread may resume.
     bool dispatch_stop(GuestThread& thread, const Stop& stop);
@@ -194,20 +238,71 @@ private:
     bool after_stop(GuestThread& thread);
     // A fault or exception becomes a guest signal, or a crash report and process exit.
     bool fault_or_crash(GuestThread& thread, const Stop& stop);
+    // Records the first guest fault in the runtime report, symbolized by file mapping, so a fault
+    // the guest handles itself is still attributable from the persisted report.
+    void note_fault_details(GuestThread& thread, const g::siginfo32& info, const Stop& stop);
     // Runs a guest thread until it exits. Process-wide exits with other live threads end the
     // host process from here.
     void thread_loop(GuestThread& thread);
     void thread_main(std::unique_ptr<GuestThread> thread);
     // Thread exit bookkeeping: CLONE_CHILD_CLEARTID, then unregister_thread().
-    void finish_thread(GuestThread& thread);
-    // Retires the signal target publication, exclusive monitor slot, registry entry and
-    // processor id of a thread that runs no more guest code.
-    void unregister_thread(GuestThread& thread);
+    void finish_thread(std::unique_ptr<GuestThread>& thread);
+    // Retires the signal target publication, exclusive monitor slot, registry entry, frees the
+    // GuestThread/JIT, and only then releases its processor id.
+    void unregister_thread(std::unique_ptr<GuestThread>& thread);
+    std::string describe_address_locked(std::uint32_t addr) const;
+    std::string describe_code_address_locked(std::uint32_t addr) const;
     void wait_for_threads();
     [[noreturn]] void exit_host_process();
     void crash_report(const Stop& stop, GuestThread& thread) const;
     std::string build_maps() const;
     std::string build_stat() const;
+
+    // Guest code probes, diagnostics only. Each entry names a function entry in a loaded image;
+    // its first instruction (an IL2CPP push prologue) is replaced by svc #(0x5B0000 | index), so
+    // the report can say whether that function ran at all. Answers "did this method execute?" for
+    // code that leaves no other trace, which is the only way to see a dynamic dispatch target.
+    struct GuestProbe {
+        std::string name;
+        std::string module;
+        std::uint32_t module_offset = 0;
+        std::uint32_t address = 0;
+        std::uint32_t original = 0;
+        bool installed = false;
+        bool hit = false;
+        // Report the managed method name of an IL2CPP MethodInfo passed in r0 (see the "method" flag).
+        bool read_method_name = false;
+        // How many times the svc was reached, and whether the patched word was ever found restored
+        // (a text-relocation rewrite of the image would silently undo the probe).
+        std::uint32_t hits = 0;
+        bool reverted_reported = false;
+        // Bounded tally of managed method names seen at a "method" probe: the first calls of one
+        // function name what actually ran, and per-hit report lines would collide on one key.
+        std::vector<std::pair<std::string, std::uint32_t>> methods;
+        // Ring of the most recent callee names, so the steady-state dispatch set stays visible
+        // even after the distinct-name tally fills up.
+        static constexpr std::size_t kRecentNames = 256;
+        std::array<std::string, kRecentNames> recent;
+        std::size_t recent_next = 0;
+        // Unity dispatches MonoBehaviour messages (Awake, Update, ...) through this same entry,
+        // so counting the lifecycle names answers "is the per-frame tick dispatched at all".
+        static constexpr const char* kLifecycleNames[8] = {"Update",   "LateUpdate", "FixedUpdate", "Start",
+                                                           "Awake",    "OnEnable",   "OnDisable",   "OnDestroy"};
+        std::array<std::uint32_t, 8> lifecycle{};
+        // Resolved entry point of the first few per-frame methods seen, with the MethodInfo token,
+        // so a probe that reports no hit can be compared with the address actually used.
+        std::vector<std::pair<std::string, std::pair<std::uint32_t, std::uint32_t>>> code_entries;
+    };
+    // Reads the probe list once, from $ZB_GUEST_PROBES or a file beside the runtime report.
+    void load_probe_requests();
+    // Patches every requested probe whose image is already mapped, and reports what is installed.
+    void install_probes();
+    // Modules whose probe resolution address was already reported once.
+    std::vector<std::string> probe_map_reported_;
+    // Emulates the replaced prologue and records the first hit; false if `stop` is not a probe.
+    bool handle_probe(GuestThread& thread, const Stop& stop);
+    // Re-reads each installed probe's patched word and reports one that no longer holds the svc.
+    void verify_probes();
 
     GuestMemory mem_;
     std::unique_ptr<Dynarmic::ExclusiveMonitor> monitor_;
@@ -219,9 +314,10 @@ private:
     std::vector<GuestThread*> borrowers_;
     std::bitset<kMaxThreads> processor_ids_;
 
-    std::mutex mm_mutex_;
+    mutable std::mutex mm_mutex_;
     std::mutex signal_mutex_;
     std::mutex seen_mutex_;
+    mutable std::mutex probe_mutex_;
     std::set<std::uint64_t> seen_;
     std::vector<FileMapping> file_mappings_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> textrel_ranges_;
@@ -237,6 +333,17 @@ private:
     std::atomic<bool> exiting_{false};
     std::atomic<int> exit_status_{0};
     HostCallHandler host_call_handler_;
+    FastHostCallHandler fast_host_call_handler_ = nullptr;
+    void* fast_host_call_ctx_ = nullptr;
+    std::vector<GuestProbe> probes_;
+    bool probes_loaded_ = false;
+    std::atomic<bool> probes_installing_{false};
+    std::atomic<std::size_t> probes_resolved_{0};
+    std::size_t probes_reported_ = 0;
+    std::atomic<std::uint32_t> probe_verify_ticks_{0};
 };
+
+// Thread-safe runtime override for ZB_PRECISE_FAULTS (avoids ::setenv in multi-threaded processes).
+void set_precise_faults_override(bool enabled);
 
 }  // namespace zb

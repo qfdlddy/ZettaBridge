@@ -17,6 +17,17 @@
 
 namespace {
 
+// Keying a mapped buffer asks the driver for the current binding with glGetIntegerv, which is
+// bookkeeping, not a driver call the test is asserting about. Every other backend entry is a real
+// translated call.
+std::vector<std::string> driver_mutations(const MockGles& backend) {
+    std::vector<std::string> names;
+    for (const auto& call : backend.calls()) {
+        if (call.name != "glGetIntegerv") names.push_back(call.name);
+    }
+    return names;
+}
+
 constexpr std::uint32_t kStack = 0x10000;
 constexpr std::uint32_t kData = 0x20000;
 
@@ -412,7 +423,8 @@ int main() {
     set_words(runtime, thread, pointer_words);
     CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
     CHECK(thread.regs()[0] == 1);
-    CHECK(backend.calls().size() == 1 && backend.calls()[0].name == "glUnmapBuffer");
+    // Only the copy-back may mutate the driver buffer.
+    CHECK(driver_mutations(backend) == std::vector<std::string>{"glUnmapBuffer"});
     CHECK(std::count(driver_range.begin(), driver_range.end(), 0x5A) ==
           static_cast<long>(driver_range.size()));
 
@@ -437,6 +449,46 @@ int main() {
     pointer_words = {0x8892};
     set_words(runtime, thread, pointer_words);
     CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
+
+    // Bound write+invalidate mapping uses shadow glBufferSubData without calling driver map/unmap.
+    backend.clear_calls();
+    pointer_words = {0x8892, 9};
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glBindBuffer, thread));
+    backend.clear_calls();
+    pointer_words = {0x8892, 16, 32, 0x0006};  // GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glMapBufferRange, thread));
+    const std::uint32_t shadow_ptr = thread.regs()[0];
+    CHECK(shadow_ptr != 0);
+    CHECK(backend.calls().empty());
+    std::memset(runtime.memory().base() + shadow_ptr, 0x3C, 32);
+    pointer_words = {0x8892};
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
+    CHECK(thread.regs()[0] == 1);
+    CHECK(driver_mutations(backend) == std::vector<std::string>{"glBufferSubData"});
+    CHECK(backend.calls().size() == 1);
+    CHECK(backend.calls()[0].arguments[1] == 16 && backend.calls()[0].arguments[2] == 32);
+
+    // GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT flushes via subdata.
+    backend.clear_calls();
+    pointer_words = {0x8892, 16, 32, 0x0016};
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glMapBufferRange, thread));
+    const std::uint32_t flush_ptr = thread.regs()[0];
+    CHECK(flush_ptr != 0 && backend.calls().empty());
+    std::memset(runtime.memory().base() + flush_ptr + 8, 0x7E, 12);
+    pointer_words = {0x8892, 8, 12};
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glFlushMappedBufferRange, thread));
+    pointer_words = {0x8892};
+    set_words(runtime, thread, pointer_words);
+    CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
+    CHECK(thread.regs()[0] == 1);
+    CHECK(driver_mutations(backend) == std::vector<std::string>{"glBufferSubData"});
+    CHECK(backend.calls().size() == 1);
+    CHECK(backend.calls()[0].arguments[1] == 24 && backend.calls()[0].arguments[2] == 12);
 
     // GLES extension entry points (eglGetProcAddress names guests call without a null check).
     // EXT_multisampled_render_to_texture: both take only scalars, the shape that killed the
@@ -546,7 +598,7 @@ int main() {
     CHECK(host.handle_host_call(zb::ZB_GL_HC_glGetBufferPointervOES, thread));
     std::memcpy(&reported, runtime.memory().base() + kData + 0xFF8, sizeof(reported));
     CHECK(reported == oes_mapped);
-    CHECK(backend.calls().empty());  // answered from the mirror, never from the driver
+    CHECK(driver_mutations(backend).empty());  // answered from the mirror, never from the driver
 
     std::memset(runtime.memory().base() + oes_mapped, 0xC3, oes_range.size());
     backend.clear_calls();
@@ -554,7 +606,7 @@ int main() {
     set_words(runtime, thread, pointer_words);
     CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBufferOES, thread));
     CHECK(thread.regs()[0] == 1);
-    CHECK(backend.calls().size() == 1 && backend.calls()[0].name == "glUnmapBufferOES");
+    CHECK(driver_mutations(backend) == std::vector<std::string>{"glUnmapBufferOES"});
     CHECK(std::count(oes_range.begin(), oes_range.end(), 0xC3) ==
           static_cast<long>(oes_range.size()));
 
@@ -656,6 +708,85 @@ int main() {
     CHECK(legacy_report.find("gl-legacy-texture-error: internal=0x1906 format=0x1906 "
                              "error=0x500") != std::string::npos);
     CHECK(backend.error() == 0x0500);
+
+    // Driver GL/GLSL versions above 3.0 must be clamped to 3.0 because this bridge serves
+    // GLES 2.0 + 3.0 entry points only; otherwise engines like Unity call ES 3.1+ functions.
+    {
+        MockGles version_backend;
+        std::uint32_t version_allocation = kData + 0x500;
+        zb::HostGl version_host(runtime, version_backend,
+                                [&](std::size_t size) -> std::optional<std::uint32_t> {
+                                    const std::uint32_t result = version_allocation;
+                                    version_allocation += static_cast<std::uint32_t>((size + 7) & ~std::size_t{7});
+                                    if (version_allocation > kData + 0x7F0) return std::nullopt;
+                                    return result;
+                                });
+        version_backend.set_string(0x1F02, "OpenGL ES 3.2 V@123");
+        version_backend.set_string(0x8B8C, "OpenGL ES GLSL ES 3.20");
+        version_backend.set_integer(0x821B, 3);  // GL_MAJOR_VERSION
+        version_backend.set_integer(0x821C, 2);  // GL_MINOR_VERSION
+
+        pointer_words = {0x1F02};
+        set_words(runtime, thread, pointer_words);
+        CHECK(version_host.handle_host_call(zb::ZB_GL_HC_glGetString, thread));
+        CHECK(std::strcmp(reinterpret_cast<const char*>(runtime.memory().base() + thread.regs()[0]),
+                          "OpenGL ES 3.0 V@123") == 0);
+
+        pointer_words = {0x8B8C};
+        set_words(runtime, thread, pointer_words);
+        CHECK(version_host.handle_host_call(zb::ZB_GL_HC_glGetString, thread));
+        CHECK(std::strcmp(reinterpret_cast<const char*>(runtime.memory().base() + thread.regs()[0]),
+                          "OpenGL ES GLSL ES 3.00") == 0);
+
+        pointer_words = {0x821B, kData + 0xFA0};
+        set_words(runtime, thread, pointer_words);
+        CHECK(version_host.handle_host_call(zb::ZB_GL_HC_glGetIntegerv, thread));
+        std::int32_t ver_word = 0;
+        std::memcpy(&ver_word, runtime.memory().base() + kData + 0xFA0, sizeof(ver_word));
+        CHECK(ver_word == 3);
+
+        pointer_words = {0x821C, kData + 0xFA0};
+        set_words(runtime, thread, pointer_words);
+        CHECK(version_host.handle_host_call(zb::ZB_GL_HC_glGetIntegerv, thread));
+        std::memcpy(&ver_word, runtime.memory().base() + kData + 0xFA0, sizeof(ver_word));
+        CHECK(ver_word == 0);
+    }
+
+    // Two distinct buffers mapped through the same target (e.g. GL_COPY_WRITE_BUFFER) do not
+    // collide, and a buffer mapped on one target can be unmapped on another.
+    {
+        std::array<std::uint8_t, 16> buf1{};
+        std::array<std::uint8_t, 16> buf2{};
+        backend.clear_calls();
+        backend.set_result("glUnmapBuffer", 1);
+
+        backend.set_integer(0x8F37, 101);  // GL_COPY_WRITE_BUFFER_BINDING
+        backend.set_result("glMapBufferRange", reinterpret_cast<std::uint64_t>(buf1.data()));
+        pointer_words = {0x8F37, 0, static_cast<std::uint32_t>(buf1.size()), 0x0006};
+        set_words(runtime, thread, pointer_words);
+        CHECK(host.handle_host_call(zb::ZB_GL_HC_glMapBufferRange, thread));
+        const std::uint32_t guest1 = thread.regs()[0];
+        CHECK(guest1 != 0);
+
+        backend.set_integer(0x8F37, 102);
+        backend.set_result("glMapBufferRange", reinterpret_cast<std::uint64_t>(buf2.data()));
+        set_words(runtime, thread, pointer_words);
+        CHECK(host.handle_host_call(zb::ZB_GL_HC_glMapBufferRange, thread));
+        const std::uint32_t guest2 = thread.regs()[0];
+        CHECK(guest2 != 0 && guest2 != guest1);
+
+        std::memset(runtime.memory().base() + guest1, 0x33, buf1.size());
+        backend.set_integer(0x8894, 101);  // GL_ARRAY_BUFFER_BINDING
+        pointer_words = {0x8892};
+        set_words(runtime, thread, pointer_words);
+        CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
+        CHECK(std::count(buf1.begin(), buf1.end(), 0x33) == static_cast<long>(buf1.size()));
+
+        backend.set_integer(0x8F37, 102);
+        pointer_words = {0x8F37};
+        set_words(runtime, thread, pointer_words);
+        CHECK(host.handle_host_call(zb::ZB_GL_HC_glUnmapBuffer, thread));
+    }
 
     // The asset range is deliberately not swallowed by HostGl.
     CHECK(!host.handle_host_call(142, thread));

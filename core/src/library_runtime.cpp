@@ -1,5 +1,8 @@
 #include "zb/library_runtime.h"
 
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +61,8 @@ struct ParkedCarrier {
 struct LibraryRuntime::Impl {
     Process process;
     Process::HostCallHandler chained;
+    Process::FastHostCallHandler fast_chained = nullptr;
+    void* fast_chained_ctx = nullptr;
     std::thread runner;
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -68,6 +73,10 @@ struct LibraryRuntime::Impl {
     zb_service_api api{};
     GuestThread* service = nullptr;
     std::thread::id service_id;
+    std::atomic<std::uint32_t> gl_epoch{1};
+    std::atomic<std::uint32_t> guest_gl_epoch_addr{0};
+    std::atomic<std::uint32_t> gl_delete_epoch{1};
+    std::atomic<std::uint32_t> guest_gl_delete_epoch_addr{0};
     bool started = false;
     bool ready = false;
     bool finished = false;
@@ -114,6 +123,9 @@ struct LibraryRuntime::Impl {
         if (address == 0) return "guest dlerror returned null";
         std::string text;
         for (std::uint32_t i = 0; i < ZB_SERVICE_SCRATCH_SIZE; ++i) {
+            if (static_cast<std::uint64_t>(address) + i >= kGuestSpaceSize) {
+                return "guest dlerror returned an unreadable string";
+            }
             const std::uint8_t* byte = process.memory().host_ptr(address + i, 1, kPageRead);
             if (byte == nullptr) return "guest dlerror returned an unreadable string";
             if (*byte == 0) return text;
@@ -301,13 +313,86 @@ struct LibraryRuntime::Impl {
         return true;
     }
 
+    std::mutex gl_epoch_mutex;
+
+    bool register_gl_epoch(GuestThread& thread) {
+        const std::uint32_t addr = thread.regs()[0];
+        if ((addr & 3u) != 0) {
+            thread.regs()[0] = 0xFFFFFFFFu;
+            return true;
+        }
+        std::uint8_t* ptr = process.memory().host_ptr(addr, sizeof(std::uint32_t), kPageWrite);
+        if (ptr == nullptr) {
+            thread.regs()[0] = 0xFFFFFFFFu;
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(gl_epoch_mutex);
+        const std::uint32_t current = gl_epoch.load(std::memory_order_acquire);
+        __atomic_store_n(reinterpret_cast<std::uint32_t*>(ptr), current, __ATOMIC_RELEASE);
+        guest_gl_epoch_addr.store(addr, std::memory_order_release);
+
+        const std::uint32_t del_addr = thread.regs()[1];
+        if (del_addr != 0 && (del_addr & 3u) == 0) {
+            std::uint8_t* del_ptr = process.memory().host_ptr(del_addr, sizeof(std::uint32_t), kPageWrite);
+            if (del_ptr != nullptr) {
+                const std::uint32_t del_current = gl_delete_epoch.load(std::memory_order_acquire);
+                __atomic_store_n(reinterpret_cast<std::uint32_t*>(del_ptr), del_current, __ATOMIC_RELEASE);
+                guest_gl_delete_epoch_addr.store(del_addr, std::memory_order_release);
+            }
+        }
+        thread.regs()[0] = 0;
+        return true;
+    }
+
+    bool register_gl_batch(GuestThread& thread) {
+        const std::uint32_t addr = thread.regs()[0];
+        if ((addr & 3u) != 0) {
+            thread.regs()[0] = 0xFFFFFFFFu;
+            return true;
+        }
+        std::uint8_t* ptr = process.memory().host_ptr(addr, sizeof(zb_gl_batch_header), kPageRead | kPageWrite);
+        if (ptr == nullptr) {
+            thread.regs()[0] = 0xFFFFFFFFu;
+            return true;
+        }
+        auto* hdr = reinterpret_cast<zb_gl_batch_header*>(ptr);
+        hdr->count = 0;
+        hdr->used_words = 0;
+        thread.set_gl_batch_addr(addr);
+        thread.set_gl_batch_host_ptr(ptr);
+        const std::uint32_t slot_addr = thread.regs()[1];
+        if (slot_addr != 0 && (slot_addr & 3u) == 0 &&
+            process.memory().host_ptr(slot_addr, 16, kPageRead | kPageWrite) != nullptr) {
+            thread.set_gl_slot_addr(slot_addr);
+        }
+        thread.regs()[0] = 0;
+        return true;
+    }
+
     bool handle_host_call(std::uint32_t index, GuestThread& thread) {
         if (index >= ZB_RUNTIME_HOST_CALL_FIRST && index <= ZB_RUNTIME_HOST_CALL_LAST) {
             if (index == ZB_SERVICE_READY_INDEX) return handle_ready(thread);
             if (index == ZB_CARRIER_PARK_INDEX) return park_carrier(thread);
+            if (index == ZB_GL_EPOCH_REGISTER_INDEX) return register_gl_epoch(thread);
+            if (index == ZB_GL_BATCH_REGISTER_INDEX) return register_gl_batch(thread);
+            if (index == ZB_GL_BATCH_FLUSH_INDEX) {
+                return chained && chained(index, thread);
+            }
             return false;
         }
         return chained && chained(index, thread);
+    }
+
+    static bool fast_host_call_entry(void* ctx, std::uint32_t index, GuestThread& thread) {
+        auto* self = static_cast<Impl*>(ctx);
+        if (index >= ZB_RUNTIME_HOST_CALL_FIRST && index <= ZB_RUNTIME_HOST_CALL_LAST) {
+            if (index == ZB_GL_BATCH_FLUSH_INDEX && self->fast_chained != nullptr) {
+                return self->fast_chained(self->fast_chained_ctx, index, thread);
+            }
+            return false;
+        }
+        return self->fast_chained != nullptr &&
+               self->fast_chained(self->fast_chained_ctx, index, thread);
     }
 
     Response submit(std::shared_ptr<Command> command) {
@@ -358,6 +443,16 @@ void LibraryRuntime::set_host_call_handler(Process::HostCallHandler handler) {
     impl_->chained = std::move(handler);
 }
 
+void LibraryRuntime::set_fast_host_call_handler(Process::FastHostCallHandler handler, void* ctx) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->started) {
+        log("LibraryRuntime::set_fast_host_call_handler called after start");
+        std::abort();
+    }
+    impl_->fast_chained = handler;
+    impl_->fast_chained_ctx = ctx;
+}
+
 bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& error) {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -371,6 +466,9 @@ bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& er
     impl->process.set_sysroot(options.sysroot);
     impl->process.set_host_call_handler(
         [impl](std::uint32_t index, GuestThread& thread) { return impl->handle_host_call(index, thread); });
+    if (impl->fast_chained != nullptr) {
+        impl->process.set_fast_host_call_handler(&Impl::fast_host_call_entry, impl);
+    }
     std::vector<std::string> argv = {options.zbhost, std::to_string(options.target_sdk)};
     if (!options.preload.empty()) argv.push_back(options.preload);
     impl->runner = std::thread([impl, argv, options] {
@@ -395,6 +493,10 @@ bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& er
     if (impl->ready) return true;
     error = settled ? impl->startup_error
                     : "zbhost did not report ready within " + std::to_string(options.ready_timeout.count()) + " ms";
+    if (!impl->finished) {
+        impl->process.request_exit(1);
+        impl->cv.wait_for(lock, std::chrono::seconds(2), [impl] { return impl->finished; });
+    }
     return false;
 }
 
@@ -488,6 +590,10 @@ GuestMemory& LibraryRuntime::memory() {
     return impl_->process.memory();
 }
 
+Process& LibraryRuntime::process() {
+    return impl_->process;
+}
+
 std::vector<std::string> LibraryRuntime::mapped_file_paths() const {
     return impl_->process.mapped_file_paths();
 }
@@ -540,6 +646,17 @@ std::optional<GuestResult> LibraryRuntime::Carrier::call(std::uint32_t function,
         log("carrier lease used while the host thread runs other guest code");
         return std::nullopt;
     }
+    struct HostTidGuard {
+        GuestThread* thread;
+        std::int32_t previous;
+        HostTidGuard(GuestThread* t, std::int32_t active)
+            : thread(t), previous(t->host_tid.exchange(active, std::memory_order_seq_cst)) {}
+        ~HostTidGuard() { thread->host_tid.store(previous, std::memory_order_seq_cst); }
+    };
+    // Cache Linux TID per host thread: Carrier::call already verified state_->owner == this_thread,
+    // avoiding a SYS_gettid kernel syscall on every OpenSL real-time audio callback.
+    thread_local const std::int32_t t_host_tid = static_cast<std::int32_t>(::syscall(SYS_gettid));
+    const HostTidGuard host_tid_guard(borrower, t_host_tid);
     Process::set_current_thread(borrower);
     auto result = state_->impl->process.call_guest(*borrower, function, args);
     Process::set_current_thread(previous);
@@ -579,6 +696,28 @@ std::int32_t LibraryRuntime::Carrier::guest_tid() const {
 
 std::uint32_t LibraryRuntime::Carrier::guest_tls() const {
     return state_->borrower->tls();
+}
+
+void LibraryRuntime::bump_gl_epoch() {
+    std::lock_guard<std::mutex> lock(impl_->gl_epoch_mutex);
+    const std::uint32_t next = impl_->gl_epoch.fetch_add(1, std::memory_order_acq_rel) + 1u;
+    const std::uint32_t addr = impl_->guest_gl_epoch_addr.load(std::memory_order_acquire);
+    if (addr == 0) return;
+    std::uint8_t* ptr = impl_->process.memory().host_ptr(addr, sizeof(std::uint32_t), kPageWrite);
+    if (ptr != nullptr) {
+        __atomic_store_n(reinterpret_cast<std::uint32_t*>(ptr), next, __ATOMIC_RELEASE);
+    }
+}
+
+void LibraryRuntime::bump_gl_delete_epoch() {
+    std::lock_guard<std::mutex> lock(impl_->gl_epoch_mutex);
+    const std::uint32_t next = impl_->gl_delete_epoch.fetch_add(1, std::memory_order_acq_rel) + 1u;
+    const std::uint32_t addr = impl_->guest_gl_delete_epoch_addr.load(std::memory_order_acquire);
+    if (addr == 0) return;
+    std::uint8_t* ptr = impl_->process.memory().host_ptr(addr, sizeof(std::uint32_t), kPageWrite);
+    if (ptr != nullptr) {
+        __atomic_store_n(reinterpret_cast<std::uint32_t*>(ptr), next, __ATOMIC_RELEASE);
+    }
 }
 
 }  // namespace zb

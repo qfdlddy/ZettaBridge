@@ -53,6 +53,7 @@ private:
     std::vector<std::uint64_t> refs_;      // 0 marks a deleted slot
     std::vector<std::uint8_t> serials_;    // never shrinks; keeps every slot's current serial
     std::vector<std::size_t> frame_starts_;
+    std::vector<std::uint32_t> free_;      // freed slots within the top frame available for reuse
 };
 
 // Global or weak global references of the process. Thread-safe; freed slots are reused.

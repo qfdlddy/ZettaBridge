@@ -104,6 +104,7 @@ struct HostLooper::Impl {
         std::uint32_t handle = 0;
         int options = 0;
         std::uint32_t references = 1;
+        std::int32_t owner_tid = 0;
         int wake_fd = -1;  // guest-path wake eventfd; -1 on an attached looper
         // Attached: this looper lives on a host thread whose own Android looper does the polling.
         bool attached = false;
@@ -325,7 +326,7 @@ struct HostLooper::Impl {
     // the guest path does from pollOnce. Returning 0 makes the real looper drop the fd.
     int dispatch_attached(Binding& binding, int fd, int events) {
         report_host_callbacks.fetch_add(1, std::memory_order_relaxed);
-        if (!binding.active.load(std::memory_order_relaxed)) {
+        if (!binding.active.load(std::memory_order_relaxed) || binding.callback == 0) {
             report_host_callbacks_line();
             return 0;
         }
@@ -384,6 +385,7 @@ struct HostLooper::Impl {
         looper->wake_fd = wake_fd;
         looper->attached = real != 0;
         looper->real = real;
+        looper->owner_tid = thread.tid;
         const std::uint32_t handle = looper->handle;
         next_handle += 4;
         thread_loopers.emplace(&thread, handle);
@@ -423,7 +425,8 @@ struct HostLooper::Impl {
             std::lock_guard<std::mutex> lock(mutex);
             const auto it = loopers.find(handle);
             if (it == loopers.end()) return;
-            if (it->second->references > 1) --it->second->references;
+            if (it->second->references <= 1) return;
+            --it->second->references;
             real = it->second->real;
         }
         if (real != 0) backend->release(real);
@@ -433,6 +436,7 @@ struct HostLooper::Impl {
                std::uint32_t callback, std::uint32_t data) {
         int wake_fd = -1;
         std::uint64_t real = 0;
+        bool is_real_backed = false;
         Binding* binding = nullptr;
         std::uint64_t serial = 0;
         {
@@ -451,15 +455,29 @@ struct HostLooper::Impl {
             looper.registrations[fd] = Registration{fd, ident, events, callback, data, serial};
             if (looper.attached || looper.real_backed) {
                 real = looper.real;
-                binding = bind_locked(handle, fd, callback, data, serial);
+                is_real_backed = looper.real_backed;
+                if (callback != 0) {
+                    binding = bind_locked(handle, fd, callback, data, serial);
+                }
             } else {
                 wake_fd = looper.wake_fd;
             }
         }
         if (real != 0) {
-            // The real looper needs a host callback even for a guest ident registration: only a
-            // callback gets control on the host thread, and nothing here ever calls pollOnce.
-            if (backend->add_fd(real, fd, ident, events, &Impl::attached_callback, binding) != 1) {
+            int added = -1;
+            if (callback != 0) {
+                added = backend->add_fd(real, fd, ident, events, &Impl::attached_callback, binding);
+            } else if (is_real_backed) {
+                // Non-callback fd on a real-backed guest looper: register directly with ident & data
+                // so ALooper_pollOnce returns them instead of invoking a null guest callback.
+                added = backend->add_fd(real, fd, ident, events, nullptr,
+                                        reinterpret_cast<void*>(static_cast<std::uintptr_t>(data)));
+            } else {
+                // Attached (host-owned) loopers never return pollOnce to the guest; reject
+                // non-callback registrations rather than jumping to guest PC 0x0.
+                added = -1;
+            }
+            if (added != 1) {
                 std::lock_guard<std::mutex> lock(mutex);
                 drop_registration_locked(handle, fd, serial);
                 return -1;
@@ -536,22 +554,35 @@ struct HostLooper::Impl {
                 "never deliver");
             return false;
         }
-        for (const Registration& registration : registrations) {
-            Binding* binding = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                binding = bind_locked(handle, registration.fd, registration.callback, registration.data,
-                                      registration.serial);
-            }
-            backend->add_fd(real, registration.fd, registration.ident, registration.events,
-                            &Impl::attached_callback, binding);
-        }
+        // Mark real_backed and snapshot registrations atomically under mutex so concurrent
+        // add_fd/remove_fd calls route to the real looper and are never lost across promotion.
+        registrations.clear();
         {
             std::lock_guard<std::mutex> lock(mutex);
             const auto looper_it = loopers.find(handle);
             if (looper_it == loopers.end()) return false;
-            looper_it->second->real = real;
-            looper_it->second->real_backed = true;
+            Looper& looper = *looper_it->second;
+            looper.real = real;
+            looper.real_backed = true;
+            for (const auto& [fd, registration] : looper.registrations) {
+                (void)fd;
+                registrations.push_back(registration);
+            }
+        }
+        for (const Registration& registration : registrations) {
+            if (registration.callback != 0) {
+                Binding* binding = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    binding = bind_locked(handle, registration.fd, registration.callback, registration.data,
+                                          registration.serial);
+                }
+                backend->add_fd(real, registration.fd, registration.ident, registration.events,
+                                &Impl::attached_callback, binding);
+            } else {
+                backend->add_fd(real, registration.fd, registration.ident, registration.events, nullptr,
+                                reinterpret_cast<void*>(static_cast<std::uintptr_t>(registration.data)));
+            }
         }
         real_out = real;
         // Anything already waiting in the old poll must come back and take the new path.
@@ -564,10 +595,8 @@ struct HostLooper::Impl {
 
     std::int32_t owner_of(std::uint32_t looper_handle) {
         std::lock_guard<std::mutex> lock(mutex);
-        for (const auto& [thread, handle] : thread_loopers) {
-            if (handle == looper_handle && thread != nullptr) return thread->tid;
-        }
-        return 0;
+        const auto it = loopers.find(looper_handle);
+        return it != loopers.end() ? it->second->owner_tid : 0;
     }
 
     int wake_fd_of(std::uint32_t handle) {
@@ -656,7 +685,7 @@ struct HostLooper::Impl {
         // Diagnostics only: every exit path below runs through `finish`, which counts the
         // poll and records this thread's "last" state in the runtime report.
         auto finish = [&](int result) {
-            report_polls.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t polls = report_polls.fetch_add(1, std::memory_order_relaxed) + 1;
             switch (result) {
             case kPollWake: report_polls_wake.fetch_add(1, std::memory_order_relaxed); break;
             case kPollCallback: report_polls_callback.fetch_add(1, std::memory_order_relaxed); break;
@@ -664,8 +693,14 @@ struct HostLooper::Impl {
             case kPollError: report_polls_error.fetch_add(1, std::memory_order_relaxed); break;
             default: if (result >= 0) report_polls_ident.fetch_add(1, std::memory_order_relaxed); break;
             }
-            report_polls_line();
-            report_last(thread, registrations.size(), result);
+#if !defined(ZB_NO_TELEMETRY)
+            if (polls <= 8 || (polls & (polls - 1)) == 0 || (polls % 1024) == 0 || result == kPollError) {
+                report_polls_line();
+                report_last(thread, registrations.size(), result);
+            }
+#else
+            (void)polls;
+#endif
             return result;
         };
 
@@ -763,6 +798,17 @@ struct HostLooper::Impl {
             const int events = looper_events(poll_fds[i + 1].revents);
             if (events == 0) continue;
             const Registration& registration = registrations[i];
+            {
+                // Verify the registration was not removed by an earlier callback in this poll.
+                std::lock_guard<std::mutex> lock(mutex);
+                const auto looper_it = loopers.find(looper_handle);
+                if (looper_it == loopers.end()) continue;
+                const auto current = looper_it->second->registrations.find(registration.fd);
+                if (current == looper_it->second->registrations.end() ||
+                    current->second.serial != registration.serial) {
+                    continue;
+                }
+            }
             if (registration.callback != 0) {
                 GuestCall call;
                 call.regs = {static_cast<std::uint32_t>(registration.fd),
@@ -834,6 +880,10 @@ bool HostLooper::ensure_real_looper(GuestThread& thread, std::uint32_t looper_ha
 }
 
 bool HostLooper::handle_host_call(std::uint32_t index, GuestThread& thread) {
+    if (index != ZB_COMPAT_HC_ALooper_pollAll &&
+        (index < ZB_COMPAT_HC_ALooper_acquire || index > ZB_COMPAT_HC_ALooper_wake)) {
+        return false;
+    }
     bool valid = true;
     const std::uint32_t r0 = impl_->argument(thread, 0, valid);
     const std::uint32_t r1 = impl_->argument(thread, 1, valid);

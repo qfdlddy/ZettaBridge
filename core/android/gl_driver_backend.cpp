@@ -28,16 +28,18 @@ T extension_default() {
     }
 }
 
+thread_local GLenum t_pending_error = GL_NO_ERROR;
+
 }  // namespace
 
 void GlDriverBackend::set_error(GLenum error) {
-    if (pending_error_ == GL_NO_ERROR) pending_error_ = error;
+    if (t_pending_error == GL_NO_ERROR) t_pending_error = error;
 }
 
 GLenum GlDriverBackend::glGetError(void) {
-    if (pending_error_ != GL_NO_ERROR) {
-        const GLenum error = pending_error_;
-        pending_error_ = GL_NO_ERROR;
+    if (t_pending_error != GL_NO_ERROR) {
+        const GLenum error = t_pending_error;
+        t_pending_error = GL_NO_ERROR;
         return error;
     }
     return ::glGetError();

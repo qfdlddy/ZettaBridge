@@ -45,6 +45,7 @@ final class GuestInstrumentation extends Instrumentation {
     public void callActivityOnCreate(Activity activity, Bundle icicle) {
         runtime.prepareActivity(activity, icicle);
         base.callActivityOnCreate(activity, icicle);
+        runtime.prepareActivityContent(activity);
         GuestWindowStyle.afterCreate(activity);
     }
 
@@ -52,6 +53,7 @@ final class GuestInstrumentation extends Instrumentation {
     public void callActivityOnCreate(Activity activity, Bundle icicle, PersistableBundle persistentState) {
         runtime.prepareActivity(activity, icicle);
         base.callActivityOnCreate(activity, icicle, persistentState);
+        runtime.prepareActivityContent(activity);
         GuestWindowStyle.afterCreate(activity);
     }
 
@@ -106,7 +108,7 @@ final class GuestInstrumentation extends Instrumentation {
         }
         Intent[] routed = new Intent[intents.length];
         for (int i = 0; i < intents.length; i++) routed[i] = runtime.route(intents[i]);
-        Log.d(TAG, "execStartActivities: " + intents.length + " intents");
+        if (!BuildConfig.DISABLE_DIAGNOSTICS) Log.d(TAG, "execStartActivities: " + intents.length + " intents");
         Reflect.invoke(execStartActivities, base, who, contextThread, token, target, routed, options);
     }
 }

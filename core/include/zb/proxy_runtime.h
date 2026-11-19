@@ -22,11 +22,13 @@
 #include "zb/host_input.h"
 #include "zb/host_sensors.h"
 #include "zb/host_native_window.h"
+#include "zb/host_opensl.h"
 #include "zb/host_platform_compat.h"
 #include "zb/jni_backend.h"
 #include "zb/jni_loader.h"
 #include "zb/library_runtime.h"
 #include "zb/native_window_backend.h"
+#include "zb/opensl_backend.h"
 
 namespace zb {
 
@@ -184,7 +186,8 @@ public:
                             NativeWindowBackend* window_backend = nullptr,
                             AndroidLooperBackend* looper_backend = nullptr,
                             InputBackend* input_backend = nullptr,
-                            ConfigurationBackend* configuration_backend = nullptr);
+                            ConfigurationBackend* configuration_backend = nullptr,
+                            OpenSlBackend* opensl_backend = nullptr);
     ~GuestJniEngine() override;
     GuestJniEngine(const GuestJniEngine&) = delete;
     GuestJniEngine& operator=(const GuestJniEngine&) = delete;
@@ -213,6 +216,8 @@ public:
     HostInput* host_input() { return host_input_; }
     HostConfiguration* host_configuration() { return host_configuration_; }
     HostNativeActivity* host_native_activity() { return host_native_activity_; }
+    // nullptr unless an opensl_backend was passed to the constructor.
+    HostOpenSl* host_opensl() { return host_opensl_; }
 
     // The Android side is installed after construction: the glue needs the units this engine
     // builds, and those exist only once the engine does.
@@ -242,6 +247,7 @@ private:
     HostNativeActivity* host_native_activity_ = nullptr;
     NativeActivityPlatform* native_activity_platform_ = nullptr;
     HostPlatformCompat* host_compat_ = nullptr;
+    HostOpenSl* host_opensl_ = nullptr;
     JniLoader* loader_;
 };
 

@@ -24,7 +24,7 @@ final class HiddenApi {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return;  // no enforcement before 9
         try {
             boolean ok = HiddenApiBypass.addHiddenApiExemptions("L");
-            Log.i(TAG, "hidden API exemptions installed: " + ok);
+            if (!BuildConfig.DISABLE_DIAGNOSTICS) Log.i(TAG, "hidden API exemptions installed: " + ok);
         } catch (Throwable t) {
             Log.w(TAG, "hidden API bypass failed; greylisted members may still work", t);
         }

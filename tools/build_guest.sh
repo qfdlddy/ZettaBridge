@@ -16,8 +16,26 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-NDK=${NDK:-$HOME/android-ndk-r29}
-NDK_HOST=${NDK_HOST:-linux-arm64}
+if [ -z "${NDK:-}" ]; then
+    if [ -d "$HOME/android-ndk-r29" ]; then
+        NDK="$HOME/android-ndk-r29"
+    elif [ -n "${LOCALAPPDATA:-}" ] && [ -d "$LOCALAPPDATA/Android/Sdk/ndk" ]; then
+        NDK=$(ls -d "$LOCALAPPDATA/Android/Sdk/ndk"/* 2>/dev/null | sort -V | tail -n 1)
+    elif [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
+        NDK=$(ls -d "$ANDROID_HOME/ndk"/* 2>/dev/null | sort -V | tail -n 1)
+    else
+        NDK="$HOME/android-ndk-r29"
+    fi
+fi
+if [ -z "${NDK_HOST:-}" ]; then
+    if [ -d "$NDK/toolchains/llvm/prebuilt/windows-x86_64" ]; then
+        NDK_HOST="windows-x86_64"
+    elif [ -d "$NDK/toolchains/llvm/prebuilt/linux-x86_64" ]; then
+        NDK_HOST="linux-x86_64"
+    else
+        NDK_HOST="linux-arm64"
+    fi
+fi
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$NDK_HOST"
 CC="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang"
 CXX="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang++"
@@ -80,7 +98,15 @@ done
 
 for asm in "$ROOT"/guest/stubs/gen/*.S; do
     lib=$(basename "$asm" .S)
-    "$CC" -shared -nostdlib -Wl,-soname,"$lib.so" -o "$OUT/lib/$lib.so" "$asm"
+    # A library's hand-written companion (guest/stubs/<lib>.S / .c) joins the same .so.
+    companion=""
+    extra_flags=""
+    if [ -f "$ROOT/guest/stubs/$lib.S" ]; then companion="$ROOT/guest/stubs/$lib.S"; fi
+    if [ -f "$ROOT/guest/stubs/${lib}_cache.c" ]; then
+        companion="$companion $ROOT/guest/stubs/${lib}_cache.c"
+        extra_flags="-fPIC -O2 -ffreestanding -fno-builtin -I$ROOT/core/include"
+    fi
+    "$CC" -shared -nostdlib $extra_flags -Wl,-soname,"$lib.so" -o "$OUT/lib/$lib.so" "$asm" $companion
 done
 
 # End-to-end callback ALooper probe. -L precedes the NDK sysroot so -landroid resolves to the
@@ -96,5 +122,8 @@ done
 # guest/testlib/*.c probes are driven; it links against the generated EGL/GLESv2 stubs above.
 "$CC" -shared -fPIC -O2 -Wall -Wl,-soname,libzbeglprobe.so -o "$OUT/lib/libzbeglprobe.so" \
     "$ROOT/guest/tests/zbeglprobe.c" -L"$OUT/lib" -lEGL -lGLESv2
+
+"$CC" -shared -fPIC -O2 -Wall -Wextra -Wl,-soname,libzbglcacheprobe.so \
+    -o "$OUT/lib/libzbglcacheprobe.so" "$ROOT/guest/testlib/zbglcacheprobe.c" -L"$OUT/lib" -lEGL -lGLESv2
 
 echo "guest build ok"

@@ -235,6 +235,28 @@ void check_malformed_files() {
     CHECK(zb::fix_guest_library(bad_phdr_file.path).status == zb::ElfFixupStatus::Error);
 }
 
+void check_obfuscated_phentsize() {
+    auto bytes = make_elf({dyn(DT_FLAGS, DF_TEXTREL), dyn(DT_NULL, 0), dyn(DT_NULL, 0)});
+    auto eh = get<Elf32_Ehdr>(bytes, 0);
+    // Some packed/obfuscated Android libs (e.g. libRMS.so) set e_phentsize != 32
+    // while keeping 32-byte Elf32_Phdr entries at e_phoff.
+    eh.e_phentsize = 17;
+    put(bytes, 0, eh);
+    TempFile file(bytes);
+
+    const int before_fd = ::open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(before_fd >= 0);
+    CHECK(!zb::elf_has_textrel_marker(before_fd));
+    CHECK(::close(before_fd) == 0);
+
+    CHECK(zb::fix_guest_library(file.path).status == zb::ElfFixupStatus::Changed);
+
+    const int after_fd = ::open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(after_fd >= 0);
+    CHECK(zb::elf_has_textrel_marker(after_fd));
+    CHECK(::close(after_fd) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -243,6 +265,7 @@ int main() {
     check_no_spare_is_atomic_error();
     check_unchanged_and_skipped();
     check_malformed_files();
+    check_obfuscated_phentsize();
     std::puts("elf_fixups_test PASS");
     return 0;
 }

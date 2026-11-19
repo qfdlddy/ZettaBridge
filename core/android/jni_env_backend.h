@@ -19,6 +19,8 @@ public:
     Ref find_class(Env env, const char* name) override;
     Ref get_superclass(Env env, Ref cls) override;
     bool is_assignable_from(Env env, Ref from, Ref to) override;
+    bool is_audio_manager_class(Env env, Ref cls) override;
+    Ref filter_bluetooth_audio_devices(Env env, Ref devices) override;
     Id get_method_id(Env env, Ref cls, const char* name, const char* signature, bool is_static) override;
     Id get_field_id(Env env, Ref cls, const char* name, const char* signature, bool is_static) override;
     Id from_reflected_method(Env env, Ref method, std::string& signature) override;
@@ -32,6 +34,7 @@ public:
     Ref get_object_class(Env env, Ref obj) override;
     bool is_instance_of(Env env, Ref obj, Ref cls) override;
     bool is_same_object(Env env, Ref a, Ref b) override;
+    bool object_class_name(Env env, Ref obj, std::string& out) override;
     JValue call_method(Env env, JniCallKind kind, char type, Ref obj, Ref cls, Id method,
                        const JValue* args) override;
     JValue get_field(Env env, bool is_static, char type, Ref obj, Id field) override;
@@ -99,6 +102,7 @@ private:
         jmethodID class_get_name = nullptr;               // Class.getName()
         jmethodID class_is_primitive = nullptr;           // Class.isPrimitive()
         jmethodID class_get_declared_methods = nullptr;   // Class.getDeclaredMethods()
+        jmethodID class_for_name = nullptr;               // static Class.forName(String, boolean, ClassLoader)
         jmethodID class_loader_load_class = nullptr;      // ClassLoader.loadClass(String)
         jmethodID method_get_name = nullptr;              // Method.getName()
         jmethodID method_get_modifiers = nullptr;         // Method.getModifiers()
@@ -142,10 +146,20 @@ private:
     NativeLookupStatus class_load_failure(JNIEnv* env, const Reflection& r);
     jobject class_loader();
 
+    struct AudioIds {
+        jclass audio_manager_class = nullptr;
+        jclass device_info_class = nullptr;
+        jmethodID device_get_type = nullptr;
+    };
+    const AudioIds* audio_ids(JNIEnv* env);
+
     JavaVM* vm_;
     std::once_flag reflection_once_;
     Reflection reflection_;
     bool reflection_ok_ = false;
+    std::once_flag audio_once_;
+    AudioIds audio_ids_;
+    bool audio_ok_ = false;
     std::mutex class_loader_mutex_;
     jobject class_loader_ = nullptr;  // global reference, retained for the process
 };

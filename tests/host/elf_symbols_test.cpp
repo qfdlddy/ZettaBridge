@@ -246,6 +246,19 @@ void check_gnu_hash_work_is_bounded() {
     CHECK(elapsed < std::chrono::seconds(5));
 }
 
+void check_obfuscated_phentsize() {
+    auto bytes = make_symbols(true);
+    auto eh = get<Elf32_Ehdr>(bytes, 0);
+    eh.e_phentsize = 17;
+    put(bytes, 0, eh);
+    TempFile file(bytes);
+    const auto report = zb::scan_elf32_jni_exports(file.path);
+    CHECK(report.status == zb::ElfSymbolStatus::Ok);
+    CHECK(report.exports.size() == 2);
+    CHECK(report.exports[0] == "Java_zb_Natives_run");
+    CHECK(report.exports[1] == "JNI_OnLoad");
+}
+
 }  // namespace
 
 int main() {
@@ -254,6 +267,7 @@ int main() {
     check_duplicates();
     check_skips_and_errors();
     check_gnu_hash_work_is_bounded();
+    check_obfuscated_phentsize();
     std::puts("elf_symbols_test PASS");
     return 0;
 }

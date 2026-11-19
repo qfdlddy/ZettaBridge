@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cstdio>
@@ -10,11 +11,19 @@
 #include <string_view>
 #include <vector>
 
+#include "zb/configuration_hostcalls.h"
+#include "zb/egl_hostcalls.h"
+#include "zb/gl_hostcalls.h"
 #include "zb/hang_watchdog.h"
 #include "zb/host_jni.h"
+#include "zb/input_hostcalls.h"
+#include "zb/jni_protocol.h"
 #include "zb/library_protocol.h"
 #include "zb/log.h"
+#include "zb/opensl_hostcalls.h"
+#include "zb/platform_compat_hostcalls.h"
 #include "zb/runtime_report.h"
+#include "zb/sensor_hostcalls.h"
 
 namespace zb {
 
@@ -193,6 +202,11 @@ bool ProxyRuntime::activate_plugin(JniBackend::Env env, const std::string& plugi
         // opens something beside "its own" library finds the real thing (IL2CPP does exactly
         // this and otherwise reports that it cannot load).
         engine_.add_path_alias(root + "/proxy/", root + "/lib/");
+        std::string raw_root = plugin_root;
+        while (raw_root.size() > 1 && raw_root.back() == '/') raw_root.pop_back();
+        if (raw_root != root) {
+            engine_.add_path_alias(raw_root + "/proxy/", root + "/lib/");
+        }
         target_sdk_ = target_sdk;
         options_ = std::move(options);
         log("guest JNI runtime: plugin %s activated (targetSdk %u)", root.c_str(), target_sdk);
@@ -248,11 +262,28 @@ ProxyLoadResult ProxyRuntime::on_proxy_loaded(JniBackend::Env env, const std::st
         return fail_locked(key, location.library,
                            "the arm32 library " + location.guest_library + " is missing; reimport the plugin");
     }
+    const std::string raw_proxy_dir = parent_of(proxy_path);
+    if (resolved && !raw_proxy_dir.empty() && raw_proxy_dir + "/" != plugin_root_ + "/proxy/") {
+        engine_.add_path_alias(raw_proxy_dir + "/", plugin_root_ + "/lib/");
+    }
 
     cv_.wait(lock, [this] { return start_state_ != StartState::Starting; });
     if (start_state_ == StartState::NotStarted) {
         start_state_ = StartState::Starting;
         const LibraryRuntimeOptions options = options_;
+        struct StartGuard {
+            ProxyRuntime* self;
+            std::unique_lock<std::mutex>* lock;
+            bool committed = false;
+            ~StartGuard() {
+                if (!committed) {
+                    if (!lock->owns_lock()) lock->lock();
+                    self->start_state_ = StartState::Failed;
+                    self->start_error_ = "unexpected exception during guest runtime startup";
+                    self->cv_.notify_all();
+                }
+            }
+        } start_guard{this, &lock};
         lock.unlock();
         std::string start_error;
         // Phase notes: between "the plugin is known" and "a library loaded" the report was blind,
@@ -265,16 +296,32 @@ ProxyLoadResult ProxyRuntime::on_proxy_loaded(JniBackend::Env env, const std::st
         start_error_ = started ? std::string() : std::move(start_error);
         if (started) log("guest JNI runtime started: %s %u %s", options.zbhost.c_str(), options.target_sdk,
                          options.preload.c_str());
+        start_guard.committed = true;
         cv_.notify_all();
     }
     if (start_state_ == StartState::Failed) {
         return fail_locked(key, location.library, "the guest runtime failed to start: " + start_error_);
     }
 
+    struct LoadGuard {
+        ProxyRuntime* self;
+        std::unique_lock<std::mutex>* lock;
+        const std::string& key;
+        const std::string& library;
+        bool committed = false;
+        ~LoadGuard() {
+            if (!committed) {
+                if (!lock->owns_lock()) lock->lock();
+                (void)self->fail_locked(key, library, "unexpected exception while loading guest library");
+            }
+        }
+    } load_guard{this, &lock, key, location.library};
+
     lock.unlock();
     runtime_report().note_jni_detail("loading", location.library, true);
     const JniLoadReport report = engine_.load(env, location.guest_library);
     lock.lock();
+    load_guard.committed = true;
     if (!report.ok) return fail_locked(key, location.library, report.error);
     if (!supported_art_version(report.jni_version)) {
         return fail_locked(key, location.library,
@@ -348,7 +395,8 @@ std::optional<std::string> ProxyRuntime::last_load_error() const {
 GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostGl::EglContextProbe egl_context_probe,
                                AssetBackend* asset_backend, EglBackend* egl_backend, NativeWindowBackend* window_backend,
                                AndroidLooperBackend* looper_backend, InputBackend* input_backend,
-                               ConfigurationBackend* configuration_backend)
+                               ConfigurationBackend* configuration_backend,
+                               OpenSlBackend* opensl_backend)
     : backend_(backend),
       runtime_(new LibraryRuntime()),
       host_jni_(new HostJni(*runtime_, backend)),
@@ -402,6 +450,9 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
                 jni_for_activity->call_on_host_thread(runtime->service_api().free_fn, call);
             });
     }
+    if (asset_backend != nullptr) {
+        host_assets_ = new HostAssets(*runtime_, *asset_backend, *host_jni_);
+    }
     if (configuration_backend != nullptr) {
         HostAssets* assets = host_assets_;
         host_configuration_ = new HostConfiguration(*runtime_, *configuration_backend,
@@ -429,9 +480,6 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     if (gl_backend != nullptr) {
         host_gl_ = new HostGl(*runtime_, *gl_backend, HostGl::GuestAllocator{}, std::move(egl_context_probe));
     }
-    if (asset_backend != nullptr) {
-        host_assets_ = new HostAssets(*runtime_, *asset_backend, *host_jni_);
-    }
     if (window_backend != nullptr) {
         host_windows_ = new HostNativeWindow(*runtime_, *window_backend, *host_jni_);
     }
@@ -443,6 +491,11 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
         }
         host_egl_ = new HostEgl(*runtime_, *egl_backend, HostEgl::GuestAllocator{}, std::move(windows));
     }
+    if (opensl_backend != nullptr) {
+        // The buffer callback arrives on OpenSL's own mixer thread, which runs no guest code, so
+        // HostOpenSl's default invoker posts the guest callback to the service thread.
+        host_opensl_ = new HostOpenSl(*runtime_, *opensl_backend);
+    }
     HostJni* host_jni = host_jni_;
     HostGl* host_gl = host_gl_;
     HostAssets* host_assets = host_assets_;
@@ -453,24 +506,111 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     HostInput* host_input = host_input_;
     HostConfiguration* host_configuration = host_configuration_;
     HostPlatformCompat* host_compat = host_compat_;
-    // Core ranges never overlap (GLES 0-141, assets 142-159, windows 160-167, EGL 168-211,
-    // append-only platform compatibility 212-227, sensors 344-375, JNI 0xFB00+), so the chain
-    // order is free;
-    // GL stays first because it is by far the hotter path during rendering.
+    HostOpenSl* host_opensl = host_opensl_;
+    // Core ranges never overlap; build an O(1) dispatch table so OpenSL/Input/Sensors/Config do
+    // not pay a linear scan of unrelated subsystems on every call, while JNI goes direct.
+    enum class HostCallTarget : std::uint8_t {
+        Unknown = 0,
+        Gl,
+        Assets,
+        Windows,
+        Egl,
+        Looper,
+        Sensors,
+        Input,
+        Config,
+        Compat,
+        OpenSl,
+    };
+    static constexpr std::size_t kDispatchTableSize = ZB_OPENSL_HC_last + 64u;
+    static_assert(kGlHostCallLast < kDispatchTableSize);
+    static_assert(kEglHostCallLast < kDispatchTableSize);
+    static_assert(ZB_COMPAT_HC_AndroidBitmap_unlockPixels < kDispatchTableSize);
+    static_assert(ZB_COMPAT_HC_ALooper_wake < kDispatchTableSize);
+    static_assert(kGlHostCallExtLast < kDispatchTableSize);
+    static_assert(ZB_SENSOR_HC_LAST < kDispatchTableSize);
+    static_assert(ZB_INPUT_HC_LAST < kDispatchTableSize);
+    static_assert(ZB_CONFIG_HC_LAST < kDispatchTableSize);
+    static_assert(ZB_COMPAT_HC_ALooper_pollAll < kDispatchTableSize);
+    static_assert(ZB_OPENSL_HC_last < kDispatchTableSize);
+    static_assert(kDispatchTableSize <= ZB_JNI_SLOT_STUB_FIRST);
+    static const std::array<HostCallTarget, kDispatchTableSize> kDispatchTable = [] {
+        std::array<HostCallTarget, kDispatchTableSize> t{};
+        t.fill(HostCallTarget::Unknown);
+        const auto fill_range = [&](std::uint32_t first, std::uint32_t last, HostCallTarget target) {
+            for (std::uint32_t i = first; i <= last && i < kDispatchTableSize; ++i) t[i] = target;
+        };
+        fill_range(kGlHostCallFirst, kGlHostCallLast, HostCallTarget::Gl);
+        fill_range(142u, 159u, HostCallTarget::Assets);
+        fill_range(160u, 167u, HostCallTarget::Windows);
+        fill_range(kEglHostCallFirst, kEglHostCallLast, HostCallTarget::Egl);
+        fill_range(ZB_COMPAT_HC_ANativeWindow_lock, ZB_COMPAT_HC_AndroidBitmap_unlockPixels,
+                   HostCallTarget::Compat);
+        fill_range(ZB_COMPAT_HC_ALooper_acquire, ZB_COMPAT_HC_ALooper_wake, HostCallTarget::Looper);
+        fill_range(kGlHostCall3First, kGlHostCallExtLast, HostCallTarget::Gl);
+        fill_range(ZB_SENSOR_HC_FIRST, ZB_SENSOR_HC_LAST, HostCallTarget::Sensors);
+        fill_range(ZB_INPUT_HC_FIRST, ZB_INPUT_HC_LAST, HostCallTarget::Input);
+        fill_range(ZB_CONFIG_HC_FIRST, ZB_CONFIG_HC_LAST, HostCallTarget::Config);
+        t[ZB_COMPAT_HC_ALooper_pollAll] = HostCallTarget::Looper;
+        fill_range(ZB_OPENSL_HC_slCreateEngine, ZB_OPENSL_HC_last, HostCallTarget::OpenSl);
+        return t;
+    }();
     runtime_->set_host_call_handler([host_jni, host_gl, host_assets, host_windows, host_egl,
                                      host_looper, host_sensors, host_input, host_configuration,
-                                     host_compat](std::uint32_t index, GuestThread& thread) {
-        if (host_gl != nullptr && host_gl->handle_host_call(index, thread)) return true;
-        if (host_assets != nullptr && host_assets->handle_host_call(index, thread)) return true;
-        if (host_windows != nullptr && host_windows->handle_host_call(index, thread)) return true;
-        if (host_egl != nullptr && host_egl->handle_host_call(index, thread)) return true;
-        if (host_looper->handle_host_call(index, thread)) return true;
-        if (host_sensors->handle_host_call(index, thread)) return true;
-        if (host_input != nullptr && host_input->handle_host_call(index, thread)) return true;
-        if (host_configuration != nullptr && host_configuration->handle_host_call(index, thread)) return true;
-        if (host_compat->handle_host_call(index, thread)) return true;
-        return host_jni->handle_host_call(index, thread);
+                                     host_compat, host_opensl](std::uint32_t index, GuestThread& thread) {
+        if (index == ZB_GL_BATCH_FLUSH_INDEX) {
+            if (host_gl != nullptr) host_gl->flush_batch(thread);
+            return true;
+        }
+        if (index >= ZB_JNI_SLOT_STUB_FIRST) {
+            return host_jni->handle_host_call(index, thread);
+        }
+        if (index < kDispatchTableSize) {
+            switch (kDispatchTable[index]) {
+            case HostCallTarget::Gl:
+                return host_gl != nullptr && host_gl->handle_host_call(index, thread);
+            case HostCallTarget::Assets:
+                return host_assets != nullptr && host_assets->handle_host_call(index, thread);
+            case HostCallTarget::Windows:
+                return host_windows != nullptr && host_windows->handle_host_call(index, thread);
+            case HostCallTarget::Egl:
+                if (host_gl != nullptr) host_gl->flush_batch(thread);
+                return host_egl != nullptr && host_egl->handle_host_call(index, thread);
+            case HostCallTarget::Looper:
+                return host_looper->handle_host_call(index, thread);
+            case HostCallTarget::Sensors:
+                return host_sensors->handle_host_call(index, thread);
+            case HostCallTarget::Input:
+                return host_input != nullptr && host_input->handle_host_call(index, thread);
+            case HostCallTarget::Config:
+                return host_configuration != nullptr && host_configuration->handle_host_call(index, thread);
+            case HostCallTarget::Compat:
+                return host_compat->handle_host_call(index, thread);
+            case HostCallTarget::OpenSl:
+                return host_opensl != nullptr && host_opensl->handle_host_call(index, thread);
+            case HostCallTarget::Unknown:
+                return false;
+            }
+        }
+        return false;
     });
+    if (host_gl_ != nullptr) host_gl_->set_state_filter_enabled(true);
+    runtime_->set_fast_host_call_handler(
+        [](void* ctx, std::uint32_t index, GuestThread& thread) {
+            auto* self = static_cast<GuestJniEngine*>(ctx);
+            if (index == ZB_GL_BATCH_FLUSH_INDEX) {
+                if (self->host_gl_ != nullptr) {
+                    self->host_gl_->flush_batch(thread);
+                    return true;
+                }
+                return false;
+            }
+            if (index >= ZB_JNI_SLOT_STUB_FIRST) {
+                return self->host_jni_->handle_fast_host_call(index, thread);
+            }
+            return self->host_gl_ != nullptr && self->host_gl_->handle_fast_host_call(index, thread);
+        },
+        this);
 }
 
 GuestJniEngine::~GuestJniEngine() {
@@ -488,8 +628,11 @@ bool GuestJniEngine::start(const LibraryRuntimeOptions& options, std::string& er
         error = "zbhost reported ready but libzbjni.so did not register the guest JNI API";
         return false;
     }
-    // Process-lifetime, like the runtime itself: no shutdown path, started once.
-    start_hang_watchdog();
+#if !defined(ZB_NO_TELEMETRY)
+    // Process-lifetime, like the runtime itself: no shutdown path, started once. The process is
+    // handed over so every sample can name the live guest PC and the stack chain behind it.
+    start_hang_watchdog(&runtime_->process());
+#endif
     return true;
 }
 
@@ -514,9 +657,11 @@ bool GuestJniEngine::create_native_activity(JniBackend::Env env, std::uint64_t a
         return false;
     }
     description.guest_vm = host_jni_->guest_java_vm();
+    description.guest_env = host_jni_->ensure_guest_env_for_current(env);
     // The activity object is held for the life of the activity: the guest keeps the jobject in
     // its own structure and calls Java through it long after this returns.
-    description.activity_handle = host_jni_->new_global_handle(backend_.new_global_ref(env, facts.activity_object));
+    const JniBackend::Ref activity_global = backend_.new_global_ref(env, facts.activity_object);
+    description.activity_handle = host_jni_->new_global_handle(activity_global);
     description.asset_manager =
         host_assets_ != nullptr ? host_assets_->handle_for_manager(facts.asset_manager) : 0;
     description.sdk_version = facts.sdk_version;
@@ -525,7 +670,15 @@ bool GuestJniEngine::create_native_activity(JniBackend::Env env, std::uint64_t a
     description.obb_path = facts.obb_path;
 
     const auto guest = host_native_activity_->create(description, saved_state, saved_state_size, error);
-    if (!guest) return false;
+    if (!guest) {
+        if (description.activity_handle != 0) {
+            const JniBackend::Ref removed = host_jni_->remove_global_handle(description.activity_handle);
+            if (removed != 0) backend_.delete_global_ref(env, removed);
+        } else if (activity_global != 0) {
+            backend_.delete_global_ref(env, activity_global);
+        }
+        return false;
+    }
     native_activity_platform_->attach(activity, *guest);
     return true;
 }

@@ -1,18 +1,28 @@
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(_zb_default_disable_telemetry ON)
+else()
+    set(_zb_default_disable_telemetry OFF)
+endif()
+option(ZB_DISABLE_TELEMETRY "Disable runtime diagnostics, watchdog, frame probe, GL census, and logging" ${_zb_default_disable_telemetry})
+
 add_library(zbcore STATIC
     src/android/host_looper.cpp
     src/android/host_native_window.cpp
+    src/android/host_opensl.cpp
     src/android/host_configuration.cpp
     src/android/host_input.cpp
     src/android/host_native_activity.cpp
     src/android/host_sensors.cpp
     src/android/host_platform_compat.cpp
     src/assets/host_assets.cpp
+    src/cpu_tuning.cpp
     src/cp15.cpp
     src/elf_fixups.cpp
     src/elf_symbols.cpp
     src/elf_loader.cpp
     src/guest_memory.cpp
     src/guest_thread.cpp
+    src/guest_io.cpp
     src/hang_watchdog.cpp
     src/gl/egl_manual.cpp
     src/gl/gl_diagnostics.cpp
@@ -42,11 +52,16 @@ add_library(zbcore STATIC
     src/runtime_report.cpp
     src/signals.cpp
     src/syscalls.cpp
-    src/zbridge_c_api.cpp
 )
+if (NOT ANDROID)
+    target_sources(zbcore PRIVATE src/zbridge_c_api.cpp)
+endif()
 target_include_directories(zbcore PUBLIC include PRIVATE src)
 target_link_libraries(zbcore PUBLIC dynarmic)
-target_compile_options(zbcore PRIVATE -Wall -Wextra)
+target_compile_options(zbcore PRIVATE -Wall -Wextra $<$<CONFIG:Release>:-O3>)
+if (ZB_DISABLE_TELEMETRY)
+    target_compile_definitions(zbcore PUBLIC ZB_NO_TELEMETRY=1)
+endif()
 
 if (ANDROID)
     target_link_libraries(zbcore PUBLIC log)
@@ -57,17 +72,20 @@ if (ANDROID)
     add_library(zbridge SHARED src/zbridge_c_api.cpp android/zbridge_jni.cpp android/jni_env_backend.cpp
         android/guest_jni_runtime.cpp android/gl_driver_backend.cpp android/asset_driver_backend.cpp
         android/egl_driver_backend.cpp android/native_window_driver_backend.cpp
-        android/looper_driver_backend.cpp android/native_activity_glue.cpp)
+        android/looper_driver_backend.cpp android/native_activity_glue.cpp
+        android/opensl_driver_backend.cpp)
     # GLESv3 for the GLES 3.0 half of GlDriverBackend. On the device both live in the one real
     # libGLESv2.so; the NDK splits the stub libraries by version.
     # core/src for the generated dispatch and driver .inc files the Android backends include.
     target_include_directories(zbridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(zbridge PRIVATE zbcore GLESv2 GLESv3 EGL android)
+    target_compile_options(zbridge PRIVATE -Wall -Wextra $<$<CONFIG:Release>:-O3>)
+    target_link_libraries(zbridge PRIVATE zbcore GLESv2 GLESv3 EGL android OpenSLES)
     set_target_properties(zbridge PROPERTIES CXX_VISIBILITY_PRESET hidden)
     target_compile_definitions(zbridge PRIVATE ZB_EXPORT_C_API)
     # --exclude-libs keeps the statically linked libc++ and friends from being exported, so
     # they cannot clash with the app's own libc++_shared.so in the same process.
-    target_link_options(zbridge PRIVATE -Wl,--gc-sections -Wl,--strip-all -Wl,--exclude-libs,ALL)
+    target_link_options(zbridge PRIVATE -Wl,--gc-sections -Wl,--strip-all -Wl,--exclude-libs,ALL
+        -Wl,-z,max-page-size=16384)
 
     # libzbproxy.so: the arm64 proxy ART loads for each arm32 plugin library (Phase 4d). Plain C
     # linked against nothing of ours; every link is checked by tools/check_zbproxy.py.
@@ -75,7 +93,7 @@ if (ANDROID)
     target_compile_options(zbproxy PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(zbproxy PRIVATE log)
     target_link_options(zbproxy PRIVATE -Wl,--as-needed -Wl,--no-undefined -Wl,--gc-sections
-        -Wl,--strip-all -Wl,--exclude-libs,ALL)
+        -Wl,--strip-all -Wl,--exclude-libs,ALL -Wl,-z,max-page-size=16384)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_custom_command(TARGET zbproxy POST_BUILD
         COMMAND Python3::Interpreter ${CMAKE_SOURCE_DIR}/tools/check_zbproxy.py $<TARGET_FILE:zbproxy>

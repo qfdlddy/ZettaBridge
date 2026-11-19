@@ -3,6 +3,8 @@ package com.zettabridge.launcher;
 import android.content.Context;
 import android.content.ContextParams;
 import android.content.ContextWrapper;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
@@ -49,9 +51,8 @@ final class PluginContext extends ContextWrapper {
     /** Wraps a context derived by the framework, with plugin resources in its configuration. */
     private PluginContext derived(Context frameworkContext) {
         Resources host = frameworkContext.getResources();
-        @SuppressWarnings("deprecation")
-        Resources pluginResources = new Resources(plugin.resources.getAssets(), host.getDisplayMetrics(),
-                host.getConfiguration());
+        Resources pluginResources = new PluginResources(plugin.resources.getAssets(), host.getDisplayMetrics(),
+                host.getConfiguration(), plugin.packageName, frameworkContext.getPackageName());
         return new PluginContext(frameworkContext, plugin, pluginResources);
     }
 
@@ -68,6 +69,34 @@ final class PluginContext extends ContextWrapper {
     @Override
     public ClassLoader getClassLoader() {
         return plugin.classLoader;
+    }
+
+    /**
+     * The Play Store licensing service does not exist on a device without Play, and translated
+     * guests cannot reach it either. Games that gate their boot on the licence callback would wait
+     * forever, so that one intent is answered locally. See {@link PlayLicensingShim}.
+     */
+    @Override
+    public boolean bindService(Intent service, ServiceConnection connection, int flags) {
+        if (PlayLicensingShim.isPlayLicensingBinding(service)) {
+            return PlayLicensingShim.bind(plugin.classLoader, connection);
+        }
+        return super.bindService(service, connection, flags);
+    }
+
+    @Override
+    public void unbindService(ServiceConnection connection) {
+        if (PlayLicensingShim.forget(connection)) return;
+        super.unbindService(connection);
+    }
+
+    @Override
+    public PackageManager getPackageManager() {
+        PackageManager pm = super.getPackageManager();
+        // ContextImpl may cache an ApplicationPackageManager whose binder is the real service,
+        // bypassing the virtualization installed at startup. Patch the one the guest actually uses.
+        PackageManagerHook.patch(pm);
+        return pm;
     }
 
     @Override
@@ -170,6 +199,29 @@ final class PluginContext extends ContextWrapper {
         return f;
     }
 
+    private static void requireSingleSegment(String name, String label) {
+        if (name == null || name.isEmpty()
+                || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf('\0') >= 0
+                || ".".equals(name) || "..".equals(name)) {
+            throw new IllegalArgumentException("Invalid " + label + ": " + name);
+        }
+    }
+
+    private static File requireChild(File base, String name, String label) {
+        requireSingleSegment(name, label);
+        File child = new File(base, name);
+        try {
+            String basePath = base.getCanonicalPath();
+            String childPath = child.getCanonicalPath();
+            if (!childPath.startsWith(basePath + File.separator)) {
+                throw new IllegalArgumentException("Path escapes base for " + label + ": " + name);
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalArgumentException("Cannot resolve " + label + ": " + name, e);
+        }
+        return child;
+    }
+
     private static File external(File base, String sub) {
         if (base == null) return null;
         File f = new File(base, sub);
@@ -199,12 +251,15 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public File getDir(String name, int mode) {
-        return dir("app_" + name);
+        requireSingleSegment(name, "directory name");
+        File f = requireChild(plugin.record.dataDir(), "app_" + name, "directory name");
+        f.mkdirs();
+        return f;
     }
 
     @Override
     public File getFileStreamPath(String name) {
-        return new File(getFilesDir(), name);
+        return requireChild(getFilesDir(), name, "file name");
     }
 
     @Override
@@ -230,8 +285,11 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public File getDatabasePath(String name) {
+        if (name == null || name.isEmpty() || name.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("Invalid database name: " + name);
+        }
         if (name.startsWith(File.separator)) return new File(name);
-        return new File(dir("databases"), name);
+        return requireChild(dir("databases"), name, "database name");
     }
 
     @Override
@@ -268,8 +326,28 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public File getExternalFilesDir(String type) {
-        String sub = "plugins/" + plugin.packageName + (type != null ? "/" + type : "");
-        return external(super.getExternalFilesDir(null), sub);
+        File pluginRoot = external(super.getExternalFilesDir(null), "plugins/" + plugin.packageName);
+        if (pluginRoot == null || type == null || type.isEmpty()) return pluginRoot;
+        if (type.indexOf('\\') >= 0 || type.indexOf('\0') >= 0 || type.startsWith("/")) {
+            throw new IllegalArgumentException("Invalid external files type: " + type);
+        }
+        File target = pluginRoot;
+        for (String seg : type.split("/")) {
+            if (seg.isEmpty()) continue;
+            requireSingleSegment(seg, "external files type");
+            target = new File(target, seg);
+        }
+        try {
+            String rootPath = pluginRoot.getCanonicalPath();
+            String targetPath = target.getCanonicalPath();
+            if (!targetPath.equals(rootPath) && !targetPath.startsWith(rootPath + File.separator)) {
+                throw new IllegalArgumentException("External files type escapes plugin dir: " + type);
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalArgumentException("Cannot resolve external files type: " + type, e);
+        }
+        target.mkdirs();
+        return target;
     }
 
     @Override
@@ -289,7 +367,9 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public File getObbDir() {
-        return external(super.getObbDir(), plugin.packageName);
+        File dir = external(super.getObbDir(), plugin.packageName);
+        if (!BuildConfig.DISABLE_DIAGNOSTICS) android.util.Log.i("zb-launcher", "obb dir: " + dir);
+        return dir;
     }
 
     @Override

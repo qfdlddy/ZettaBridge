@@ -3,13 +3,14 @@
 .arm
 .text
 
-.global glActiveTexture
-.type glActiveTexture, %function
+.global __zb_svc_glActiveTexture
+.hidden __zb_svc_glActiveTexture
+.type __zb_svc_glActiveTexture, %function
 .p2align 2
-glActiveTexture:
+__zb_svc_glActiveTexture:
     svc #0x5a0000
     bx lr
-.size glActiveTexture, . - glActiveTexture
+.size __zb_svc_glActiveTexture, . - __zb_svc_glActiveTexture
 
 .global glAttachShader
 .type glAttachShader, %function
@@ -27,21 +28,23 @@ glBindAttribLocation:
     bx lr
 .size glBindAttribLocation, . - glBindAttribLocation
 
-.global glBindBuffer
-.type glBindBuffer, %function
+.global __zb_svc_glBindBuffer
+.hidden __zb_svc_glBindBuffer
+.type __zb_svc_glBindBuffer, %function
 .p2align 2
-glBindBuffer:
+__zb_svc_glBindBuffer:
     svc #0x5a0003
     bx lr
-.size glBindBuffer, . - glBindBuffer
+.size __zb_svc_glBindBuffer, . - __zb_svc_glBindBuffer
 
-.global glBindFramebuffer
-.type glBindFramebuffer, %function
+.global __zb_svc_glBindFramebuffer
+.hidden __zb_svc_glBindFramebuffer
+.type __zb_svc_glBindFramebuffer, %function
 .p2align 2
-glBindFramebuffer:
+__zb_svc_glBindFramebuffer:
     svc #0x5a0004
     bx lr
-.size glBindFramebuffer, . - glBindFramebuffer
+.size __zb_svc_glBindFramebuffer, . - __zb_svc_glBindFramebuffer
 
 .global glBindRenderbuffer
 .type glBindRenderbuffer, %function
@@ -51,13 +54,14 @@ glBindRenderbuffer:
     bx lr
 .size glBindRenderbuffer, . - glBindRenderbuffer
 
-.global glBindTexture
-.type glBindTexture, %function
+.global __zb_svc_glBindTexture
+.hidden __zb_svc_glBindTexture
+.type __zb_svc_glBindTexture, %function
 .p2align 2
-glBindTexture:
+__zb_svc_glBindTexture:
     svc #0x5a0006
     bx lr
-.size glBindTexture, . - glBindTexture
+.size __zb_svc_glBindTexture, . - __zb_svc_glBindTexture
 
 .global glBlendColor
 .type glBlendColor, %function
@@ -67,37 +71,41 @@ glBlendColor:
     bx lr
 .size glBlendColor, . - glBlendColor
 
-.global glBlendEquation
-.type glBlendEquation, %function
+.global __zb_svc_glBlendEquation
+.hidden __zb_svc_glBlendEquation
+.type __zb_svc_glBlendEquation, %function
 .p2align 2
-glBlendEquation:
+__zb_svc_glBlendEquation:
     svc #0x5a0008
     bx lr
-.size glBlendEquation, . - glBlendEquation
+.size __zb_svc_glBlendEquation, . - __zb_svc_glBlendEquation
 
-.global glBlendEquationSeparate
-.type glBlendEquationSeparate, %function
+.global __zb_svc_glBlendEquationSeparate
+.hidden __zb_svc_glBlendEquationSeparate
+.type __zb_svc_glBlendEquationSeparate, %function
 .p2align 2
-glBlendEquationSeparate:
+__zb_svc_glBlendEquationSeparate:
     svc #0x5a0009
     bx lr
-.size glBlendEquationSeparate, . - glBlendEquationSeparate
+.size __zb_svc_glBlendEquationSeparate, . - __zb_svc_glBlendEquationSeparate
 
-.global glBlendFunc
-.type glBlendFunc, %function
+.global __zb_svc_glBlendFunc
+.hidden __zb_svc_glBlendFunc
+.type __zb_svc_glBlendFunc, %function
 .p2align 2
-glBlendFunc:
+__zb_svc_glBlendFunc:
     svc #0x5a000a
     bx lr
-.size glBlendFunc, . - glBlendFunc
+.size __zb_svc_glBlendFunc, . - __zb_svc_glBlendFunc
 
-.global glBlendFuncSeparate
-.type glBlendFuncSeparate, %function
+.global __zb_svc_glBlendFuncSeparate
+.hidden __zb_svc_glBlendFuncSeparate
+.type __zb_svc_glBlendFuncSeparate, %function
 .p2align 2
-glBlendFuncSeparate:
+__zb_svc_glBlendFuncSeparate:
     svc #0x5a000b
     bx lr
-.size glBlendFuncSeparate, . - glBlendFuncSeparate
+.size __zb_svc_glBlendFuncSeparate, . - __zb_svc_glBlendFuncSeparate
 
 .global glBufferData
 .type glBufferData, %function
@@ -107,13 +115,14 @@ glBufferData:
     bx lr
 .size glBufferData, . - glBufferData
 
-.global glBufferSubData
-.type glBufferSubData, %function
+.global __zb_svc_glBufferSubData
+.hidden __zb_svc_glBufferSubData
+.type __zb_svc_glBufferSubData, %function
 .p2align 2
-glBufferSubData:
+__zb_svc_glBufferSubData:
     svc #0x5a000d
     bx lr
-.size glBufferSubData, . - glBufferSubData
+.size __zb_svc_glBufferSubData, . - __zb_svc_glBufferSubData
 
 .global glCheckFramebufferStatus
 .type glCheckFramebufferStatus, %function
@@ -123,45 +132,50 @@ glCheckFramebufferStatus:
     bx lr
 .size glCheckFramebufferStatus, . - glCheckFramebufferStatus
 
-.global glClear
-.type glClear, %function
+.global __zb_svc_glClear
+.hidden __zb_svc_glClear
+.type __zb_svc_glClear, %function
 .p2align 2
-glClear:
+__zb_svc_glClear:
     svc #0x5a000f
     bx lr
-.size glClear, . - glClear
+.size __zb_svc_glClear, . - __zb_svc_glClear
 
-.global glClearColor
-.type glClearColor, %function
+.global __zb_svc_glClearColor
+.hidden __zb_svc_glClearColor
+.type __zb_svc_glClearColor, %function
 .p2align 2
-glClearColor:
+__zb_svc_glClearColor:
     svc #0x5a0010
     bx lr
-.size glClearColor, . - glClearColor
+.size __zb_svc_glClearColor, . - __zb_svc_glClearColor
 
-.global glClearDepthf
-.type glClearDepthf, %function
+.global __zb_svc_glClearDepthf
+.hidden __zb_svc_glClearDepthf
+.type __zb_svc_glClearDepthf, %function
 .p2align 2
-glClearDepthf:
+__zb_svc_glClearDepthf:
     svc #0x5a0011
     bx lr
-.size glClearDepthf, . - glClearDepthf
+.size __zb_svc_glClearDepthf, . - __zb_svc_glClearDepthf
 
-.global glClearStencil
-.type glClearStencil, %function
+.global __zb_svc_glClearStencil
+.hidden __zb_svc_glClearStencil
+.type __zb_svc_glClearStencil, %function
 .p2align 2
-glClearStencil:
+__zb_svc_glClearStencil:
     svc #0x5a0012
     bx lr
-.size glClearStencil, . - glClearStencil
+.size __zb_svc_glClearStencil, . - __zb_svc_glClearStencil
 
-.global glColorMask
-.type glColorMask, %function
+.global __zb_svc_glColorMask
+.hidden __zb_svc_glColorMask
+.type __zb_svc_glColorMask, %function
 .p2align 2
-glColorMask:
+__zb_svc_glColorMask:
     svc #0x5a0013
     bx lr
-.size glColorMask, . - glColorMask
+.size __zb_svc_glColorMask, . - __zb_svc_glColorMask
 
 .global glCompileShader
 .type glCompileShader, %function
@@ -219,37 +233,41 @@ glCreateShader:
     bx lr
 .size glCreateShader, . - glCreateShader
 
-.global glCullFace
-.type glCullFace, %function
+.global __zb_svc_glCullFace
+.hidden __zb_svc_glCullFace
+.type __zb_svc_glCullFace, %function
 .p2align 2
-glCullFace:
+__zb_svc_glCullFace:
     svc #0x5a001b
     bx lr
-.size glCullFace, . - glCullFace
+.size __zb_svc_glCullFace, . - __zb_svc_glCullFace
 
-.global glDeleteBuffers
-.type glDeleteBuffers, %function
+.global __zb_svc_glDeleteBuffers
+.hidden __zb_svc_glDeleteBuffers
+.type __zb_svc_glDeleteBuffers, %function
 .p2align 2
-glDeleteBuffers:
+__zb_svc_glDeleteBuffers:
     svc #0x5a001c
     bx lr
-.size glDeleteBuffers, . - glDeleteBuffers
+.size __zb_svc_glDeleteBuffers, . - __zb_svc_glDeleteBuffers
 
-.global glDeleteFramebuffers
-.type glDeleteFramebuffers, %function
+.global __zb_svc_glDeleteFramebuffers
+.hidden __zb_svc_glDeleteFramebuffers
+.type __zb_svc_glDeleteFramebuffers, %function
 .p2align 2
-glDeleteFramebuffers:
+__zb_svc_glDeleteFramebuffers:
     svc #0x5a001d
     bx lr
-.size glDeleteFramebuffers, . - glDeleteFramebuffers
+.size __zb_svc_glDeleteFramebuffers, . - __zb_svc_glDeleteFramebuffers
 
-.global glDeleteProgram
-.type glDeleteProgram, %function
+.global __zb_svc_glDeleteProgram
+.hidden __zb_svc_glDeleteProgram
+.type __zb_svc_glDeleteProgram, %function
 .p2align 2
-glDeleteProgram:
+__zb_svc_glDeleteProgram:
     svc #0x5a001e
     bx lr
-.size glDeleteProgram, . - glDeleteProgram
+.size __zb_svc_glDeleteProgram, . - __zb_svc_glDeleteProgram
 
 .global glDeleteRenderbuffers
 .type glDeleteRenderbuffers, %function
@@ -267,37 +285,41 @@ glDeleteShader:
     bx lr
 .size glDeleteShader, . - glDeleteShader
 
-.global glDeleteTextures
-.type glDeleteTextures, %function
+.global __zb_svc_glDeleteTextures
+.hidden __zb_svc_glDeleteTextures
+.type __zb_svc_glDeleteTextures, %function
 .p2align 2
-glDeleteTextures:
+__zb_svc_glDeleteTextures:
     svc #0x5a0021
     bx lr
-.size glDeleteTextures, . - glDeleteTextures
+.size __zb_svc_glDeleteTextures, . - __zb_svc_glDeleteTextures
 
-.global glDepthFunc
-.type glDepthFunc, %function
+.global __zb_svc_glDepthFunc
+.hidden __zb_svc_glDepthFunc
+.type __zb_svc_glDepthFunc, %function
 .p2align 2
-glDepthFunc:
+__zb_svc_glDepthFunc:
     svc #0x5a0022
     bx lr
-.size glDepthFunc, . - glDepthFunc
+.size __zb_svc_glDepthFunc, . - __zb_svc_glDepthFunc
 
-.global glDepthMask
-.type glDepthMask, %function
+.global __zb_svc_glDepthMask
+.hidden __zb_svc_glDepthMask
+.type __zb_svc_glDepthMask, %function
 .p2align 2
-glDepthMask:
+__zb_svc_glDepthMask:
     svc #0x5a0023
     bx lr
-.size glDepthMask, . - glDepthMask
+.size __zb_svc_glDepthMask, . - __zb_svc_glDepthMask
 
-.global glDepthRangef
-.type glDepthRangef, %function
+.global __zb_svc_glDepthRangef
+.hidden __zb_svc_glDepthRangef
+.type __zb_svc_glDepthRangef, %function
 .p2align 2
-glDepthRangef:
+__zb_svc_glDepthRangef:
     svc #0x5a0024
     bx lr
-.size glDepthRangef, . - glDepthRangef
+.size __zb_svc_glDepthRangef, . - __zb_svc_glDepthRangef
 
 .global glDetachShader
 .type glDetachShader, %function
@@ -307,53 +329,59 @@ glDetachShader:
     bx lr
 .size glDetachShader, . - glDetachShader
 
-.global glDisable
-.type glDisable, %function
+.global __zb_svc_glDisable
+.hidden __zb_svc_glDisable
+.type __zb_svc_glDisable, %function
 .p2align 2
-glDisable:
+__zb_svc_glDisable:
     svc #0x5a0026
     bx lr
-.size glDisable, . - glDisable
+.size __zb_svc_glDisable, . - __zb_svc_glDisable
 
-.global glDisableVertexAttribArray
-.type glDisableVertexAttribArray, %function
+.global __zb_svc_glDisableVertexAttribArray
+.hidden __zb_svc_glDisableVertexAttribArray
+.type __zb_svc_glDisableVertexAttribArray, %function
 .p2align 2
-glDisableVertexAttribArray:
+__zb_svc_glDisableVertexAttribArray:
     svc #0x5a0027
     bx lr
-.size glDisableVertexAttribArray, . - glDisableVertexAttribArray
+.size __zb_svc_glDisableVertexAttribArray, . - __zb_svc_glDisableVertexAttribArray
 
-.global glDrawArrays
-.type glDrawArrays, %function
+.global __zb_svc_glDrawArrays
+.hidden __zb_svc_glDrawArrays
+.type __zb_svc_glDrawArrays, %function
 .p2align 2
-glDrawArrays:
+__zb_svc_glDrawArrays:
     svc #0x5a0028
     bx lr
-.size glDrawArrays, . - glDrawArrays
+.size __zb_svc_glDrawArrays, . - __zb_svc_glDrawArrays
 
-.global glDrawElements
-.type glDrawElements, %function
+.global __zb_svc_glDrawElements
+.hidden __zb_svc_glDrawElements
+.type __zb_svc_glDrawElements, %function
 .p2align 2
-glDrawElements:
+__zb_svc_glDrawElements:
     svc #0x5a0029
     bx lr
-.size glDrawElements, . - glDrawElements
+.size __zb_svc_glDrawElements, . - __zb_svc_glDrawElements
 
-.global glEnable
-.type glEnable, %function
+.global __zb_svc_glEnable
+.hidden __zb_svc_glEnable
+.type __zb_svc_glEnable, %function
 .p2align 2
-glEnable:
+__zb_svc_glEnable:
     svc #0x5a002a
     bx lr
-.size glEnable, . - glEnable
+.size __zb_svc_glEnable, . - __zb_svc_glEnable
 
-.global glEnableVertexAttribArray
-.type glEnableVertexAttribArray, %function
+.global __zb_svc_glEnableVertexAttribArray
+.hidden __zb_svc_glEnableVertexAttribArray
+.type __zb_svc_glEnableVertexAttribArray, %function
 .p2align 2
-glEnableVertexAttribArray:
+__zb_svc_glEnableVertexAttribArray:
     svc #0x5a002b
     bx lr
-.size glEnableVertexAttribArray, . - glEnableVertexAttribArray
+.size __zb_svc_glEnableVertexAttribArray, . - __zb_svc_glEnableVertexAttribArray
 
 .global glFinish
 .type glFinish, %function
@@ -387,13 +415,14 @@ glFramebufferTexture2D:
     bx lr
 .size glFramebufferTexture2D, . - glFramebufferTexture2D
 
-.global glFrontFace
-.type glFrontFace, %function
+.global __zb_svc_glFrontFace
+.hidden __zb_svc_glFrontFace
+.type __zb_svc_glFrontFace, %function
 .p2align 2
-glFrontFace:
+__zb_svc_glFrontFace:
     svc #0x5a0030
     bx lr
-.size glFrontFace, . - glFrontFace
+.size __zb_svc_glFrontFace, . - __zb_svc_glFrontFace
 
 .global glGenBuffers
 .type glGenBuffers, %function
@@ -723,21 +752,23 @@ glLinkProgram:
     bx lr
 .size glLinkProgram, . - glLinkProgram
 
-.global glPixelStorei
-.type glPixelStorei, %function
+.global __zb_svc_glPixelStorei
+.hidden __zb_svc_glPixelStorei
+.type __zb_svc_glPixelStorei, %function
 .p2align 2
-glPixelStorei:
+__zb_svc_glPixelStorei:
     svc #0x5a005a
     bx lr
-.size glPixelStorei, . - glPixelStorei
+.size __zb_svc_glPixelStorei, . - __zb_svc_glPixelStorei
 
-.global glPolygonOffset
-.type glPolygonOffset, %function
+.global __zb_svc_glPolygonOffset
+.hidden __zb_svc_glPolygonOffset
+.type __zb_svc_glPolygonOffset, %function
 .p2align 2
-glPolygonOffset:
+__zb_svc_glPolygonOffset:
     svc #0x5a005b
     bx lr
-.size glPolygonOffset, . - glPolygonOffset
+.size __zb_svc_glPolygonOffset, . - __zb_svc_glPolygonOffset
 
 .global glReadPixels
 .type glReadPixels, %function
@@ -771,13 +802,14 @@ glSampleCoverage:
     bx lr
 .size glSampleCoverage, . - glSampleCoverage
 
-.global glScissor
-.type glScissor, %function
+.global __zb_svc_glScissor
+.hidden __zb_svc_glScissor
+.type __zb_svc_glScissor, %function
 .p2align 2
-glScissor:
+__zb_svc_glScissor:
     svc #0x5a0060
     bx lr
-.size glScissor, . - glScissor
+.size __zb_svc_glScissor, . - __zb_svc_glScissor
 
 .global glShaderBinary
 .type glShaderBinary, %function
@@ -795,53 +827,59 @@ glShaderSource:
     bx lr
 .size glShaderSource, . - glShaderSource
 
-.global glStencilFunc
-.type glStencilFunc, %function
+.global __zb_svc_glStencilFunc
+.hidden __zb_svc_glStencilFunc
+.type __zb_svc_glStencilFunc, %function
 .p2align 2
-glStencilFunc:
+__zb_svc_glStencilFunc:
     svc #0x5a0063
     bx lr
-.size glStencilFunc, . - glStencilFunc
+.size __zb_svc_glStencilFunc, . - __zb_svc_glStencilFunc
 
-.global glStencilFuncSeparate
-.type glStencilFuncSeparate, %function
+.global __zb_svc_glStencilFuncSeparate
+.hidden __zb_svc_glStencilFuncSeparate
+.type __zb_svc_glStencilFuncSeparate, %function
 .p2align 2
-glStencilFuncSeparate:
+__zb_svc_glStencilFuncSeparate:
     svc #0x5a0064
     bx lr
-.size glStencilFuncSeparate, . - glStencilFuncSeparate
+.size __zb_svc_glStencilFuncSeparate, . - __zb_svc_glStencilFuncSeparate
 
-.global glStencilMask
-.type glStencilMask, %function
+.global __zb_svc_glStencilMask
+.hidden __zb_svc_glStencilMask
+.type __zb_svc_glStencilMask, %function
 .p2align 2
-glStencilMask:
+__zb_svc_glStencilMask:
     svc #0x5a0065
     bx lr
-.size glStencilMask, . - glStencilMask
+.size __zb_svc_glStencilMask, . - __zb_svc_glStencilMask
 
-.global glStencilMaskSeparate
-.type glStencilMaskSeparate, %function
+.global __zb_svc_glStencilMaskSeparate
+.hidden __zb_svc_glStencilMaskSeparate
+.type __zb_svc_glStencilMaskSeparate, %function
 .p2align 2
-glStencilMaskSeparate:
+__zb_svc_glStencilMaskSeparate:
     svc #0x5a0066
     bx lr
-.size glStencilMaskSeparate, . - glStencilMaskSeparate
+.size __zb_svc_glStencilMaskSeparate, . - __zb_svc_glStencilMaskSeparate
 
-.global glStencilOp
-.type glStencilOp, %function
+.global __zb_svc_glStencilOp
+.hidden __zb_svc_glStencilOp
+.type __zb_svc_glStencilOp, %function
 .p2align 2
-glStencilOp:
+__zb_svc_glStencilOp:
     svc #0x5a0067
     bx lr
-.size glStencilOp, . - glStencilOp
+.size __zb_svc_glStencilOp, . - __zb_svc_glStencilOp
 
-.global glStencilOpSeparate
-.type glStencilOpSeparate, %function
+.global __zb_svc_glStencilOpSeparate
+.hidden __zb_svc_glStencilOpSeparate
+.type __zb_svc_glStencilOpSeparate, %function
 .p2align 2
-glStencilOpSeparate:
+__zb_svc_glStencilOpSeparate:
     svc #0x5a0068
     bx lr
-.size glStencilOpSeparate, . - glStencilOpSeparate
+.size __zb_svc_glStencilOpSeparate, . - __zb_svc_glStencilOpSeparate
 
 .global glTexImage2D
 .type glTexImage2D, %function
@@ -867,13 +905,14 @@ glTexParameterfv:
     bx lr
 .size glTexParameterfv, . - glTexParameterfv
 
-.global glTexParameteri
-.type glTexParameteri, %function
+.global __zb_svc_glTexParameteri
+.hidden __zb_svc_glTexParameteri
+.type __zb_svc_glTexParameteri, %function
 .p2align 2
-glTexParameteri:
+__zb_svc_glTexParameteri:
     svc #0x5a006c
     bx lr
-.size glTexParameteri, . - glTexParameteri
+.size __zb_svc_glTexParameteri, . - __zb_svc_glTexParameteri
 
 .global glTexParameteriv
 .type glTexParameteriv, %function
@@ -899,21 +938,23 @@ glUniform1f:
     bx lr
 .size glUniform1f, . - glUniform1f
 
-.global glUniform1fv
-.type glUniform1fv, %function
+.global __zb_svc_glUniform1fv
+.hidden __zb_svc_glUniform1fv
+.type __zb_svc_glUniform1fv, %function
 .p2align 2
-glUniform1fv:
+__zb_svc_glUniform1fv:
     svc #0x5a0070
     bx lr
-.size glUniform1fv, . - glUniform1fv
+.size __zb_svc_glUniform1fv, . - __zb_svc_glUniform1fv
 
-.global glUniform1i
-.type glUniform1i, %function
+.global __zb_svc_glUniform1i
+.hidden __zb_svc_glUniform1i
+.type __zb_svc_glUniform1i, %function
 .p2align 2
-glUniform1i:
+__zb_svc_glUniform1i:
     svc #0x5a0071
     bx lr
-.size glUniform1i, . - glUniform1i
+.size __zb_svc_glUniform1i, . - __zb_svc_glUniform1i
 
 .global glUniform1iv
 .type glUniform1iv, %function
@@ -931,21 +972,23 @@ glUniform2f:
     bx lr
 .size glUniform2f, . - glUniform2f
 
-.global glUniform2fv
-.type glUniform2fv, %function
+.global __zb_svc_glUniform2fv
+.hidden __zb_svc_glUniform2fv
+.type __zb_svc_glUniform2fv, %function
 .p2align 2
-glUniform2fv:
+__zb_svc_glUniform2fv:
     svc #0x5a0074
     bx lr
-.size glUniform2fv, . - glUniform2fv
+.size __zb_svc_glUniform2fv, . - __zb_svc_glUniform2fv
 
-.global glUniform2i
-.type glUniform2i, %function
+.global __zb_svc_glUniform2i
+.hidden __zb_svc_glUniform2i
+.type __zb_svc_glUniform2i, %function
 .p2align 2
-glUniform2i:
+__zb_svc_glUniform2i:
     svc #0x5a0075
     bx lr
-.size glUniform2i, . - glUniform2i
+.size __zb_svc_glUniform2i, . - __zb_svc_glUniform2i
 
 .global glUniform2iv
 .type glUniform2iv, %function
@@ -963,13 +1006,14 @@ glUniform3f:
     bx lr
 .size glUniform3f, . - glUniform3f
 
-.global glUniform3fv
-.type glUniform3fv, %function
+.global __zb_svc_glUniform3fv
+.hidden __zb_svc_glUniform3fv
+.type __zb_svc_glUniform3fv, %function
 .p2align 2
-glUniform3fv:
+__zb_svc_glUniform3fv:
     svc #0x5a0078
     bx lr
-.size glUniform3fv, . - glUniform3fv
+.size __zb_svc_glUniform3fv, . - __zb_svc_glUniform3fv
 
 .global glUniform3i
 .type glUniform3i, %function
@@ -995,13 +1039,14 @@ glUniform4f:
     bx lr
 .size glUniform4f, . - glUniform4f
 
-.global glUniform4fv
-.type glUniform4fv, %function
+.global __zb_svc_glUniform4fv
+.hidden __zb_svc_glUniform4fv
+.type __zb_svc_glUniform4fv, %function
 .p2align 2
-glUniform4fv:
+__zb_svc_glUniform4fv:
     svc #0x5a007c
     bx lr
-.size glUniform4fv, . - glUniform4fv
+.size __zb_svc_glUniform4fv, . - __zb_svc_glUniform4fv
 
 .global glUniform4i
 .type glUniform4i, %function
@@ -1027,29 +1072,32 @@ glUniformMatrix2fv:
     bx lr
 .size glUniformMatrix2fv, . - glUniformMatrix2fv
 
-.global glUniformMatrix3fv
-.type glUniformMatrix3fv, %function
+.global __zb_svc_glUniformMatrix3fv
+.hidden __zb_svc_glUniformMatrix3fv
+.type __zb_svc_glUniformMatrix3fv, %function
 .p2align 2
-glUniformMatrix3fv:
+__zb_svc_glUniformMatrix3fv:
     svc #0x5a0080
     bx lr
-.size glUniformMatrix3fv, . - glUniformMatrix3fv
+.size __zb_svc_glUniformMatrix3fv, . - __zb_svc_glUniformMatrix3fv
 
-.global glUniformMatrix4fv
-.type glUniformMatrix4fv, %function
+.global __zb_svc_glUniformMatrix4fv
+.hidden __zb_svc_glUniformMatrix4fv
+.type __zb_svc_glUniformMatrix4fv, %function
 .p2align 2
-glUniformMatrix4fv:
+__zb_svc_glUniformMatrix4fv:
     svc #0x5a0081
     bx lr
-.size glUniformMatrix4fv, . - glUniformMatrix4fv
+.size __zb_svc_glUniformMatrix4fv, . - __zb_svc_glUniformMatrix4fv
 
-.global glUseProgram
-.type glUseProgram, %function
+.global __zb_svc_glUseProgram
+.hidden __zb_svc_glUseProgram
+.type __zb_svc_glUseProgram, %function
 .p2align 2
-glUseProgram:
+__zb_svc_glUseProgram:
     svc #0x5a0082
     bx lr
-.size glUseProgram, . - glUseProgram
+.size __zb_svc_glUseProgram, . - __zb_svc_glUseProgram
 
 .global glValidateProgram
 .type glValidateProgram, %function
@@ -1115,29 +1163,32 @@ glVertexAttrib4f:
     bx lr
 .size glVertexAttrib4f, . - glVertexAttrib4f
 
-.global glVertexAttrib4fv
-.type glVertexAttrib4fv, %function
+.global __zb_svc_glVertexAttrib4fv
+.hidden __zb_svc_glVertexAttrib4fv
+.type __zb_svc_glVertexAttrib4fv, %function
 .p2align 2
-glVertexAttrib4fv:
+__zb_svc_glVertexAttrib4fv:
     svc #0x5a008b
     bx lr
-.size glVertexAttrib4fv, . - glVertexAttrib4fv
+.size __zb_svc_glVertexAttrib4fv, . - __zb_svc_glVertexAttrib4fv
 
-.global glVertexAttribPointer
-.type glVertexAttribPointer, %function
+.global __zb_svc_glVertexAttribPointer
+.hidden __zb_svc_glVertexAttribPointer
+.type __zb_svc_glVertexAttribPointer, %function
 .p2align 2
-glVertexAttribPointer:
+__zb_svc_glVertexAttribPointer:
     svc #0x5a008c
     bx lr
-.size glVertexAttribPointer, . - glVertexAttribPointer
+.size __zb_svc_glVertexAttribPointer, . - __zb_svc_glVertexAttribPointer
 
-.global glViewport
-.type glViewport, %function
+.global __zb_svc_glViewport
+.hidden __zb_svc_glViewport
+.type __zb_svc_glViewport, %function
 .p2align 2
-glViewport:
+__zb_svc_glViewport:
     svc #0x5a008d
     bx lr
-.size glViewport, . - glViewport
+.size __zb_svc_glViewport, . - __zb_svc_glViewport
 
 .global glEGLImageTargetTexture2DOES
 .type glEGLImageTargetTexture2DOES, %function
@@ -1163,29 +1214,32 @@ glBeginTransformFeedback:
     bx lr
 .size glBeginTransformFeedback, . - glBeginTransformFeedback
 
-.global glBindBufferBase
-.type glBindBufferBase, %function
+.global __zb_svc_glBindBufferBase
+.hidden __zb_svc_glBindBufferBase
+.type __zb_svc_glBindBufferBase, %function
 .p2align 2
-glBindBufferBase:
+__zb_svc_glBindBufferBase:
     svc #0x5a00e6
     bx lr
-.size glBindBufferBase, . - glBindBufferBase
+.size __zb_svc_glBindBufferBase, . - __zb_svc_glBindBufferBase
 
-.global glBindBufferRange
-.type glBindBufferRange, %function
+.global __zb_svc_glBindBufferRange
+.hidden __zb_svc_glBindBufferRange
+.type __zb_svc_glBindBufferRange, %function
 .p2align 2
-glBindBufferRange:
+__zb_svc_glBindBufferRange:
     svc #0x5a00e7
     bx lr
-.size glBindBufferRange, . - glBindBufferRange
+.size __zb_svc_glBindBufferRange, . - __zb_svc_glBindBufferRange
 
-.global glBindSampler
-.type glBindSampler, %function
+.global __zb_svc_glBindSampler
+.hidden __zb_svc_glBindSampler
+.type __zb_svc_glBindSampler, %function
 .p2align 2
-glBindSampler:
+__zb_svc_glBindSampler:
     svc #0x5a00e8
     bx lr
-.size glBindSampler, . - glBindSampler
+.size __zb_svc_glBindSampler, . - __zb_svc_glBindSampler
 
 .global glBindTransformFeedback
 .type glBindTransformFeedback, %function
@@ -1195,13 +1249,14 @@ glBindTransformFeedback:
     bx lr
 .size glBindTransformFeedback, . - glBindTransformFeedback
 
-.global glBindVertexArray
-.type glBindVertexArray, %function
+.global __zb_svc_glBindVertexArray
+.hidden __zb_svc_glBindVertexArray
+.type __zb_svc_glBindVertexArray, %function
 .p2align 2
-glBindVertexArray:
+__zb_svc_glBindVertexArray:
     svc #0x5a00ea
     bx lr
-.size glBindVertexArray, . - glBindVertexArray
+.size __zb_svc_glBindVertexArray, . - __zb_svc_glBindVertexArray
 
 .global glBlitFramebuffer
 .type glBlitFramebuffer, %function
@@ -1315,13 +1370,14 @@ glDeleteTransformFeedbacks:
     bx lr
 .size glDeleteTransformFeedbacks, . - glDeleteTransformFeedbacks
 
-.global glDeleteVertexArrays
-.type glDeleteVertexArrays, %function
+.global __zb_svc_glDeleteVertexArrays
+.hidden __zb_svc_glDeleteVertexArrays
+.type __zb_svc_glDeleteVertexArrays, %function
 .p2align 2
-glDeleteVertexArrays:
+__zb_svc_glDeleteVertexArrays:
     svc #0x5a00f9
     bx lr
-.size glDeleteVertexArrays, . - glDeleteVertexArrays
+.size __zb_svc_glDeleteVertexArrays, . - __zb_svc_glDeleteVertexArrays
 
 .global glDrawArraysInstanced
 .type glDrawArraysInstanced, %function
@@ -1611,13 +1667,14 @@ glGetVertexAttribIuiv:
     bx lr
 .size glGetVertexAttribIuiv, . - glGetVertexAttribIuiv
 
-.global glInvalidateFramebuffer
-.type glInvalidateFramebuffer, %function
+.global __zb_svc_glInvalidateFramebuffer
+.hidden __zb_svc_glInvalidateFramebuffer
+.type __zb_svc_glInvalidateFramebuffer, %function
 .p2align 2
-glInvalidateFramebuffer:
+__zb_svc_glInvalidateFramebuffer:
     svc #0x5a011e
     bx lr
-.size glInvalidateFramebuffer, . - glInvalidateFramebuffer
+.size __zb_svc_glInvalidateFramebuffer, . - __zb_svc_glInvalidateFramebuffer
 
 .global glInvalidateSubFramebuffer
 .type glInvalidateSubFramebuffer, %function
@@ -1963,13 +2020,14 @@ glVertexAttribI4uiv:
     bx lr
 .size glVertexAttribI4uiv, . - glVertexAttribI4uiv
 
-.global glVertexAttribIPointer
-.type glVertexAttribIPointer, %function
+.global __zb_svc_glVertexAttribIPointer
+.hidden __zb_svc_glVertexAttribIPointer
+.type __zb_svc_glVertexAttribIPointer, %function
 .p2align 2
-glVertexAttribIPointer:
+__zb_svc_glVertexAttribIPointer:
     svc #0x5a014a
     bx lr
-.size glVertexAttribIPointer, . - glVertexAttribIPointer
+.size __zb_svc_glVertexAttribIPointer, . - __zb_svc_glVertexAttribIPointer
 
 .global glWaitSync
 .type glWaitSync, %function
@@ -2003,21 +2061,23 @@ glDiscardFramebufferEXT:
     bx lr
 .size glDiscardFramebufferEXT, . - glDiscardFramebufferEXT
 
-.global glBindVertexArrayOES
-.type glBindVertexArrayOES, %function
+.global __zb_svc_glBindVertexArrayOES
+.hidden __zb_svc_glBindVertexArrayOES
+.type __zb_svc_glBindVertexArrayOES, %function
 .p2align 2
-glBindVertexArrayOES:
+__zb_svc_glBindVertexArrayOES:
     svc #0x5a014f
     bx lr
-.size glBindVertexArrayOES, . - glBindVertexArrayOES
+.size __zb_svc_glBindVertexArrayOES, . - __zb_svc_glBindVertexArrayOES
 
-.global glDeleteVertexArraysOES
-.type glDeleteVertexArraysOES, %function
+.global __zb_svc_glDeleteVertexArraysOES
+.hidden __zb_svc_glDeleteVertexArraysOES
+.type __zb_svc_glDeleteVertexArraysOES, %function
 .p2align 2
-glDeleteVertexArraysOES:
+__zb_svc_glDeleteVertexArraysOES:
     svc #0x5a0150
     bx lr
-.size glDeleteVertexArraysOES, . - glDeleteVertexArraysOES
+.size __zb_svc_glDeleteVertexArraysOES, . - __zb_svc_glDeleteVertexArraysOES
 
 .global glGenVertexArraysOES
 .type glGenVertexArraysOES, %function

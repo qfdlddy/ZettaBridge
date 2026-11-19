@@ -5,12 +5,15 @@
 #include <atomic>
 #include <string>
 
+#include <algorithm>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "zb/log.h"
 #include "zb/process.h"
@@ -93,10 +96,26 @@ std::uint32_t loader_operation(HostJni::Impl& jni, JniBackend::Env env, bool sym
     ThreadEnvScope env_scope(state, env, error);
     if (!env_scope.active()) return 0;
 
+    bool pushed_frame = false;
+    if (!symbol) {
+        if (!jni.ensure_guest_env(state)) {
+            error = "cannot allocate guest JNIEnv for dlopen";
+            return 0;
+        }
+        if (env != 0 && jni.backend.push_local_frame(env, 16) == 0) {
+            state.locals.push_frame();
+            pushed_frame = true;
+        }
+    }
+
     GuestCall allocate;
     allocate.regs = {static_cast<std::uint32_t>(text.size() + 1), 0, 0, 0};
     const auto allocated = jni.invoke(state, jni.runtime.service_api().malloc_fn, allocate);
     if (!allocated || allocated->r0 == 0) {
+        if (pushed_frame) {
+            state.locals.pop_frame();
+            (void)jni.backend.pop_local_frame(env, 0);
+        }
         error = "guest malloc for the loader string failed";
         return 0;
     }
@@ -126,6 +145,10 @@ std::uint32_t loader_operation(HostJni::Impl& jni, JniBackend::Env env, bool sym
     GuestCall release;
     release.regs = {scratch, 0, 0, 0};
     (void)jni.invoke(state, jni.runtime.service_api().free_fn, release);
+    if (pushed_frame) {
+        state.locals.pop_frame();
+        (void)jni.backend.pop_local_frame(env, 0);
+    }
     return result ? result->r0 : 0;
 }
 
@@ -164,7 +187,10 @@ std::uint32_t JniCall::arg(unsigned position) const {
 
 JniBackend::Env JniCall::env() {
     if (state_.env == 0) {
-        log("JNI %s called on a thread without a JNIEnv", jni_host_call_name(index_));
+        const char* name = jni_host_call_name(index_);
+        log("JNI %s called on a thread without a JNIEnv", name);
+        runtime_report().note_jni_detail("fatal", std::string("JNI ") + name + " called without JNIEnv", true);
+        runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
         std::abort();
     }
     return state_.env;
@@ -183,6 +209,8 @@ void HostJni::Impl::fatal(JniBackend::Env env, const char* fmt, ...) {
     std::vsnprintf(text, sizeof text, fmt, ap);
     va_end(ap);
     log("JNI fatal error: %s", text);
+    runtime_report().note_jni_detail("fatal", text, true);
+    runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
     if (env != 0) backend.fatal_error(env, text);
     std::abort();
 }
@@ -207,19 +235,79 @@ JniBackend::Ref HostJni::Impl::resolve(JniThread& state, std::uint32_t handle, c
     return *ref;
 }
 
-std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string& shorty) {
+std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string& shorty,
+                                           AudioMethodHook audio_hook, const std::string& java_name,
+                                           const std::string& java_signature) {
     const std::uint32_t guest = methods.intern(id);
     if (guest == 0) return 0;
     std::lock_guard<std::mutex> lock(shorty_mutex);
-    if (shorties.size() < guest) shorties.resize(guest);
-    shorties[guest - 1] = shorty;
+    const std::size_t page_idx = guest >> kMethodPageBits;
+    if (page_idx < kMethodPages) {
+        MethodPage* page = method_pages_[page_idx].load(std::memory_order_relaxed);
+        if (page == nullptr) {
+            auto owned_page = std::make_unique<MethodPage>();
+            page = owned_page.get();
+            owned_method_pages_.push_back(std::move(owned_page));
+            method_pages_[page_idx].store(page, std::memory_order_release);
+        }
+        const std::size_t slot = guest & (kMethodPageSize - 1);
+        const MethodRecord* existing = page->entries[slot].load(std::memory_order_relaxed);
+        const bool hook_changed = existing != nullptr && audio_hook != AudioMethodHook::None &&
+                                  existing->audio_hook != audio_hook;
+        const bool detail_missing = existing != nullptr &&
+                                    ((existing->name.empty() && !java_name.empty()) ||
+                                     (existing->signature.empty() && !java_signature.empty()));
+        if (existing == nullptr || hook_changed || detail_missing) {
+            // Name and signature are diagnostic only, so re-interning the same id must not lose
+            // the shorty or audio hook that were already recorded for it (and vice versa).
+            MethodRecord record = existing != nullptr
+                                      ? *existing
+                                      : MethodRecord{id, shorty, java_name, java_signature, audio_hook};
+            if (hook_changed) record.audio_hook = audio_hook;
+            if (record.name.empty()) record.name = java_name;
+            if (record.signature.empty()) record.signature = java_signature;
+            auto owned_record = std::make_unique<MethodRecord>(std::move(record));
+            const MethodRecord* raw = owned_record.get();
+            owned_methods_.push_back(std::move(owned_record));
+            page->entries[slot].store(raw, std::memory_order_release);
+        }
+        return guest;
+    }
+    const std::size_t overflow_idx = guest - kMethodPages * kMethodPageSize;
+    if (method_overflow_.size() <= overflow_idx) method_overflow_.resize(overflow_idx + 1);
+    method_overflow_[overflow_idx] = MethodRecord{id, shorty, java_name, java_signature, audio_hook};
     return guest;
 }
 
+const HostJni::Impl::MethodRecord* HostJni::Impl::method_record_fast(std::uint32_t id) const {
+    if (id == 0) return nullptr;
+    const std::size_t page_idx = id >> kMethodPageBits;
+    if (page_idx >= kMethodPages) return nullptr;
+    const MethodPage* page = method_pages_[page_idx].load(std::memory_order_acquire);
+    if (page == nullptr) return nullptr;
+    return page->entries[id & (kMethodPageSize - 1)].load(std::memory_order_acquire);
+}
+
 std::optional<std::string> HostJni::Impl::method_shorty(std::uint32_t id) {
+    if (const MethodRecord* fast = method_record_fast(id)) return fast->shorty;
+    if (id < kMethodPages * kMethodPageSize) return std::nullopt;
     std::lock_guard<std::mutex> lock(shorty_mutex);
-    if (id == 0 || id > shorties.size() || shorties[id - 1].empty()) return std::nullopt;
-    return shorties[id - 1];
+    const std::size_t overflow_idx = id - kMethodPages * kMethodPageSize;
+    if (overflow_idx >= method_overflow_.size() || method_overflow_[overflow_idx].shorty.empty()) {
+        return std::nullopt;
+    }
+    return method_overflow_[overflow_idx].shorty;
+}
+
+std::optional<HostJni::Impl::MethodRecord> HostJni::Impl::method_record(std::uint32_t id) {
+    if (const MethodRecord* fast = method_record_fast(id)) return *fast;
+    if (id < kMethodPages * kMethodPageSize) return std::nullopt;
+    std::lock_guard<std::mutex> lock(shorty_mutex);
+    const std::size_t overflow_idx = id - kMethodPages * kMethodPageSize;
+    if (overflow_idx >= method_overflow_.size() || method_overflow_[overflow_idx].shorty.empty()) {
+        return std::nullopt;
+    }
+    return method_overflow_[overflow_idx];
 }
 
 JniBackend::Id HostJni::Impl::method_id(JniBackend::Env env, std::uint32_t id, const char* function) {
@@ -232,6 +320,21 @@ JniBackend::Id HostJni::Impl::field_id(JniBackend::Env env, std::uint32_t id, co
     const std::optional<std::uint64_t> host = fields.get(id);
     if (id == 0 || !host) fatal(env, "%s: invalid jfieldID 0x%08x", function, id);
     return *host;
+}
+
+void HostJni::Impl::note_null_result(const std::string& what) {
+    const std::uint64_t total = null_result_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::string key;
+    {
+        std::lock_guard<std::mutex> lock(null_result_mutex_);
+        if (null_results_.size() < kMaxNullResults &&
+            std::find(null_results_.begin(), null_results_.end(), what) == null_results_.end()) {
+            null_results_.push_back(what);
+            key = "null-" + std::to_string(null_results_.size());
+        }
+    }
+    runtime_report().note_jni_detail("null-results", std::to_string(total), true);
+    if (!key.empty()) runtime_report().note_jni_detail(key, what, true);
 }
 
 std::string HostJni::Impl::read_string(JniBackend::Env env, std::uint32_t address, const char* function) {
@@ -289,6 +392,7 @@ std::optional<GuestResult> HostJni::Impl::invoke(JniThread& state, std::uint32_t
         state.carrier = runtime.borrow(error);
         if (!state.carrier) {
             log("JNI: cannot borrow a guest carrier: %s", error.c_str());
+            runtime_report().note_jni_detail("borrow-failed", error, true);
             return std::nullopt;
         }
     }
@@ -322,7 +426,7 @@ HostJni::~HostJni() {
 }
 
 std::optional<GuestResult> HostJni::call_on_host_thread(std::uint32_t function, const GuestCall& args) {
-    return impl_->invoke(t_thread, function, args);
+    return impl_->invoke(impl_->thread(), function, args);
 }
 
 bool HostJni::ready() const {
@@ -344,6 +448,33 @@ JniBackend::Ref HostJni::resolve_ref(std::uint32_t handle, const char* function)
 std::uint32_t HostJni::new_global_handle(JniBackend::Ref ref) {
     if (ref == 0) return 0;
     return impl_->globals.add(ref);
+}
+
+JniBackend::Ref HostJni::remove_global_handle(std::uint32_t handle) {
+    if (handle == 0) return 0;
+    const std::optional<std::uint64_t> ref = impl_->globals.remove(handle);
+    return ref.value_or(0);
+}
+
+JniBackend::Ref HostJni::retain_global_ref(JniBackend::Env env, JniBackend::Ref ref) {
+    if (env == 0 || ref == 0) return 0;
+    return impl_->backend.new_global_ref(env, ref);
+}
+
+void HostJni::release_global_ref(JniBackend::Env env, JniBackend::Ref ref) {
+    if (env == 0 || ref == 0) return;
+    impl_->backend.delete_global_ref(env, ref);
+}
+
+std::uint32_t HostJni::ensure_guest_env_for_current(JniBackend::Env env) {
+    Impl& jni = *impl_;
+    if (!jni.ready.load()) return 0;
+    JniThread& state = jni.thread();
+    std::string error;
+    ThreadEnvScope env_scope(state, env, error);
+    if (!env_scope.active()) return 0;
+    if (!jni.ensure_guest_env(state)) return 0;
+    return state.guest_env;
 }
 
 std::uint32_t HostJni::new_local_handle(JniBackend::Ref ref) {
@@ -370,11 +501,89 @@ std::atomic<std::uint32_t> g_recent[kRecentJniCalls];
 std::atomic<std::uint64_t> g_recent_next{0};
 
 void note_recent(std::uint32_t index) {
+#if defined(ZB_NO_TELEMETRY)
+    (void)index;
+#else
     const std::uint64_t slot = g_recent_next.fetch_add(1, std::memory_order_relaxed);
     g_recent[slot % kRecentJniCalls].store(index, std::memory_order_relaxed);
+#endif
+}
+
+// The method name of the call a CallMethodA performed, when it was looked up through GetMethodID.
+// The index alone ("CallMethodA") hides the difference between getObbDir, getAbsolutePath and a
+// Bundle.getString, which is exactly what a crash caused by one of them has to distinguish.
+constexpr std::size_t kRecentCalls = 24;
+std::mutex g_recent_names_mutex;
+std::array<std::string, kRecentCalls> g_recent_names;
+std::uint64_t g_recent_names_next = 0;
+
+void note_recent_name(const std::string& name) {
+    std::lock_guard<std::mutex> lock(g_recent_names_mutex);
+    g_recent_names[g_recent_names_next % kRecentCalls] = name;
+    ++g_recent_names_next;
 }
 
 }  // namespace
+
+void jni_note_call_name(const std::string& name) {
+#if defined(ZB_NO_TELEMETRY)
+    (void)name;
+#else
+    note_recent_name(name);
+#endif
+}
+
+// Actual string values returned by CallMethodA, for the handful of getters whose result a guest
+// turns into a path or an identifier. Bounded and truncated so a hot getter cannot grow the report.
+constexpr std::size_t kRecentStrings = 16;
+std::mutex g_recent_strings_mutex;
+std::array<std::string, kRecentStrings> g_recent_strings;
+std::uint64_t g_recent_strings_next = 0;
+
+void jni_note_string_result(const std::string& name, const std::string& value) {
+#if defined(ZB_NO_TELEMETRY)
+    (void)name;
+    (void)value;
+#else
+    if (value.size() > 512) return;
+    // A toString() that produced a throwable's text is the single most valuable string here; give
+    // it its own report line so the bounded combined "recent-jni-strings" line cannot truncate it.
+    if (value.find("Exception") != std::string::npos || value.find("Error") != std::string::npos) {
+        runtime_report().note_crash_detail("jni-toString-throwable", name + "=" + value);
+    }
+    std::lock_guard<std::mutex> lock(g_recent_strings_mutex);
+    g_recent_strings[g_recent_strings_next % kRecentStrings] = name + "=" + value;
+    ++g_recent_strings_next;
+#endif
+}
+
+std::string jni_recent_string_results() {
+    std::lock_guard<std::mutex> lock(g_recent_strings_mutex);
+    if (g_recent_strings_next == 0) return "(none)";
+    const std::uint64_t first = g_recent_strings_next > kRecentStrings ? g_recent_strings_next - kRecentStrings : 0;
+    std::string out;
+    for (std::uint64_t i = first; i < g_recent_strings_next; ++i) {
+        const std::string& item = g_recent_strings[i % kRecentStrings];
+        if (item.empty()) continue;
+        if (!out.empty()) out += " | ";
+        out += item;
+    }
+    return out.empty() ? "(none)" : out;
+}
+
+std::string jni_recent_call_names() {
+    std::lock_guard<std::mutex> lock(g_recent_names_mutex);
+    if (g_recent_names_next == 0) return "(none)";
+    const std::uint64_t first = g_recent_names_next > kRecentCalls ? g_recent_names_next - kRecentCalls : 0;
+    std::string out;
+    for (std::uint64_t i = first; i < g_recent_names_next; ++i) {
+        const std::string& name = g_recent_names[i % kRecentCalls];
+        if (name.empty()) continue;
+        if (!out.empty()) out += " ";
+        out += name;
+    }
+    return out.empty() ? "(none)" : out;
+}
 
 std::string jni_recent_calls() {
     const std::uint64_t next = g_recent_next.load(std::memory_order_relaxed);
@@ -387,6 +596,74 @@ std::string jni_recent_calls() {
         out += jni_host_call_name(index);
     }
     return out;
+}
+
+namespace {
+
+[[noreturn]] void abort_jni(const std::string& detail) {
+    runtime_report().note_jni_detail("fatal", detail, true);
+    runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
+    std::abort();
+}
+
+bool jni_call_is_fast_leaf(std::uint32_t index, GuestThread& thread) {
+    // Strict allowlist of genuinely leaf JNI calls that never invoke Java bytecode, class
+    // initializers (<clinit>), constructors, or guest code re-entry.
+    switch (index) {
+    case ZB_JNI_HC_GetField:
+    case ZB_JNI_HC_SetField:
+        // Instance field accesses (arg0 == 0) operate on an already-constructed object and never
+        // trigger <clinit> or Java bytecode execution.
+        return thread.regs()[0] == 0;
+    case ZB_JNI_HC_GetEnv:
+    case ZB_JNI_HC_GetSuperclass:
+    case ZB_JNI_HC_IsAssignableFrom:
+    case ZB_JNI_HC_GetObjectClass:
+    case ZB_JNI_HC_IsInstanceOf:
+    case ZB_JNI_HC_IsSameObject:
+    case ZB_JNI_HC_GetObjectRefType:
+    case ZB_JNI_HC_GetMethodShorty:
+    case ZB_JNI_HC_NewLocalRef:
+    case ZB_JNI_HC_DeleteLocalRef:
+    case ZB_JNI_HC_NewGlobalRef:
+    case ZB_JNI_HC_DeleteGlobalRef:
+    case ZB_JNI_HC_NewWeakGlobalRef:
+    case ZB_JNI_HC_DeleteWeakGlobalRef:
+    case ZB_JNI_HC_EnsureLocalCapacity:
+    case ZB_JNI_HC_PushLocalFrame:
+    case ZB_JNI_HC_PopLocalFrame:
+    case ZB_JNI_HC_Throw:
+    case ZB_JNI_HC_ExceptionOccurred:
+    case ZB_JNI_HC_ExceptionClear:
+    case ZB_JNI_HC_ExceptionCheck:
+    case ZB_JNI_HC_NewString:
+    case ZB_JNI_HC_GetStringLength:
+    case ZB_JNI_HC_GetStringRegion:
+    case ZB_JNI_HC_NewStringUTF:
+    case ZB_JNI_HC_GetStringUTFLength:
+    case ZB_JNI_HC_GetStringUTFRegion:
+    case ZB_JNI_HC_GetArrayLength:
+    case ZB_JNI_HC_NewObjectArray:
+    case ZB_JNI_HC_GetObjectArrayElement:
+    case ZB_JNI_HC_SetObjectArrayElement:
+    case ZB_JNI_HC_NewPrimitiveArray:
+    case ZB_JNI_HC_GetPrimitiveArrayRegion:
+    case ZB_JNI_HC_SetPrimitiveArrayRegion:
+    case ZB_JNI_HC_GetDirectBufferCapacity:
+        return true;
+    default:
+        return false;
+    }
+}
+
+}  // namespace
+
+bool HostJni::handle_fast_host_call(std::uint32_t index, GuestThread& thread) {
+    if (!jni_call_is_fast_leaf(index, thread)) return false;
+    Impl& jni = *impl_;
+    if (__builtin_expect(!jni.ready.load(std::memory_order_acquire), 0)) return false;
+    JniCall call(jni, thread, jni.thread(), index);
+    return jni.serve_vm(call) || jni.serve_objects(call) || jni.serve_values(call) || jni.serve_data(call);
 }
 
 bool HostJni::handle_host_call(std::uint32_t index, GuestThread& thread) {
@@ -409,16 +686,18 @@ bool HostJni::handle_host_call(std::uint32_t index, GuestThread& thread) {
         return true;
     }
     if (!jni.ready.load()) {
-        log("JNI host call %s before libzbjni.so registered", jni_host_call_name(index));
-        std::abort();
+        const char* name = jni_host_call_name(index);
+        log("JNI host call %s before libzbjni.so registered", name);
+        abort_jni(std::string("host call ") + name + " before libzbjni.so registered");
     }
     JniCall call(jni, thread, jni.thread(), index);
     if (jni.serve_vm(call) || jni.serve_objects(call) || jni.serve_values(call) || jni.serve_data(call) ||
         jni.serve_natives(call)) {
         return true;
     }
-    log("JNI host call 0x%x (%s) is not implemented", index, jni_host_call_name(index));
-    std::abort();
+    const char* name = jni_host_call_name(index);
+    log("JNI host call 0x%x (%s) is not implemented", index, name);
+    abort_jni(std::string("unimplemented JNI host call ") + name);
 }
 
 std::optional<HostJni::NativeResult> HostJni::call_native(JniBackend::Env env, char return_type,
@@ -433,9 +712,13 @@ std::optional<HostJni::NativeResult> HostJni::call_native(JniBackend::Env env, c
     const JniBackend::Env outer_env = state.env;
     if (outer_env != 0 && outer_env != env) {
         log("JNI native call with a JNIEnv that differs from this thread's JNIEnv");
-        std::abort();
+        abort_jni("native call JNIEnv mismatch");
     }
-    if (!jni.ready.load() || !jni.ensure_guest_env(state)) return std::nullopt;
+    if (!jni.ready.load() || !jni.ensure_guest_env(state)) {
+        runtime_report().note_jni_detail(
+            "native-call-aborted", !jni.ready.load() ? "host jni not ready" : "ensure_guest_env failed", true);
+        return std::nullopt;
+    }
     // The backend frame frees every host local created during the call in one step and keeps
     // the caller's (argument) references untouched.
     if (jni.backend.push_local_frame(env, 16) != 0) return std::nullopt;
@@ -455,13 +738,16 @@ std::optional<HostJni::NativeResult> HostJni::call_native(JniBackend::Env env, c
     // method returns. A guest that writes to a mirror outside a Java -> guest native call (from a
     // guest thread of its own, say) is not seen by Java until the next native call returns, and a
     // later GetDirectBufferAddress for the same buffer overwrites those writes with Java's bytes.
-    jni.flush_buffer_mirrors(env);
+    const bool exception_pending = jni.backend.exception_check(env);
+    if (!exception_pending) jni.flush_buffer_mirrors(env);
 
     std::optional<NativeResult> result;
     JniBackend::Ref kept = 0;
     if (guest) {
         result = NativeResult{*guest, 0};
-        if (return_type == 'L') kept = jni.resolve(state, guest->r0, "native method result");
+        if (return_type == 'L' && !exception_pending) {
+            kept = jni.resolve(state, guest->r0, "native method result");
+        }
     }
     if (state.locals.frame_count() != frames || state.user_frames != 0) {
         log("JNI: a native method returned with %d unpopped PushLocalFrame frames", state.user_frames);

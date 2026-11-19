@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -43,7 +44,23 @@ void store(std::uint8_t* p, T v) {
     std::memcpy(p, &v, sizeof v);
 }
 
+std::atomic<int> g_unsafe_fp_override{-1};
+
+bool unsafe_fp_enabled() {
+    const int override_val = g_unsafe_fp_override.load(std::memory_order_acquire);
+    if (override_val >= 0) return override_val != 0;
+    static const bool env_enabled = [] {
+        const char* v = std::getenv("ZB_UNSAFE_FP");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return env_enabled;
+}
+
 }  // namespace
+
+void set_unsafe_fp_override(bool enabled) {
+    g_unsafe_fp_override.store(enabled ? 1 : 0, std::memory_order_release);
+}
 
 GuestThread::GuestThread(GuestMemory& mem, Dynarmic::ExclusiveMonitor* monitor, std::size_t processor_id,
                          bool precise_faults, std::size_t code_cache_size)
@@ -56,11 +73,21 @@ GuestThread::GuestThread(GuestMemory& mem, Dynarmic::ExclusiveMonitor* monitor, 
     cfg.processor_id = processor_id;
     cfg.arch_version = Dynarmic::A32::ArchVersion::v8;
     cfg.fastmem_pointer = static_cast<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(mem.base()));
+    cfg.fastmem_exclusive_access = true;
     cfg.coprocessors[15] = cp15_;
     cfg.define_unpredictable_behaviour = true;
     cfg.enable_cycle_counting = false;
+    cfg.always_little_endian = true;
+    cfg.wall_clock_cntpct = true;
     cfg.check_halt_on_memory_access = precise_faults;
     cfg.code_cache_size = code_cache_size;
+    if (unsafe_fp_enabled()) {
+        cfg.unsafe_optimizations = true;
+        cfg.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA |
+                             Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue |
+                             Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+                             Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+    }
     jit_ = std::make_unique<Dynarmic::A32::Jit>(cfg);
 }
 
@@ -137,6 +164,10 @@ Stop GuestThread::run() {
 
 std::optional<GuestResult> GuestThread::call(std::uint32_t target, const GuestCall& args,
                                              const GuestStopHandler& handle_stop) {
+    if (in_fast_svc_) {
+        log("internal error: nested guest call attempted inside in-JIT fast svc");
+        std::abort();
+    }
     const auto saved_regs = regs();
     const auto saved_ext = ext_regs();
     const std::uint32_t saved_cpsr = cpsr();
@@ -167,6 +198,15 @@ std::optional<GuestResult> GuestThread::call(std::uint32_t target, const GuestCa
     set_cpsr((saved_cpsr & ~(kCpsrThumb | kCpsrItMask | kCpsrEndian)) | ((target & 1u) ? kCpsrThumb : 0));
 
     ++call_depth;
+    struct CallScope {
+        int& depth;
+        const decltype(restore)& fn;
+        ~CallScope() {
+            --depth;
+            fn();
+        }
+    } scope{call_depth, restore};
+
     std::optional<GuestResult> result;
     for (;;) {
         const Stop stop = run();
@@ -182,35 +222,49 @@ std::optional<GuestResult> GuestThread::call(std::uint32_t target, const GuestCa
         }
         if (!handle_stop(stop)) break;
     }
-    --call_depth;
-    restore();
     return result;
 }
 
-void GuestThread::invalidate(std::uint32_t addr, std::uint32_t len) {
-    jit_->InvalidateCacheRange(addr, len);
+void GuestThread::invalidate(std::uint32_t addr, std::uint64_t len) {
+    if (len == 0) return;
+    if (len >= kGuestSpaceSize || static_cast<std::uint64_t>(addr) + len > kGuestSpaceSize) {
+        jit_->ClearCache();
+        return;
+    }
+    jit_->InvalidateCacheRange(addr, static_cast<std::size_t>(len));
 }
 
 void GuestThread::begin_blocking() {
-    blocking_.store(1);
+    blocking_.store(1, std::memory_order_seq_cst);
 }
 
 void GuestThread::end_blocking() {
-    blocking_.store(0);
+    blocking_.store(0, std::memory_order_seq_cst);
 }
 
 void GuestThread::interrupt() {
     // seq_cst: the poster sets the pending bit before reading this flag, and the waiter sets the
     // flag before it checks for pending signals, so at least one of the two sees the other.
-    if (blocking_.load() == 0 || tid == 0) return;
-    ::syscall(SYS_tgkill, ::getpid(), tid, host_interrupt_signal());
+    const std::int32_t active = host_tid.load(std::memory_order_seq_cst);
+    const std::int32_t target = active != 0 ? active : tid;
+    if (blocking_.load(std::memory_order_seq_cst) == 0 || target == 0) return;
+    ::syscall(SYS_tgkill, ::getpid(), target, host_interrupt_signal());
 }
 
 void GuestThread::post_signal(const g::siginfo32& info) {
     const int sig = info.si_signo;
     if (sig < 1 || sig > 64) return;
-    pending_info_[static_cast<std::size_t>(sig)] = info;
-    pending_signals_.fetch_or(1ULL << (sig - 1));
+    const std::size_t slot = static_cast<std::size_t>(sig);
+    std::uint8_t expected = 0;
+    if (pending_state_[slot].compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+        pending_info_[slot] = info;
+        pending_state_[slot].store(2, std::memory_order_release);
+        pending_signals_.fetch_or(1ULL << (sig - 1), std::memory_order_seq_cst);
+    } else if (expected == 2) {
+        // Already populated and ready: coalesce without overwriting siginfo32 in flight.
+        pending_signals_.fetch_or(1ULL << (sig - 1), std::memory_order_seq_cst);
+    }
     jit_->HaltExecution(kInterruptHalt);
     wake();
     interrupt();
@@ -226,13 +280,21 @@ void GuestThread::wake() {
 }
 
 bool GuestThread::take_signal(std::uint64_t blocked, g::siginfo32& out) {
-    std::uint64_t pending = pending_signals_.load();
+    std::uint64_t pending = pending_signals_.load(std::memory_order_acquire);
     for (;;) {
         const std::uint64_t deliverable = pending & ~blocked;
         if (deliverable == 0) return false;
         const int bit = std::countr_zero(deliverable);
-        if (pending_signals_.compare_exchange_weak(pending, pending & ~(1ULL << bit))) {
-            out = pending_info_[static_cast<std::size_t>(bit + 1)];
+        const std::size_t slot = static_cast<std::size_t>(bit + 1);
+        if (pending_signals_.compare_exchange_weak(pending, pending & ~(1ULL << bit),
+                                                   std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (pending_state_[slot].load(std::memory_order_acquire) == 2) {
+                out = pending_info_[slot];
+                pending_state_[slot].store(0, std::memory_order_release);
+            } else {
+                out = g::siginfo32{};
+                out.si_signo = static_cast<std::int32_t>(slot);
+            }
             return true;
         }
     }
@@ -285,34 +347,63 @@ void GuestThread::MemoryWrite64(std::uint32_t vaddr, std::uint64_t value) {
     if (check_access(vaddr, 8, kPageWrite, true)) store(mem_.base() + vaddr, value);
 }
 
-// The ExclusiveMonitor serializes these calls; compare-then-write is atomic under its lock.
+namespace {
+
+std::mutex& unaligned_exclusive_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+template <typename T>
+bool atomic_write_exclusive(std::uint8_t* base, std::uint32_t vaddr, T value, T expected) {
+    if constexpr (sizeof(T) == 1) {
+        return __atomic_compare_exchange_n(base + vaddr, &expected, value, false, __ATOMIC_SEQ_CST,
+                                           __ATOMIC_SEQ_CST);
+    } else {
+        if ((vaddr & (sizeof(T) - 1)) == 0) {
+            return __atomic_compare_exchange_n(reinterpret_cast<T*>(base + vaddr), &expected, value,
+                                               false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        }
+        std::lock_guard<std::mutex> lock(unaligned_exclusive_mutex());
+        T current{};
+        std::memcpy(&current, base + vaddr, sizeof(T));
+        if (current != expected) return false;
+        std::memcpy(base + vaddr, &value, sizeof(T));
+        return true;
+    }
+}
+
+}  // namespace
+
+// Hardware CAS when naturally aligned (matching JIT fastmem LDAXR/STLXR), with mutex fallback
+// only for rare unaligned exclusive accesses.
 bool GuestThread::MemoryWriteExclusive8(std::uint32_t vaddr, std::uint8_t value, std::uint8_t expected) {
-    if (!check_access(vaddr, 1, kPageRead | kPageWrite, true) || mem_.base()[vaddr] != expected) return false;
-    mem_.base()[vaddr] = value;
-    return true;
+    if (!check_access(vaddr, 1, kPageRead | kPageWrite, true)) return false;
+    return atomic_write_exclusive<std::uint8_t>(mem_.base(), vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive16(std::uint32_t vaddr, std::uint16_t value, std::uint16_t expected) {
-    if (!check_access(vaddr, 2, kPageRead | kPageWrite, true) || load<std::uint16_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    if (!check_access(vaddr, 2, kPageRead | kPageWrite, true)) return false;
+    return atomic_write_exclusive<std::uint16_t>(mem_.base(), vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) {
-    if (!check_access(vaddr, 4, kPageRead | kPageWrite, true) || load<std::uint32_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    if (!check_access(vaddr, 4, kPageRead | kPageWrite, true)) return false;
+    return atomic_write_exclusive<std::uint32_t>(mem_.base(), vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) {
-    if (!check_access(vaddr, 8, kPageRead | kPageWrite, true) || load<std::uint64_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    if (!check_access(vaddr, 8, kPageRead | kPageWrite, true)) return false;
+    return atomic_write_exclusive<std::uint64_t>(mem_.base(), vaddr, value, expected);
 }
 
 std::optional<std::uint32_t> GuestThread::MemoryReadCode(std::uint32_t vaddr) {
     if (!mem_.accessible(vaddr, 4, kPageExec)) return std::nullopt;
     return load<std::uint32_t>(mem_.base() + vaddr);
+}
+
+bool GuestThread::IsReadOnlyMemory(std::uint32_t vaddr) {
+    return mem_.accessible(vaddr, 8, kPageRead | kPageExec) && !mem_.any_flag(vaddr, 8, kPageWrite);
 }
 
 void GuestThread::InterpreterFallback(std::uint32_t pc, std::size_t num_instructions) {
@@ -326,6 +417,13 @@ void GuestThread::InterpreterFallback(std::uint32_t pc, std::size_t num_instruct
 }
 
 void GuestThread::CallSVC(std::uint32_t swi) {
+    if (pending_.kind == StopKind::None && fast_svc_handler_ != nullptr &&
+        !has_pending_signals(sigmask)) {
+        in_fast_svc_ = true;
+        const bool handled = fast_svc_handler_(fast_svc_ctx_, *this, swi);
+        in_fast_svc_ = false;
+        if (handled) return;
+    }
     if (pending_.kind == StopKind::None) {
         pending_.kind = StopKind::Svc;
         pending_.swi = swi;

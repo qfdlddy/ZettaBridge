@@ -50,7 +50,6 @@ private:
     // does not have it. Safe from any thread; resolving twice in a race is harmless.
     void* extension_entry(unsigned slot, const char* name);
 
-    GLenum pending_error_ = 0;  // GL_NO_ERROR
     std::array<std::atomic<void*>, kGlHostCallExtCount> extension_entries_{};
 };
 

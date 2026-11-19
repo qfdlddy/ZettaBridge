@@ -518,10 +518,18 @@ static void zbjni_buffer_free(struct zbjni_buffer* header) {
 }
 
 static void* zbjni_get_elements(jarray array, char type, jboolean* is_copy) {
+    if (array == NULL) return NULL;
     const jsize length = (jsize)zbjni_hc_GetArrayLength(U(array));
+    if (zbjni_hc_ExceptionCheck()) return NULL;
     void* data = zbjni_buffer_new(type, length);
     if (data == NULL) return NULL;
-    if (length > 0) zbjni_hc_GetPrimitiveArrayRegion((uint32_t)type, U(array), 0, (uint32_t)length, U(data));
+    if (length > 0) {
+        zbjni_hc_GetPrimitiveArrayRegion((uint32_t)type, U(array), 0, (uint32_t)length, U(data));
+        if (zbjni_hc_ExceptionCheck()) {
+            zbjni_buffer_free((struct zbjni_buffer*)((char*)data - sizeof(struct zbjni_buffer)));
+            return NULL;
+        }
+    }
     if (is_copy != NULL) *is_copy = JNI_TRUE;
     return data;
 }
@@ -531,7 +539,19 @@ static void zbjni_release_elements(jarray array, void* data, jint mode, const ch
     struct zbjni_buffer* header = zbjni_buffer_header(data, function);
     if (header == NULL) return;
     if (mode != JNI_ABORT && header->length > 0) {
+        /* JNI permits Release*ArrayElements with an exception pending, whereas Set*ArrayRegion
+         * does not; preserve any pending exception across the writeback. */
+        uint32_t pending = 0;
+        if (zbjni_hc_ExceptionCheck()) {
+            pending = zbjni_hc_ExceptionOccurred();
+            zbjni_hc_ExceptionClear();
+        }
         zbjni_hc_SetPrimitiveArrayRegion(header->type, U(array), 0, (uint32_t)header->length, U(data));
+        if (pending != 0) {
+            if (zbjni_hc_ExceptionCheck()) zbjni_hc_ExceptionClear();
+            zbjni_hc_Throw(pending);
+            zbjni_hc_DeleteLocalRef(pending);
+        }
     }
     if (mode != JNI_COMMIT) zbjni_buffer_free(header);
 }
@@ -549,9 +569,16 @@ static jsize zbjni_GetStringLength(JNIEnv* env, jstring str) {
 static const jchar* zbjni_GetStringChars(JNIEnv* env, jstring str, jboolean* is_copy) {
     if (str == NULL) return NULL;
     const jsize length = zbjni_GetStringLength(env, str);
+    if (zbjni_hc_ExceptionCheck()) return NULL;
     jchar* chars = zbjni_buffer_new('C', length);
     if (chars == NULL) return NULL;
-    if (length > 0) zbjni_hc_GetStringRegion(U(str), 0, (uint32_t)length, U(chars));
+    if (length > 0) {
+        zbjni_hc_GetStringRegion(U(str), 0, (uint32_t)length, U(chars));
+        if (zbjni_hc_ExceptionCheck()) {
+            zbjni_buffer_free((struct zbjni_buffer*)((char*)chars - sizeof(struct zbjni_buffer)));
+            return NULL;
+        }
+    }
     if (is_copy != NULL) *is_copy = JNI_TRUE;
     return chars;
 }
@@ -573,10 +600,15 @@ static const char* zbjni_GetStringUTFChars(JNIEnv* env, jstring str, jboolean* i
     if (str == NULL) return NULL;
     const jsize bytes = zbjni_GetStringUTFLength(env, str);
     const jsize length = zbjni_GetStringLength(env, str);
+    if (zbjni_hc_ExceptionCheck()) return NULL;
     char* utf = zbjni_buffer_new('U', bytes);
     if (utf == NULL) return NULL;
     /* Writes the bytes and a NUL, which the buffer has room for. */
     zbjni_hc_GetStringUTFRegion(U(str), 0, (uint32_t)length, U(utf));
+    if (zbjni_hc_ExceptionCheck()) {
+        zbjni_buffer_free((struct zbjni_buffer*)((char*)utf - sizeof(struct zbjni_buffer)));
+        return NULL;
+    }
     if (is_copy != NULL) *is_copy = JNI_TRUE;
     return utf;
 }

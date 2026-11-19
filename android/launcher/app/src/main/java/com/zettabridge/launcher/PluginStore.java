@@ -1,6 +1,7 @@
 package com.zettabridge.launcher;
 
 import android.content.Context;
+import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -8,12 +9,20 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Parcel;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -23,8 +32,18 @@ import com.zettabridge.core.ZBridge;
 final class PluginStore {
     static final int ARCHIVE_FLAGS = PackageManager.GET_ACTIVITIES | PackageManager.GET_PROVIDERS
             | PackageManager.GET_SERVICES | PackageManager.GET_RECEIVERS | PackageManager.GET_META_DATA;
+    private static final int PACKAGE_CACHE_MAGIC = 0x5A425049;
+    private static final int PACKAGE_CACHE_VERSION = 1;
+    private static final String PACKAGE_CACHE_NAME = "package-info.parcel";
+    private static final java.util.regex.Pattern PACKAGE_NAME_PATTERN =
+            java.util.regex.Pattern.compile("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$");
 
     private PluginStore() {}
+
+    static boolean isValidPackageName(String packageName) {
+        return packageName != null && packageName.length() <= 255
+                && PACKAGE_NAME_PATTERN.matcher(packageName).matches();
+    }
 
     static File root(Context c) {
         return new File(c.getFilesDir(), "plugins");
@@ -43,7 +62,7 @@ final class PluginStore {
     }
 
     static PluginRecord find(Context c, String packageName) {
-        if (packageName == null || packageName.contains("/")) return null;
+        if (!isValidPackageName(packageName)) return null;
         return PluginRecord.load(new File(root(c), packageName));
     }
 
@@ -69,7 +88,7 @@ final class PluginStore {
             tmp.delete();
             throw new IOException("not an installable APK (split bundles are not supported)");
         }
-        if (info.packageName.equals(c.getPackageName()) || info.packageName.contains("/")) {
+        if (!isValidPackageName(info.packageName) || info.packageName.equals(c.getPackageName())) {
             tmp.delete();
             throw new IOException("refusing to import " + info.packageName);
         }
@@ -83,9 +102,7 @@ final class PluginStore {
         try {
             PluginRecord r = new PluginRecord(staging);
             File apk = r.apk();
-            try (InputStream in = new java.io.FileInputStream(tmp)) {
-                PluginFiles.copyAtomic(in, apk);
-            }
+            PluginFiles.moveOrCopy(tmp, apk);
             // Android 14+ refuses to load dex code from writable files.
             if (!apk.setReadOnly()) throw new IOException("cannot make APK read-only: " + apk);
 
@@ -97,7 +114,10 @@ final class PluginStore {
             r.selectedAbi = PluginFiles.selectAbi(r.abis);
             if (r.selectedAbi != null) {
                 final boolean translated = r.isTranslated();
-                if (translated) RuntimeBundle.install(c);
+                if (translated) {
+                    RuntimeBundle.install(c);
+                    r.unsafeFp = true;
+                }
                 PluginFiles.extractLibraries(apk, r.libDir(), r.selectedAbi, library -> {
                     if (!translated) return;
                     String result = ZBridge.fixGuestLibrary(library.getPath());
@@ -116,8 +136,15 @@ final class PluginStore {
             } catch (PackageManager.NameNotFoundException e) {
                 r.launcherActivity = null;
             }
+            if ("cc.binmt.signature.PmsHookApplication".equals(ai.className)) {
+                r.application = android.app.Application.class.getName();
+            }
+            if ("com.fiveplay.mod.RMS.Recovery".equals(r.launcherActivity) && hasActivity(info, "com.unity3d.player.UnityPlayerActivity")) {
+                r.launcherActivity = "com.unity3d.player.UnityPlayerActivity";
+            }
             // Completion marker: never write this until extraction and all in-place fixups pass.
             r.save();
+            savePackageInfoCache(r, info);
             PluginFiles.replaceDirectoryKeeping(staging, target, "data");
             PluginRecord published = PluginRecord.load(target);
             if (published == null) throw new IOException("cannot read published metadata for " + info.packageName);
@@ -128,8 +155,115 @@ final class PluginStore {
         }
     }
 
+    static PackageInfo loadPackageInfo(Context c, PluginRecord r) {
+        File apk = r.apk();
+        File cache = new File(r.dir, PACKAGE_CACHE_NAME);
+        if (cache.isFile() && apk.isFile()) {
+            try (DataInputStream in = new DataInputStream(new FileInputStream(cache))) {
+                if (in.readInt() == PACKAGE_CACHE_MAGIC
+                        && in.readInt() == PACKAGE_CACHE_VERSION
+                        && in.readInt() == ARCHIVE_FLAGS
+                        && in.readLong() == apk.length()
+                        && in.readLong() == apk.lastModified()
+                        && Build.FINGERPRINT.equals(in.readUTF())) {
+                    int len = in.readInt();
+                    if (len > 0 && len <= (16 << 20)) {
+                        byte[] bytes = new byte[len];
+                        in.readFully(bytes);
+                        Parcel parcel = Parcel.obtain();
+                        try {
+                            parcel.unmarshall(bytes, 0, bytes.length);
+                            parcel.setDataPosition(0);
+                            PackageInfo cached = PackageInfo.CREATOR.createFromParcel(parcel);
+                            if (cached != null && cached.applicationInfo != null) {
+                                return cached;
+                            }
+                        } finally {
+                            parcel.recycle();
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Fall back to parsing the archive if the parcel format changed or is corrupt.
+            }
+        }
+        PackageInfo parsed = c.getPackageManager().getPackageArchiveInfo(apk.getPath(), ARCHIVE_FLAGS);
+        if (parsed != null && parsed.applicationInfo != null) {
+            savePackageInfoCache(r, parsed);
+        }
+        return parsed;
+    }
+
+    private static void savePackageInfoCache(PluginRecord r, PackageInfo info) {
+        File apk = r.apk();
+        if (!apk.isFile() || info == null) return;
+        Parcel parcel = Parcel.obtain();
+        byte[] parcelBytes;
+        try {
+            info.writeToParcel(parcel, 0);
+            parcelBytes = parcel.marshall();
+        } catch (Throwable ignored) {
+            return;
+        } finally {
+            parcel.recycle();
+        }
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(parcelBytes.length + 128);
+            DataOutputStream out = new DataOutputStream(baos);
+            out.writeInt(PACKAGE_CACHE_MAGIC);
+            out.writeInt(PACKAGE_CACHE_VERSION);
+            out.writeInt(ARCHIVE_FLAGS);
+            out.writeLong(apk.length());
+            out.writeLong(apk.lastModified());
+            out.writeUTF(Build.FINGERPRINT);
+            out.writeInt(parcelBytes.length);
+            out.write(parcelBytes);
+            out.flush();
+            PluginFiles.copyAtomic(new ByteArrayInputStream(baos.toByteArray()), new File(r.dir, PACKAGE_CACHE_NAME));
+        } catch (IOException ignored) {
+            // Cache write is best-effort.
+        }
+    }
+
     static void delete(PluginRecord r) {
         PluginFiles.deleteRecursive(r.dir);
+    }
+
+    private static boolean hasActivity(PackageInfo info, String name) {
+        if (info == null || info.activities == null) return false;
+        for (ActivityInfo a : info.activities) {
+            if (name.equals(a.name)) return true;
+        }
+        return false;
+    }
+
+    /** Extracts a 5play/mod bundled assets/obb payload once if the plugin's OBB directory is empty. */
+    static void ensureBundledObb(Context c, PluginRecord r, PackageInfo info) {
+        if (r == null || info == null) return;
+        File obbRoot = c.getObbDir();
+        if (obbRoot == null) return;
+        File obbDir = new File(obbRoot, r.packageName);
+        File[] existing = obbDir.listFiles();
+        if (existing != null) {
+            for (File f : existing) {
+                if (f.isFile() && f.getName().endsWith(".obb") && f.length() > 0) return;
+            }
+        }
+        File apk = r.apk();
+        if (!apk.isFile()) return;
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(apk)) {
+            java.util.zip.ZipEntry entry = zip.getEntry("assets/obb");
+            if (entry == null || entry.isDirectory() || entry.getSize() <= 0) return;
+            if (!obbDir.isDirectory() && !obbDir.mkdirs()) return;
+            String obbName = "patch." + info.getLongVersionCode() + "." + c.getPackageName() + ".obb";
+            File out = new File(obbDir, obbName);
+            if (out.isFile() && out.length() == entry.getSize()) return;
+            try (InputStream in = zip.getInputStream(entry)) {
+                PluginFiles.copyAtomic(in, out);
+            }
+        } catch (IOException ignored) {
+            // Best-effort extraction; missing OBB will be visible in the runtime report.
+        }
     }
 
     private static void saveIcon(Drawable d, File out) {

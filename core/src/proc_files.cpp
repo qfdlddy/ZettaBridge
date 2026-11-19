@@ -61,6 +61,7 @@ int memfd_with(const std::string& text, int flags) {
     std::size_t done = 0;
     while (done < text.size()) {
         const ssize_t n = ::write(fd, text.data() + done, text.size() - done);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             const int err = n < 0 ? errno : EIO;
             ::close(fd);
@@ -98,14 +99,24 @@ bool Process::open_synthetic_file(const char* guest_path, int flags, std::int32_
 std::string Process::build_maps() const {
     std::string text;
     const auto flags_at = [&](std::uint64_t page) { return mem_.page_flags(static_cast<std::uint32_t>(page << 12)); };
-    const auto name_at = [&](std::uint32_t addr, std::uint64_t& offset) -> std::string {
+    struct MappingIdentity {
+        int special = 0;  // 0 = anon/file, 1 = [stack], 2 = [vectors]
+        const FileMapping* file = nullptr;
+        bool operator==(const MappingIdentity& other) const {
+            if (special != other.special) return false;
+            if (file == other.file) return true;
+            if (file == nullptr || other.file == nullptr) return false;
+            return file->path == other.file->path;
+        }
+    };
+    const auto identity_at = [&](std::uint32_t addr, std::uint64_t& offset) -> MappingIdentity {
         offset = 0;
-        if (addr >= kStackTop - kStackSize && addr < kStackTop) return "[stack]";
-        if (addr == kKuserPage) return "[vectors]";
+        if (addr >= kStackTop - kStackSize && addr < kStackTop) return {1, nullptr};
+        if (addr == kKuserPage) return {2, nullptr};
         for (const auto& m : file_mappings_) {
             if (addr >= m.start && addr - m.start < m.length) {
                 if (!m.offset_is_vaddr) offset = m.offset + (addr - m.start);
-                return m.path;
+                return {0, &m};
             }
         }
         return {};
@@ -121,11 +132,11 @@ std::string Process::build_maps() const {
         }
         const auto start = static_cast<std::uint32_t>(page << 12);
         std::uint64_t offset = 0;
-        const std::string name = name_at(start, offset);
+        const MappingIdentity id = identity_at(start, offset);
         std::uint64_t end_page = page + 1;
         while (end_page < page_count && flags_at(end_page) == flags) {
             std::uint64_t unused = 0;
-            if (name_at(static_cast<std::uint32_t>(end_page << 12), unused) != name) break;
+            if (!(identity_at(static_cast<std::uint32_t>(end_page << 12), unused) == id)) break;
             ++end_page;
         }
         char line[256];
@@ -134,7 +145,15 @@ std::string Process::build_maps() const {
                       (flags & kPageWrite) ? 'w' : '-', (flags & kPageExec) ? 'x' : '-',
                       static_cast<unsigned long long>(offset));
         text += line;
-        if (!name.empty()) {
+        const char* name = nullptr;
+        if (id.special == 1) {
+            name = "[stack]";
+        } else if (id.special == 2) {
+            name = "[vectors]";
+        } else if (id.file != nullptr && !id.file->path.empty()) {
+            name = id.file->path.c_str();
+        }
+        if (name != nullptr) {
             text += "                    ";
             text += name;
         }

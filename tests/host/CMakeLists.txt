@@ -4,6 +4,10 @@ set(ZB_HOST_TESTS
     configuration_test
     elf_fixups_test
     elf_symbols_test
+    exclusive_aba_test
+    fast_svc_test
+    gl_state_cache_test
+    guest_io_apk_cache_test
     guest_memory_test
     hang_watchdog_test
     host_looper_test
@@ -18,6 +22,7 @@ set(ZB_HOST_TESTS
     jni_shorty_test
     native_activity_test
     native_thunk_test
+    opensl_chain_test
     path_translation_test
     platform_compat_test
     proxy_runtime_test
@@ -43,11 +48,21 @@ target_sources(egl_marshal_test PRIVATE mock_egl.cpp)
 target_sources(gles_marshal_test PRIVATE mock_gles.cpp)
 target_sources(gles_pointer_test PRIVATE mock_gles.cpp)
 target_sources(gles_client_arrays_test PRIVATE mock_gles.cpp)
+target_sources(fast_svc_test PRIVATE mock_gles.cpp)
+target_link_libraries(fast_svc_test PRIVATE zbmockjvm)
+target_sources(gl_state_cache_test PRIVATE mock_gles.cpp mock_egl.cpp)
+target_link_libraries(gl_state_cache_test PRIVATE zbmockjvm)
+add_test(NAME gl_state_cache_test_guest COMMAND gl_state_cache_test
+    guest-cache
+    ${CMAKE_SOURCE_DIR}/sysroot
+    ${CMAKE_SOURCE_DIR}/build/guest/zbhost
+    ${CMAKE_SOURCE_DIR}/build/guest/lib)
 
 # Proves GuestJniEngine chains a GlBackend's HostGl alongside HostJni (Phase 5 Task 8). Each mode
 # is its own process: HostJni (like the LibraryRuntime it lives in) is one per process.
 add_executable(gl_chain_test gl_chain_test.cpp mock_gles.cpp)
 target_link_libraries(gl_chain_test PRIVATE zbcore zbmockjvm)
+target_include_directories(gl_chain_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src)
 foreach(gl_chain_mode no-backend with-backend)
     add_test(NAME gl_chain_test_${gl_chain_mode} COMMAND gl_chain_test ${gl_chain_mode})
 endforeach()

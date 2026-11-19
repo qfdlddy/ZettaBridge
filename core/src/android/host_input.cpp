@@ -33,6 +33,7 @@ std::size_t HostInput::remove_queue(std::uint32_t handle) {
     std::vector<std::uint32_t> orphans;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        attachments_.erase(handle);
         for (const auto& [event, owner] : live_events_) {
             if (owner == handle) orphans.push_back(event);
         }
@@ -125,14 +126,16 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
     auto& regs = thread.regs();
     switch (index) {
     case ZB_INPUT_HC_AInputQueue_hasEvents: {
-        void* queue = live_queue(regs[0]);
-        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_hasEvents", regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* queue = live_queue(bad);
+        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_hasEvents", bad); }
         regs[0] = static_cast<std::uint32_t>(backend_.queue_has_events(queue));
         return true;
     }
     case ZB_INPUT_HC_AInputQueue_getEvent: {
-        void* queue = live_queue(regs[0]);
-        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_getEvent", regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* queue = live_queue(bad);
+        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_getEvent", bad); }
         // The guest gets the event as a handle written through its own pointer, which must be
         // writable before the backend is asked for an event we would then have to drop.
         std::uint8_t* out = runtime_.memory().host_ptr(regs[1], 4, kPageRead | kPageWrite);
@@ -146,7 +149,7 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
         if (event != nullptr) {
             handle = events_.add(from_pointer(event));
             std::lock_guard<std::mutex> lock(mutex_);
-            live_events_[handle] = regs[0];
+            live_events_[handle] = bad;
             ++events_gotten_;
         }
         std::memcpy(out, &handle, sizeof handle);
@@ -155,9 +158,10 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
         return true;
     }
     case ZB_INPUT_HC_AInputQueue_preDispatchEvent: {
-        void* queue = live_queue(regs[0]);
+        const std::uint32_t bad = regs[0];
+        void* queue = live_queue(bad);
         const void* event = live_event(regs[1]);
-        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_preDispatchEvent", regs[0]); }
+        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_preDispatchEvent", bad); }
         if (event == nullptr) { regs[0] = 0; return reject("AInputQueue_preDispatchEvent event", regs[1]); }
         const std::int32_t handled = backend_.queue_pre_dispatch(queue, const_cast<void*>(event));
         // A pre-dispatched event belongs to the framework now (the soft keyboard path): the guest
@@ -204,11 +208,17 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
         return true;
     }
     case ZB_INPUT_HC_AInputQueue_attachLooper: {
-        void* queue = live_queue(regs[0]);
-        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_attachLooper", regs[0]); }
-        // regs[1] is the guest's looper, regs[3] and regs[4] its callback and data. A host
-        // AInputQueue has no descriptor we could poll, so this thread must first have a real
-        // Android looper; the queue then goes to it and the guest's own poll picks it up.
+        const std::uint32_t queue_handle = regs[0];
+        void* queue = live_queue(queue_handle);
+        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_attachLooper", queue_handle); }
+        // AAPCS32: r0=queue, r1=looper, r2=ident, r3=callback, [sp+0]=data (5th argument).
+        std::uint32_t guest_data = 0;
+        const std::uint8_t* stack_arg = runtime_.memory().host_ptr(regs[13], 4, kPageRead);
+        if (stack_arg == nullptr) {
+            regs[0] = 0;
+            return reject("AInputQueue_attachLooper stack", regs[13]);
+        }
+        std::memcpy(&guest_data, stack_arg, sizeof guest_data);
         std::uint64_t real_looper = 0;
         const bool ready = real_looper_ ? real_looper_(thread, regs[1], real_looper) : false;
         if (!ready) {
@@ -225,10 +235,10 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
         // The guest's data travels as an opaque value and comes back from the poll unchanged, so
         // the guest recognizes its own source. Nothing of the host crosses here.
         backend_.queue_attach_looper(queue, static_cast<std::int32_t>(regs[2]),
-                                     reinterpret_cast<void*>(static_cast<std::uintptr_t>(regs[4])), real_looper);
+                                     reinterpret_cast<void*>(static_cast<std::uintptr_t>(guest_data)), real_looper);
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            attachments_[regs[0]] = Attachment{real_looper, static_cast<std::int32_t>(regs[2]), regs[4]};
+            attachments_[queue_handle] = Attachment{real_looper, static_cast<std::int32_t>(regs[2]), guest_data};
         }
         char detail[160];
         std::snprintf(detail, sizeof detail, "ident %u looper 0x%08x owner-tid %d caller-tid %d%s",
@@ -239,8 +249,9 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
         return true;
     }
     case ZB_INPUT_HC_AInputQueue_detachLooper: {
-        void* queue = live_queue(regs[0]);
-        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_detachLooper", regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* queue = live_queue(bad);
+        if (queue == nullptr) { regs[0] = 0; return reject("AInputQueue_detachLooper", bad); }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             attachments_.erase(regs[0]);

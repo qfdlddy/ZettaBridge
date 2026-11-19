@@ -25,6 +25,19 @@ struct NativeCallCounter;  // core/include/zb/runtime_report.h
 // the LibraryRuntime it is process-lifetime and must outlive every guest thread.
 // The last JNI host calls this process served, newest last, for a crash report.
 std::string jni_recent_calls();
+// The Java method names of the last CallMethodA calls, newest last. The host-call index alone
+// cannot tell getObbDir from Bundle.getString, and a crash caused by one of them has to.
+std::string jni_recent_call_names();
+void jni_note_call_name(const std::string& name);
+// `name=value` pairs of the last string results returned to the guest by CallMethodA, newest
+// last. Bounded and truncated; used to see the actual strings a guest like Unity used to build a
+// path, which the call names alone cannot show.
+std::string jni_recent_string_results();
+void jni_note_string_result(const std::string& name, const std::string& value);
+// Name of one flat JNI host call (index 0xFB00+), or "?" when the table has no entry. The
+// watchdog and the slow-call report name a stuck call through this, so it must stay readable
+// without the generated tables at hand.
+const char* jni_host_call_name(std::uint32_t index);
 
 class HostJni {
 public:
@@ -46,6 +59,9 @@ public:
     // Serves JNI host calls (0xFB00-0xFCFF). Chain it into LibraryRuntime::set_host_call_handler
     // before start(); returns false for other indices.
     bool handle_host_call(std::uint32_t index, GuestThread& thread);
+    // Synchronous in-JIT fast path for pure-leaf JNI calls that never invoke Java code, trigger
+    // class initializers, block, or re-enter the guest via call_on_current.
+    bool handle_fast_host_call(std::uint32_t index, GuestThread& thread);
     // True once libzbjni.so has registered its API (while zbhost preloads it).
     bool ready() const;
     // The guest JavaVM*, valid when ready().
@@ -68,6 +84,13 @@ public:
     // local handle is long gone (ART ends the process for using one: "invalid JNI reference").
     // The caller owns the global reference behind it.
     std::uint32_t new_global_handle(JniBackend::Ref ref);
+    // Removes a guest global handle created by new_global_handle and returns its underlying host ref (or 0).
+    JniBackend::Ref remove_global_handle(std::uint32_t handle);
+    // Wraps JniBackend::new_global_ref / delete_global_ref for companion NDK units (e.g. HostNativeWindow).
+    JniBackend::Ref retain_global_ref(JniBackend::Env env, JniBackend::Ref ref);
+    void release_global_ref(JniBackend::Env env, JniBackend::Ref ref);
+    // Ensures the calling host thread has a guest JNIEnv* allocated and returns its guest address (or 0).
+    std::uint32_t ensure_guest_env_for_current(JniBackend::Env env);
 
     // Runs a guest function as native code called from Java on the calling host thread, whose
     // host JNIEnv is env. Uses the guest thread this host thread already runs, or else this host

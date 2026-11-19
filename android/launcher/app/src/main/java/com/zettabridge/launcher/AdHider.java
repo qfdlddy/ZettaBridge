@@ -35,7 +35,13 @@ final class AdHider {
     private AdHider() {}
 
     static void attach(Activity activity) {
-        final View root = activity.getWindow() != null ? activity.getWindow().getDecorView() : null;
+        // getDecorView() builds the window decor, and PhoneWindow can only do that while the
+        // activity still resolves framework resources. Called from prepareActivity the plugin's
+        // resources are already in place, so building it here throws "Window couldn't find content
+        // container view" before the plugin's onCreate runs. Defer to the decor view directly once
+        // it exists; the listener is attached from afterCreate() instead, after the plugin has
+        // created its content view.
+        final View root = decorOf(activity);
         if (root == null) return;
         root.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
             @Override
@@ -50,11 +56,17 @@ final class AdHider {
         });
     }
 
+    /** The window's decor view, but only if the window has already built it. */
+    static View decorOf(Activity activity) {
+        if (activity.getWindow() == null) return null;
+        return activity.getWindow().peekDecorView();
+    }
+
     private static void hide(View view, int depth) {
         if (depth > MAX_DEPTH) return;
         if (isAdView(view)) {
             if (view.getVisibility() != View.GONE) {
-                Log.i(TAG, "hiding ad view " + view.getClass().getName());
+                if (!BuildConfig.DISABLE_DIAGNOSTICS) Log.i(TAG, "hiding ad view " + view.getClass().getName());
                 view.setVisibility(View.GONE);
             }
             return;  // its children go with it

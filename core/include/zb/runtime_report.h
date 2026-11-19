@@ -40,11 +40,21 @@ public:
     // throttle the rest, so a hot loop of unimplemented GLES calls cannot stall the guest.
     using Observer = std::function<void(bool structural)>;
 
+    RuntimeReport() = default;
+    ~RuntimeReport();
+    RuntimeReport(const RuntimeReport&) = delete;
+    RuntimeReport& operator=(const RuntimeReport&) = delete;
+
     void set_observer(Observer observer);
 
     void note_plugin(const std::string& plugin_root, std::uint32_t target_sdk);
     // One host call that had no handler. The caller still writes r0 = 0 and continues.
     void note_unimplemented_host_call(std::uint32_t index, const char* library, const char* function);
+    // A host call that took at least a second to return, with the guest tid that made it. A stalled
+    // frame loop has two possible homes: a host call that never came back (this line names it) or a
+    // guest spin (no line at all). Only the first kMaxSlowHostCalls are described; the count is
+    // always exact.
+    void note_slow_host_call(const std::string& name, std::uint64_t guest_tid, std::uint64_t ms);
     void note_proxy_loaded(const std::string& library, std::int32_t jni_version);
     void note_proxy_failed(const std::string& library, const std::string& error);
     void note_jni_onload(const std::string& library, bool ok, std::int32_t jni_version);
@@ -68,13 +78,29 @@ public:
     void note_signal_restart(std::uint32_t nr, const char* name, std::uint64_t guest_tid,
                              bool sa_restart, bool rewound);
 
+    // Futex census (Unity load-queue hang hunt). A guest that stops before its first scene keeps
+    // every loader thread parked on one lock word, so what has to be proven is which word still
+    // has waiters and whether anybody ever woke it. These record, per futex word address, how
+    // many waits were entered and returned (and how many of those were timeouts, i.e. a deadline
+    // loop rather than a deadlock), how many wakes were issued and how many waiters they found.
+    // A wake that reports zero woken threads on an address that still has live waiters is the
+    // lost-wakeup signature. Bounded: kMaxFutexAddresses distinct words, the rest share one
+    // overflow entry so a busy process cannot grow the report. A word with no parked waiters
+    // gives its slot up to a new word, so the table always names the words that matter now.
+    static constexpr std::size_t kMaxFutexAddresses = 32;
+    void note_futex_wait(std::uint32_t guest_address, std::uint32_t expected, std::uint64_t guest_tid);
+    void note_futex_returned(std::uint32_t guest_address, std::int32_t result);
+    void note_futex_wake(std::uint32_t guest_address, std::int32_t woken);
+
     // Guest file opens worth knowing about (did the guest find its .so/.dat/.bin payloads and
     // flutter_assets): the most recent kMaxOpenedPaths distinct paths successfully opened that
-    // matched the syscall layer's narrow filter, most-recent last, and the first
-    // kMaxFailedOpens failed opens of such paths with their errno. Both are only called after a
-    // matching open, never on every syscall.
+    // matched the syscall layer's narrow filter, most-recent last, and the most recent
+    // kMaxFailedOpens failed opens of such paths with their errno plus the total failure count.
+    // Both are only called after a matching open, never on every syscall. Keeping the most recent
+    // failures rather than the first ones matters: the first few are always the link-time probes
+    // for libraries that do not exist, while the interesting failure comes much later.
     static constexpr std::size_t kMaxOpenedPaths = 16;
-    static constexpr std::size_t kMaxFailedOpens = 4;
+    static constexpr std::size_t kMaxFailedOpens = 16;
     void note_guest_open(const std::string& path);
     void note_guest_open_failed(const std::string& path, int error);
 
@@ -109,6 +135,29 @@ public:
     // first-note order, later notes of the same key overwriting the value. At most
     // kMaxWatchDetails keys; later new keys are dropped.
     void note_watch_detail(const std::string& key, const std::string& value);
+
+    // Audio (OpenSL ES) diagnostics: one "audio-<key>: <value>" line per key, in first-note
+    // order, later notes of the same key overwriting the value when `overwrite` is set. At most
+    // kMaxAudioDetails keys; later new keys are dropped. A silent device has no other way to
+    // show whether the guest ever created an output device or streamed a single buffer.
+    void note_audio_detail(const std::string& key, const std::string& value, bool overwrite);
+
+    // Guest engine log capture (Unity/il2cpp print their own failure text through liblog, which
+    // writes it to logd's socket; ROMs that hide third-party logcat make that text unreachable
+    // otherwise). The last kMaxGuestLog records are kept, most recent last, and the count of all
+    // captured records. Non-structural: the persisting observer's throttle applies.
+    static constexpr std::size_t kMaxGuestLog = 64;
+    void note_guest_log_line(const std::string& line);
+    void note_guest_log_captured();  // one record captured, before its line is formatted
+
+    // I/O progress diagnostics ("is the engine loading or stuck?"): one "io-<key>: <value>" line
+    // per key, in first-note order, later notes of the same key overwriting the value. At most
+    // kMaxIoDetails keys; later new keys are dropped.
+    void note_io_detail(const std::string& key, const std::string& value);
+
+    // Totals read by the hang watchdog's heartbeat.
+    std::uint64_t guest_log_count() const;
+    std::uint64_t egl_swaps() const;
 
     // EGL section (Phase 7a Task 7): proves or disproves that the guest built an EGL context and
     // surface and is presenting frames on the thread GL calls arrive on.
@@ -159,11 +208,23 @@ private:
         std::string error;
     };
 
-    // Copies the observer under the lock; the caller runs it after unlocking.
-    std::shared_ptr<Observer> take_observer() const;
+    using PersistObserver = std::function<void(bool structural, bool urgent)>;
+
+    struct Observers {
+        std::shared_ptr<Observer> observer;
+        std::shared_ptr<PersistObserver> persist;
+    };
+
+    // Copies observers under the lock; the caller invokes them after unlocking.
+    Observers take_observers() const;
+    static void notify_observers(const Observers& observers, bool structural, bool urgent);
+
+    friend bool write_runtime_report_to(RuntimeReport& report, const std::string& path,
+                                        std::chrono::milliseconds min_interval);
 
     mutable std::mutex mutex_;
     std::shared_ptr<Observer> observer_;
+    std::shared_ptr<PersistObserver> persist_observer_;
     std::string plugin_root_;
     std::uint32_t target_sdk_ = 0;
     std::vector<HostCall> host_calls_;
@@ -185,6 +246,34 @@ private:
     std::string signal_last_eintr_;
     std::string signal_last_delivery_;
 
+    struct FutexWord {
+        std::uint32_t address = 0;
+        std::uint64_t entered = 0;
+        std::uint64_t returned = 0;
+        std::uint64_t timeouts = 0;
+        std::uint64_t wakes = 0;
+        std::uint64_t woken = 0;
+        std::uint64_t empty_wakes = 0;
+        std::uint64_t live = 0;
+        std::uint32_t last_expected = 0;
+        std::uint64_t last_tid = 0;
+    };
+    // Returns the entry for `address`, creating it while the table has room; nullptr means the
+    // table is full and the caller must use futex_overflow_.
+    FutexWord* futex_word_locked(std::uint32_t address);
+    // Dedicated mutex so high-frequency sys_futex telemetry never contends with ReportWriter
+    // serialization or AudioTrack/GL/JNI updates on mutex_.
+    mutable std::mutex futex_mutex_;
+    std::vector<FutexWord> futex_words_;
+    FutexWord futex_overflow_;
+    std::uint64_t futex_entered_total_ = 0;
+    std::uint64_t futex_returned_total_ = 0;
+    std::uint64_t futex_timeout_total_ = 0;
+    std::uint64_t futex_live_total_ = 0;
+    std::uint64_t futex_wake_total_ = 0;
+    std::uint64_t futex_woken_total_ = 0;
+    std::uint64_t futex_empty_wake_total_ = 0;
+
     struct NativeCallEntry {
         std::string name;
         std::unique_ptr<NativeCallCounter> counter{std::make_unique<NativeCallCounter>()};
@@ -194,8 +283,9 @@ private:
 
     std::vector<std::string> opened_paths_;
     std::vector<std::pair<std::string, int>> failed_opens_;
+    std::uint64_t failed_open_count_ = 0;
 
-    std::uint64_t gl_call_total_ = 0;
+    std::atomic<std::uint64_t> gl_call_total_{0};
     std::string gl_first_call_function_;
     std::uint64_t gl_first_call_tid_ = 0;
     bool gl_egl_context_known_ = false;
@@ -208,14 +298,26 @@ private:
     static constexpr std::size_t kMaxGlDetails = 400;
     std::vector<std::pair<std::string, std::string>> gl_details_;
 
+    static constexpr std::size_t kMaxSlowHostCalls = 8;
+    std::vector<std::string> slow_host_calls_;
+    std::uint64_t slow_host_call_total_ = 0;
+
     static constexpr std::size_t kMaxCrashDetails = 32;
     std::vector<std::pair<std::string, std::string>> crash_details_;
-    static constexpr std::size_t kMaxJniDetails = 16;
+    static constexpr std::size_t kMaxJniDetails = 64;
     std::vector<std::pair<std::string, std::string>> jni_details_;
-    static constexpr std::size_t kMaxWatchDetails = 8;
+    static constexpr std::size_t kMaxWatchDetails = 64;
     std::vector<std::pair<std::string, std::string>> watch_details_;
+    std::vector<std::string> guest_log_;
+    std::uint64_t guest_log_total_ = 0;
+    static constexpr std::size_t kMaxIoDetails = 48;
+    std::vector<std::pair<std::string, std::string>> io_details_;
     static constexpr std::size_t kMaxLooperDetails = 16;
     std::vector<std::pair<std::string, std::string>> looper_details_;
+    // OpenSL keeps state lines, a call census and a ring of the most recent control calls, so a
+    // route change (Bluetooth, unplug) stays visible after the fact.
+    static constexpr std::size_t kMaxAudioDetails = 32;
+    std::vector<std::pair<std::string, std::string>> audio_details_;
 
     std::vector<std::pair<std::string, std::string>> egl_objects_;
     // Host tids that have made an EGL context current (note_egl_current), and host tids a gl*
@@ -243,5 +345,10 @@ RuntimeReport& runtime_report();
 // the first write fails.
 bool write_runtime_report_to(RuntimeReport& report, const std::string& path,
                              std::chrono::milliseconds min_interval = std::chrono::milliseconds(1000));
+
+// The path write_runtime_report_to() was given for this process, empty when no file is written.
+// Diagnostics only: a guest probe list is read from a file beside it, so probes can be changed on
+// a device without rebuilding the launcher.
+std::string runtime_report_path();
 
 }  // namespace zb

@@ -32,12 +32,23 @@ std::vector<std::uint64_t> LocalHandles::pop_frame() {
         serials_[i] = static_cast<std::uint8_t>((serials_[i] + 1) & 63u);
     }
     refs_.resize(start);
+    std::erase_if(free_, [&](std::uint32_t idx) { return idx >= start; });
     return released;
 }
 
 std::uint32_t LocalHandles::add(std::uint64_t host_ref) {
     if (host_ref == 0) return 0;
     if (frame_starts_.empty()) push_frame();
+    const std::size_t floor = frame_starts_.back();
+    while (!free_.empty()) {
+        const std::uint32_t idx = free_.back();
+        if (idx < floor) break;  // belongs to an outer frame; do not reuse in inner frame
+        free_.pop_back();
+        if (idx < refs_.size() && refs_[idx] == 0) {
+            refs_[idx] = host_ref;
+            return make_handle(HandleKind::Local, idx, serials_[idx]);
+        }
+    }
     const std::size_t index = refs_.size();
     if (index >= kMaxSlots) {
         log("too many JNI local references");
@@ -72,6 +83,9 @@ std::optional<std::uint64_t> LocalHandles::remove(std::uint32_t handle) {
     serials_[index] = static_cast<std::uint8_t>((serials_[index] + 1) & 63u);
     const std::size_t floor = frame_starts_.empty() ? 0 : frame_starts_.back();
     while (refs_.size() > floor && refs_.back() == 0) refs_.pop_back();
+    if (index < refs_.size() && index >= floor) {
+        free_.push_back(index);
+    }
     return ref;
 }
 

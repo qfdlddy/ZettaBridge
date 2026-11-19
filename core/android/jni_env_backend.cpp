@@ -108,6 +108,9 @@ const JniEnvBackend::Reflection* JniEnvBackend::reflection(JNIEnv* env) {
             for (jobject global : globals) env->DeleteGlobalRef(global);
             return;
         }
+        r.class_for_name = env->GetStaticMethodID(
+            r.class_class, "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+        if (r.class_for_name == nullptr) env->ExceptionClear();
         // Optional group: the long-form export path. java.lang.invoke.MethodType is API 26, which
         // the launcher requires, but a missing piece here only disables the fast path; it must not
         // disable reflection for the process. Every failure is cleared before the next lookup.
@@ -411,15 +414,33 @@ JniBackend::Ref JniEnvBackend::find_class(Env env, const char* name) {
     JNIEnv* e = E(env);
     if (e == nullptr || name == nullptr) return 0;
     const jobject loader = class_loader();
+    if (loader == nullptr) return R(e->FindClass(name));
     const std::optional<std::string> binary_name = jni_binary_class_name(name);
-    if (loader == nullptr || !binary_name) return R(e->FindClass(name));
-    const Reflection* r = reflection(e);
-    if (r == nullptr) return 0;
-    jstring java_name = e->NewStringUTF(binary_name->c_str());
-    if (java_name == nullptr) return 0;
-    jobject found = e->CallObjectMethod(loader, r->class_loader_load_class, java_name);
-    e->DeleteLocalRef(java_name);
-    return R(found);
+    if (binary_name) {
+        const Reflection* r = reflection(e);
+        if (r == nullptr) return 0;
+        jstring java_name = e->NewStringUTF(binary_name->c_str());
+        if (java_name == nullptr) return 0;
+        jobject found = e->CallObjectMethod(loader, r->class_loader_load_class, java_name);
+        e->DeleteLocalRef(java_name);
+        return R(found);
+    }
+    if (name[0] == '[') {
+        const Reflection* r = reflection(e);
+        if (r != nullptr && r->class_for_name != nullptr) {
+            std::string dot_name(name);
+            for (char& ch : dot_name) {
+                if (ch == '/') ch = '.';
+            }
+            jstring java_name = e->NewStringUTF(dot_name.c_str());
+            if (java_name == nullptr) return 0;
+            jobject found =
+                e->CallStaticObjectMethod(r->class_class, r->class_for_name, java_name, JNI_FALSE, loader);
+            e->DeleteLocalRef(java_name);
+            return R(found);
+        }
+    }
+    return R(e->FindClass(name));
 }
 
 JniBackend::Ref JniEnvBackend::get_superclass(Env env, Ref cls) {
@@ -428,6 +449,133 @@ JniBackend::Ref JniEnvBackend::get_superclass(Env env, Ref cls) {
 
 bool JniEnvBackend::is_assignable_from(Env env, Ref from, Ref to) {
     return E(env)->IsAssignableFrom(C(from), C(to)) == JNI_TRUE;
+}
+
+bool JniEnvBackend::object_class_name(Env env, Ref obj, std::string& out) {
+    JNIEnv* e = E(env);
+    if (e == nullptr || obj == 0) return false;
+    const Reflection* r = reflection(e);  // nullptr with an exception pending
+    if (r == nullptr) return false;
+    jobject cls = e->GetObjectClass(O(obj));
+    if (cls == nullptr) return false;
+    auto name = static_cast<jstring>(e->CallObjectMethod(cls, r->class_get_name));
+    e->DeleteLocalRef(cls);
+    if (e->ExceptionCheck() || name == nullptr) {
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        return false;
+    }
+    const char* chars = e->GetStringUTFChars(name, nullptr);
+    const bool ok = chars != nullptr;
+    if (ok) {
+        out.assign(chars);
+        e->ReleaseStringUTFChars(name, chars);
+    } else if (e->ExceptionCheck()) {
+        e->ExceptionClear();
+    }
+    e->DeleteLocalRef(name);
+    return ok;
+}
+
+const JniEnvBackend::AudioIds* JniEnvBackend::audio_ids(JNIEnv* e) {
+    if (e == nullptr || e->ExceptionCheck()) return nullptr;
+    std::call_once(audio_once_, [this, e] {
+        jclass am_local = e->FindClass("android/media/AudioManager");
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            am_local = nullptr;
+        }
+        jclass di_local = e->FindClass("android/media/AudioDeviceInfo");
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            di_local = nullptr;
+        }
+        jmethodID get_type = di_local != nullptr ? e->GetMethodID(di_local, "getType", "()I") : nullptr;
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            get_type = nullptr;
+        }
+        if (am_local != nullptr) {
+            audio_ids_.audio_manager_class = static_cast<jclass>(e->NewGlobalRef(am_local));
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            e->DeleteLocalRef(am_local);
+        }
+        if (di_local != nullptr && get_type != nullptr) {
+            audio_ids_.device_info_class = static_cast<jclass>(e->NewGlobalRef(di_local));
+            if (e->ExceptionCheck()) e->ExceptionClear();
+            audio_ids_.device_get_type = get_type;
+        }
+        if (di_local != nullptr) e->DeleteLocalRef(di_local);
+        audio_ok_ = (audio_ids_.audio_manager_class != nullptr);
+    });
+    return audio_ok_ ? &audio_ids_ : nullptr;
+}
+
+bool JniEnvBackend::is_audio_manager_class(Env env, Ref cls) {
+    if (cls == 0) return false;
+    JNIEnv* e = E(env);
+    const AudioIds* ids = audio_ids(e);
+    if (ids == nullptr || ids->audio_manager_class == nullptr) return false;
+    return e->IsAssignableFrom(C(cls), ids->audio_manager_class) == JNI_TRUE;
+}
+
+JniBackend::Ref JniEnvBackend::filter_bluetooth_audio_devices(Env env, Ref devices) {
+    if (devices == 0) return 0;
+    JNIEnv* e = E(env);
+    if (e->ExceptionCheck()) return devices;
+    const AudioIds* ids = audio_ids(e);
+    if (ids == nullptr || ids->device_info_class == nullptr || ids->device_get_type == nullptr) {
+        return devices;
+    }
+    auto array = static_cast<jobjectArray>(O(devices));
+    const jsize length = e->GetArrayLength(array);
+    if (length <= 0) return devices;
+
+    auto is_bluetooth_type = [](jint type) {
+        // AudioDeviceInfo: SCO=7, A2DP=8, BLE_HEADSET=26, BLE_SPEAKER=27, BLE_BROADCAST=30.
+        return type == 7 || type == 8 || type == 26 || type == 27 || type == 30;
+    };
+
+    std::vector<jobject> kept;
+    kept.reserve(static_cast<std::size_t>(length));
+    for (jsize i = 0; i < length; ++i) {
+        jobject item = e->GetObjectArrayElement(array, i);
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            for (jobject obj : kept) e->DeleteLocalRef(obj);
+            return devices;
+        }
+        if (item == nullptr) continue;
+        const jint type = e->CallIntMethod(item, ids->device_get_type);
+        if (e->ExceptionCheck()) {
+            e->ExceptionClear();
+            e->DeleteLocalRef(item);
+            for (jobject obj : kept) e->DeleteLocalRef(obj);
+            return devices;
+        }
+        if (is_bluetooth_type(type)) {
+            e->DeleteLocalRef(item);
+        } else {
+            kept.push_back(item);
+        }
+    }
+
+    if (kept.size() == static_cast<std::size_t>(length)) {
+        for (jobject obj : kept) e->DeleteLocalRef(obj);
+        return devices;
+    }
+
+    jobjectArray filtered = e->NewObjectArray(static_cast<jsize>(kept.size()), ids->device_info_class, nullptr);
+    if (filtered == nullptr || e->ExceptionCheck()) {
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        for (jobject obj : kept) e->DeleteLocalRef(obj);
+        return devices;
+    }
+    for (jsize i = 0; i < static_cast<jsize>(kept.size()); ++i) {
+        e->SetObjectArrayElement(filtered, i, kept[static_cast<std::size_t>(i)]);
+        e->DeleteLocalRef(kept[static_cast<std::size_t>(i)]);
+    }
+    e->DeleteLocalRef(array);
+    return R(filtered);
 }
 
 JniBackend::Id JniEnvBackend::get_method_id(Env env, Ref cls, const char* name, const char* signature,
@@ -447,8 +595,9 @@ JniBackend::Id JniEnvBackend::get_field_id(Env env, Ref cls, const char* name, c
 JniBackend::Id JniEnvBackend::from_reflected_method(Env env, Ref method, std::string& signature) {
     JNIEnv* e = E(env);
     const Reflection* r = reflection(e);
+    if (r == nullptr || method == 0) return 0;
     const jmethodID id = e->FromReflectedMethod(O(method));
-    if (id == nullptr || r == nullptr) return 0;
+    if (id == nullptr) return 0;
     const auto letter_descriptor = [](char letter) {
         return letter == 'L' ? std::string("Ljava/lang/Object;") : std::string(1, letter);
     };
@@ -620,9 +769,18 @@ void JniEnvBackend::get_string_region(Env env, Ref str, std::int32_t start, std:
 bool JniEnvBackend::get_string_utf_region(Env env, Ref str, std::int32_t start, std::int32_t length,
                                           std::string& out) {
     JNIEnv* e = E(env);
+    auto jstr = static_cast<jstring>(O(str));
+    if (jstr != nullptr && !e->ExceptionCheck()) {
+        const jsize str_len = e->GetStringLength(jstr);
+        if (start < 0 || length < 0 || start > str_len || length > str_len - start) {
+            char small_buf[1] = {'\0'};
+            e->GetStringUTFRegion(jstr, start, length, small_buf);
+            return false;
+        }
+    }
     // Modified UTF-8 needs at most 3 bytes per UTF-16 unit and never contains a zero byte.
     std::vector<char> buffer(length > 0 ? 3 * static_cast<std::size_t>(length) + 1 : 1, '\0');
-    e->GetStringUTFRegion(static_cast<jstring>(O(str)), start, length, buffer.data());
+    e->GetStringUTFRegion(jstr, start, length, buffer.data());
     if (e->ExceptionCheck()) return false;
     out.assign(buffer.data());
     return true;

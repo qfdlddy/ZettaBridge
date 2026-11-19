@@ -9,9 +9,11 @@ import android.content.pm.ShortcutInfo;
 import android.content.pm.ShortcutManager;
 import android.graphics.Bitmap;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Bundle;
+import android.text.InputType;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -19,6 +21,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
@@ -36,14 +39,27 @@ import java.util.List;
 public class LibraryActivity extends Activity {
     private static final String TAG = "zb-launcher";
     private static final int REQUEST_IMPORT = 1;
+    private static final int REQUEST_EXPORT = 2;
+
+    private static final String STATE_EXPORT_RECORD = "zb.export.record";
+    private static final String STATE_EXPORT_PACKAGE = "zb.export.package";
+    private static final String STATE_EXPORT_LABEL = "zb.export.label";
 
     private final List<PluginRecord> plugins = new ArrayList<>();
     private BaseAdapter adapter;
     private TextView emptyView;
+    private String pendingExportRecordPackage;
+    private String pendingExportPackage;
+    private String pendingExportLabel;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (state != null) {
+            pendingExportRecordPackage = state.getString(STATE_EXPORT_RECORD);
+            pendingExportPackage = state.getString(STATE_EXPORT_PACKAGE);
+            pendingExportLabel = state.getString(STATE_EXPORT_LABEL);
+        }
         int pad = dp(16);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -80,7 +96,7 @@ public class LibraryActivity extends Activity {
 
             @Override
             public View getView(int position, View convertView, ViewGroup parent) {
-                return row(plugins.get(position));
+                return row(convertView, plugins.get(position));
             }
         };
         list.setAdapter(adapter);
@@ -91,6 +107,23 @@ public class LibraryActivity extends Activity {
         });
         root.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
+        // Pre-install the guest runtime bundle in the background so cold-launching a game after an
+        // app update does not stall the :guest main thread.
+        new Thread(() -> {
+            try {
+                RuntimeBundle.install(getApplicationContext());
+            } catch (IOException ignored) {
+                // GuestRuntime will surface any installation error when launching.
+            }
+        }, "zb-bundle-warmup").start();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (pendingExportRecordPackage != null) outState.putString(STATE_EXPORT_RECORD, pendingExportRecordPackage);
+        if (pendingExportPackage != null) outState.putString(STATE_EXPORT_PACKAGE, pendingExportPackage);
+        if (pendingExportLabel != null) outState.putString(STATE_EXPORT_LABEL, pendingExportLabel);
     }
 
     @Override
@@ -133,34 +166,56 @@ public class LibraryActivity extends Activity {
         }
     }
 
-    private View row(PluginRecord r) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(8), 0, dp(8));
+    private static final class RowHolder {
+        final ImageView icon;
+        final TextView title;
+        final TextView details;
 
-        ImageView icon = new ImageView(this);
+        RowHolder(ImageView icon, TextView title, TextView details) {
+            this.icon = icon;
+            this.title = title;
+            this.details = details;
+        }
+    }
+
+    private View row(View convertView, PluginRecord r) {
+        View rowView = convertView;
+        RowHolder holder;
+        if (rowView != null && rowView.getTag() instanceof RowHolder) {
+            holder = (RowHolder) rowView.getTag();
+        } else {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dp(8), 0, dp(8));
+
+            ImageView icon = new ImageView(this);
+            row.addView(icon, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+            LinearLayout texts = new LinearLayout(this);
+            texts.setOrientation(LinearLayout.VERTICAL);
+            texts.setPadding(dp(12), 0, 0, 0);
+            TextView title = new TextView(this);
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            TextView details = new TextView(this);
+            texts.addView(title);
+            texts.addView(details);
+            row.addView(texts);
+            holder = new RowHolder(icon, title, details);
+            row.setTag(holder);
+            rowView = row;
+        }
+
         Bitmap bmp = r.icon();
         if (bmp != null) {
-            icon.setImageBitmap(bmp);
+            holder.icon.setImageBitmap(bmp);
         } else {
-            icon.setImageResource(android.R.drawable.sym_def_app_icon);
+            holder.icon.setImageResource(android.R.drawable.sym_def_app_icon);
         }
-        row.addView(icon, new LinearLayout.LayoutParams(dp(48), dp(48)));
-
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        texts.setPadding(dp(12), 0, 0, 0);
-        TextView title = new TextView(this);
-        title.setText(r.label);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        TextView details = new TextView(this);
-        details.setText(r.packageName + (r.versionName != null ? " " + r.versionName : "") + "\n" + r.status());
-        texts.addView(title);
-        texts.addView(details);
-        row.addView(texts);
-        return row;
+        holder.title.setText(r.label);
+        holder.details.setText(r.packageName + (r.versionName != null ? " " + r.versionName : "") + "\n" + r.status());
+        return rowView;
     }
 
     private void pickApk() {
@@ -177,29 +232,58 @@ public class LibraryActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_IMPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
             importApk(data.getData());
+        } else if (requestCode == REQUEST_EXPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            startExport(data.getData());
         }
     }
 
     private void importApk(Uri uri) {
         // A running plugin keeps the old APK mapped: stop the guest process first.
         stopGuestProcess();
+        final android.content.Context app = getApplicationContext();
         AlertDialog progress = new AlertDialog.Builder(this).setMessage("Importing...").setCancelable(false).show();
         new Thread(() -> {
-            String message;
+            String success = null;
+            String error = null;
             try {
-                PluginRecord r = PluginStore.importApk(this, uri);
-                message = "Imported " + r.label + " (" + r.status() + ")";
+                PluginRecord r = PluginStore.importApk(app, uri);
+                success = "Imported " + r.label + " (" + r.status() + ")";
             } catch (Exception e) {
                 Log.e(TAG, "import failed", e);
-                message = "Import failed: " + e.getMessage();
+                Diagnostics.report(app, "import failed", e, false);
+                error = String.valueOf(e.getMessage());
             }
-            String shown = message;
+            String okMessage = success;
+            String errMessage = error;
             runOnUiThread(() -> {
-                progress.dismiss();
-                Toast.makeText(this, shown, Toast.LENGTH_LONG).show();
+                if (progress.isShowing()) progress.dismiss();
+                if (isFinishing() || isDestroyed()) return;
+                if (errMessage == null) {
+                    Toast.makeText(this, okMessage, Toast.LENGTH_LONG).show();
+                } else {
+                    showImportError(errMessage);
+                }
                 refresh();
             });
         }, "zb-import").start();
+    }
+
+    private void showImportError(String error) {
+        TextView view = new TextView(this);
+        view.setText(error);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        view.setTypeface(Typeface.MONOSPACE);
+        view.setTextIsSelectable(true);
+        int pad = dp(16);
+        view.setPadding(pad, pad, pad, pad);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(view);
+        new AlertDialog.Builder(this)
+                .setTitle("Import failed")
+                .setView(scroll)
+                .setPositiveButton("Copy", (d, w) -> Diagnostics.copy(this, "ZettaBridge import error", error))
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     private void launch(PluginRecord r) {
@@ -217,6 +301,9 @@ public class LibraryActivity extends Activity {
                                         r.hideAds ? "Show ads" : "Hide ads",
                                         r.preciseFaults ? "Precise faults: on" : "Precise faults (slow)",
                                         r.diagnostics ? "GL diagnostics: on" : "GL diagnostics (slow)",
+                                        r.unsafeFp ? "Fast FP: on" : "Fast FP (off)",
+                                        r.unityMt ? "Unity MT: on" : "Unity MT (off)",
+                                        "Export APK",
                                         "Delete"},
                         (dialog, which) -> {
                             if (which == 0) launch(r);
@@ -225,7 +312,10 @@ public class LibraryActivity extends Activity {
                             if (which == 3) toggleAds(r);
                             if (which == 4) togglePreciseFaults(r);
                             if (which == 5) toggleDiagnostics(r);
-                            if (which == 6) confirmDelete(r);
+                            if (which == 6) toggleUnsafeFp(r);
+                            if (which == 7) toggleUnityMt(r);
+                            if (which == 8) promptExport(r);
+                            if (which == 9) confirmDelete(r);
                         })
                 .show();
     }
@@ -275,24 +365,146 @@ public class LibraryActivity extends Activity {
         Toast.makeText(this, "Restart the game to apply.", Toast.LENGTH_LONG).show();
     }
 
-    /**
-     * What the last :guest run recorded, without a shell: OxygenOS drops third-party logcat
-     * output, so this file is the only evidence a device run leaves behind. The text also goes to
-     * the clipboard, ready to be sent back.
-     */
-    private void showRuntimeReport(PluginRecord r) {
-        String report = Diagnostics.readRuntimeReport(this);
-        if (report == null) {
-            Toast.makeText(this, "No run report yet. Launch " + r.label + " once, then look again.",
+    /** Toggles ZB_UNSAFE_FP for this plugin; takes effect on the next launch. */
+    private void toggleUnsafeFp(PluginRecord r) {
+        r.unsafeFp = !r.unsafeFp;
+        try {
+            r.save();
+        } catch (IOException e) {
+            Diagnostics.report(this, "cannot save the fast-FP setting of " + r.label, e, false);
+            return;
+        }
+        Toast.makeText(this, "Restart the game to apply.", Toast.LENGTH_LONG).show();
+    }
+
+    /** Toggles experimental Unity multi-threaded rendering; takes effect on the next launch. */
+    private void toggleUnityMt(PluginRecord r) {
+        r.unityMt = !r.unityMt;
+        try {
+            r.save();
+        } catch (IOException e) {
+            Diagnostics.report(this, "cannot save the Unity MT setting of " + r.label, e, false);
+            return;
+        }
+        Toast.makeText(this, "Restart the game to apply.", Toast.LENGTH_LONG).show();
+    }
+
+    private void promptExport(PluginRecord r) {
+        if (!r.isLaunchable() || !r.isTranslated()) {
+            Toast.makeText(this, "Only ready 32-bit translated apps can be exported as standalone APKs.",
                     Toast.LENGTH_LONG).show();
             return;
         }
-        File file = Diagnostics.runtimeReportFile(this);
-        String text = report + (file != null ? "\nfile: " + file.getAbsolutePath() + "\n" : "");
-        boolean copied = Diagnostics.copy(this, "ZettaBridge run report", text);
+        int pad = dp(16);
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(pad, dp(8), pad, 0);
 
+        TextView labelTitle = new TextView(this);
+        labelTitle.setText("App Name (桌面名稱)");
+        layout.addView(labelTitle);
+
+        EditText labelInput = new EditText(this);
+        labelInput.setText(r.label);
+        labelInput.setSingleLine(true);
+        layout.addView(labelInput);
+
+        TextView pkgTitle = new TextView(this);
+        pkgTitle.setText("Package Name (包名)");
+        pkgTitle.setPadding(0, dp(10), 0, 0);
+        layout.addView(pkgTitle);
+
+        EditText pkgInput = new EditText(this);
+        pkgInput.setText(r.packageName);
+        pkgInput.setSingleLine(true);
+        pkgInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        layout.addView(pkgInput);
+
+        TextView note = new TextView(this);
+        note.setText("Icon and version are copied from " + r.label + ".");
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        note.setPadding(0, dp(10), 0, 0);
+        layout.addView(note);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Export Standalone APK")
+                .setView(layout)
+                .setPositiveButton("Export", (dialog, which) -> {
+                    String outLabel = labelInput.getText().toString().trim();
+                    String outPkg = pkgInput.getText().toString().trim();
+                    if (outLabel.isEmpty()) {
+                        Toast.makeText(this, "App name cannot be empty", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    if (!PluginStore.isValidPackageName(outPkg)) {
+                        Toast.makeText(this, "Invalid package name: " + outPkg, Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    pendingExportRecordPackage = r.packageName;
+                    pendingExportLabel = outLabel;
+                    pendingExportPackage = outPkg;
+                    String safeFile = outLabel.replaceAll("[\\\\/:*?\"<>|]", "_") + ".apk";
+                    Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                            .addCategory(Intent.CATEGORY_OPENABLE)
+                            .setType("application/vnd.android.package-archive")
+                            .putExtra(Intent.EXTRA_TITLE, safeFile);
+                    startActivityForResult(intent, REQUEST_EXPORT);
+                })
+                .setNegativeButton("Cancel", null);
+        Bitmap bmp = r.icon();
+        if (bmp != null) {
+            builder.setIcon(new BitmapDrawable(getResources(), bmp));
+        }
+        builder.show();
+    }
+
+    private void startExport(Uri destinationUri) {
+        String recordPkg = pendingExportRecordPackage;
+        String exportPkg = pendingExportPackage;
+        String exportLabel = pendingExportLabel;
+        pendingExportRecordPackage = null;
+        pendingExportPackage = null;
+        pendingExportLabel = null;
+        PluginRecord r = recordPkg != null ? PluginStore.find(this, recordPkg) : null;
+        if (r == null || exportPkg == null || exportLabel == null) return;
+
+        final android.content.Context app = getApplicationContext();
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Exporting " + exportLabel)
+                .setMessage("Preparing...")
+                .setCancelable(false)
+                .show();
+
+        new Thread(() -> {
+            String error = null;
+            try {
+                ApkExporter.export(app, r, exportPkg, exportLabel, destinationUri,
+                        stage -> runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed() && progress.isShowing()) {
+                                progress.setMessage(stage);
+                            }
+                        }));
+            } catch (Throwable t) {
+                Log.e(TAG, "export failed", t);
+                Diagnostics.report(app, "export failed", t, false);
+                error = t.getClass().getSimpleName() + ": " + t.getMessage();
+            }
+            String errMsg = error;
+            runOnUiThread(() -> {
+                if (progress.isShowing()) progress.dismiss();
+                if (isFinishing() || isDestroyed()) return;
+                if (errMsg == null) {
+                    Toast.makeText(this, "Exported " + exportLabel + " APK", Toast.LENGTH_LONG).show();
+                } else {
+                    showExportError(errMsg);
+                }
+            });
+        }, "zb-export").start();
+    }
+
+    private void showExportError(String error) {
         TextView view = new TextView(this);
-        view.setText(text);
+        view.setText(error);
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         view.setTypeface(Typeface.MONOSPACE);
         view.setTextIsSelectable(true);
@@ -301,10 +513,60 @@ public class LibraryActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(view);
         new AlertDialog.Builder(this)
-                .setTitle(copied ? "Last run report (copied)" : "Last run report")
+                .setTitle("Export failed")
                 .setView(scroll)
-                .setPositiveButton("Close", null)
+                .setPositiveButton("Copy", (d, w) -> Diagnostics.copy(this, "ZettaBridge export error", error))
+                .setNegativeButton("Close", null)
                 .show();
+    }
+
+    /**
+     * What the last :guest run recorded, without a shell: OxygenOS drops third-party logcat
+     * output, so this file is the only evidence a device run leaves behind. The text also goes to
+     * the clipboard, ready to be sent back.
+     */
+    private void showRuntimeReport(PluginRecord r) {
+        final android.content.Context app = getApplicationContext();
+        new Thread(() -> {
+            String report = Diagnostics.readRuntimeReport(app);
+            String errors = Diagnostics.readErrors(app);
+            File reportFile = report != null ? Diagnostics.runtimeReportFile(app) : null;
+            String errorFileName = errors != null ? Diagnostics.errorFile(app).getName() : null;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (report == null && errors == null) {
+                    Toast.makeText(this, "No run report yet. Launch " + r.label + " once, then look again.",
+                            Toast.LENGTH_LONG).show();
+                    return;
+                }
+                StringBuilder sb = new StringBuilder();
+                if (report != null) {
+                    sb.append(report);
+                    if (reportFile != null) sb.append("\nfile: ").append(reportFile.getAbsolutePath()).append('\n');
+                }
+                if (errors != null) {
+                    if (sb.length() > 0) sb.append('\n');
+                    sb.append("=== ").append(errorFileName).append(" ===\n").append(errors);
+                }
+                String text = sb.toString();
+                boolean copied = Diagnostics.copy(this, "ZettaBridge run report", text);
+
+                TextView view = new TextView(this);
+                view.setText(text);
+                view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                view.setTypeface(Typeface.MONOSPACE);
+                view.setTextIsSelectable(true);
+                int pad = dp(16);
+                view.setPadding(pad, pad, pad, pad);
+                ScrollView scroll = new ScrollView(this);
+                scroll.addView(view);
+                new AlertDialog.Builder(this)
+                        .setTitle(copied ? "Last run report (copied)" : "Last run report")
+                        .setView(scroll)
+                        .setPositiveButton("Close", null)
+                        .show();
+            });
+        }, "zb-read-report").start();
     }
 
     private static String shortcutId(PluginRecord r) {
@@ -342,8 +604,12 @@ public class LibraryActivity extends Activity {
                             Log.w(TAG, "cannot disable shortcut: " + e);
                         }
                     }
-                    PluginStore.delete(r);
-                    refresh();
+                    new Thread(() -> {
+                        PluginStore.delete(r);
+                        runOnUiThread(() -> {
+                            if (!isFinishing() && !isDestroyed()) refresh();
+                        });
+                    }, "zb-delete").start();
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
@@ -351,11 +617,7 @@ public class LibraryActivity extends Activity {
 
     /** Kills our own :guest process, if running (allowed for processes of the same uid). */
     private void stopGuestProcess() {
-        ActivityManager am = getSystemService(ActivityManager.class);
-        if (am == null || am.getRunningAppProcesses() == null) return;
-        for (ActivityManager.RunningAppProcessInfo proc : am.getRunningAppProcesses()) {
-            if (proc.processName.endsWith(ZbApplication.GUEST_SUFFIX)) android.os.Process.killProcess(proc.pid);
-        }
+        ActivePlugin.endGuestProcess(this);
     }
 
     private int dp(int value) {

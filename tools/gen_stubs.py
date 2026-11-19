@@ -178,6 +178,108 @@ def input_names():
     return sorted(names)
 
 
+def opensl_names():
+    """libOpenSLES: slCreateEngine plus one thunk per interface vtable slot.
+
+    OpenSL has no flat C API for the objects: every method is reached through a
+    vtable the implementation fills in. A generated stub cannot reproduce that
+    either - the addresses in it belong to the loaded library - so the guest
+    library defines ONE vtable (guest/stubs/opensl.S) whose slot N is the thunk
+    below. The host already knows what it created, so the pair (object kind, slot)
+    is enough to dispatch: slot 0 is Realize on an SLObjectItf, SetPlayState on an
+    SLPlayItf, Enqueue on a buffer queue, and so on. Fifteen slots cover the
+    widest interface (SLEngineItf_).
+    """
+    return ["slCreateEngine"] + ["zb_sl_slot_%d" % slot for slot in range(15)]
+
+
+# A stub whose guest must also hand the host a pointer to guest data. The address
+# goes in r12, which AAPCS32 lets a callee clobber, so r0-r3 and the stack still
+# arrive exactly as the caller placed them. slCreateEngine passes the address of
+# the one guest vtable: the host needs it to build the { vtable, handle } structs
+# it hands back for every object and interface.
+GUEST_DATA_ARGUMENTS = {
+    "slCreateEngine": "zb_sl_vtables",
+}
+
+
+def is_hidden_stub(name):
+    """Thunks only this library references, so they must not become preemptible.
+
+    The OpenSL vtable holds their addresses. A shared library may not take the
+    absolute address of a preemptible symbol (the linker rejects R_ARM_ABS32
+    against one), and nothing outside libOpenSLES.so calls a slot thunk.
+    """
+    return name.startswith("zb_sl_slot_")
+
+
+# GLES entry points wrapped by guest/stubs/libGLESv2_cache.c inside libGLESv2.so.
+# Their raw SVC thunks are emitted as `.hidden __zb_svc_<name>` while keeping the same
+# host-call index and public symbol name in hostcalls.inc.
+CACHED_GLES_WRAPPERS = frozenset({
+    "glActiveTexture",
+    "glBindBuffer",
+    "glBindBufferBase",
+    "glBindBufferRange",
+    "glBindFramebuffer",
+    "glBindTexture",
+    "glUseProgram",
+    "glBindVertexArray",
+    "glBindVertexArrayOES",
+    "glDeleteBuffers",
+    "glDeleteFramebuffers",
+    "glDeleteTextures",
+    "glDeleteProgram",
+    "glDeleteVertexArrays",
+    "glDeleteVertexArraysOES",
+    "glEnable",
+    "glDisable",
+    "glEnableVertexAttribArray",
+    "glDisableVertexAttribArray",
+    "glPixelStorei",
+    "glDepthMask",
+    "glDepthFunc",
+    "glClearDepthf",
+    "glStencilMask",
+    "glStencilMaskSeparate",
+    "glStencilFunc",
+    "glStencilFuncSeparate",
+    "glStencilOp",
+    "glStencilOpSeparate",
+    "glCullFace",
+    "glFrontFace",
+    "glBlendFunc",
+    "glBlendFuncSeparate",
+    "glBlendEquation",
+    "glBlendEquationSeparate",
+    "glColorMask",
+    "glViewport",
+    "glScissor",
+    "glDepthRangef",
+    "glClearColor",
+    "glVertexAttribPointer",
+    "glVertexAttribIPointer",
+    "glUniform1i",
+    "glUniform2i",
+    "glUniform1fv",
+    "glUniform2fv",
+    "glUniform3fv",
+    "glUniform4fv",
+    "glUniformMatrix3fv",
+    "glUniformMatrix4fv",
+    "glDrawElements",
+    "glDrawArrays",
+    "glClear",
+    "glPolygonOffset",
+    "glVertexAttrib4fv",
+    "glInvalidateFramebuffer",
+    "glBindSampler",
+    "glBufferSubData",
+    "glClearStencil",
+    "glTexParameteri",
+})
+
+
 def gles1_names():
     """Every GLES 1.1 entry point of the NDK header.
 
@@ -235,6 +337,9 @@ LIBRARIES = [
     ("libandroid", looper_pollall_names),
     # GLES 1.1: linked by Unity 4.5, so the library has to exist for the guest to load at all.
     ("libGLESv1_CM", gles1_names),
+    # OpenSL ES: arm32 guests dlopen it themselves (FMOD in Unity does), and the device
+    # ships no arm32 copy. Appended last so no established index moves.
+    ("libOpenSLES", opensl_names),
 ]
 
 
@@ -272,14 +377,40 @@ def main():
             if shared is None and index >= RESERVED_HOST_CALL_FIRST:
                 sys.exit("too many host calls: index 0x%x reaches the reserved range" % index)
             entry = shared if shared is not None else index
-            lines += [
-                ".global %s" % name,
-                ".type %s, %%function" % name,
-                ".p2align 2",
-                "%s:" % name,
+            guest_data = GUEST_DATA_ARGUMENTS.get(name)
+            body = []
+            if guest_data is not None:
+                # A shared library may not carry an absolute address in its text (that would be
+                # a text relocation the linker refuses for a preemptible symbol), so the literal
+                # holds a delta from a label and the add applies it to this instruction's pc.
+                # In ARM mode pc reads as the address of the add plus 8, which is exactly why
+                # the label sits on the add and the literal subtracts another 8.
+                body += [
+                    "    ldr r12, .Lzb_arg_%s" % name,
+                    ".Lzb_arg_%s_pc:" % name,
+                    "    add r12, pc, r12",
+                ]
+            body += [
                 "    svc #0x%x" % (HOST_CALL_BASE | entry),
                 "    bx lr",
-                ".size %s, . - %s" % (name, name),
+            ]
+            if guest_data is not None:
+                body += [
+                    ".Lzb_arg_%s:" % name,
+                    "    .word %s - .Lzb_arg_%s_pc - 8" % (guest_data, name),
+                ]
+            sym = "__zb_svc_" + name if (lib == "libGLESv2" and name in CACHED_GLES_WRAPPERS) else name
+            lines += [
+                ".global %s" % sym,
+            ]
+            if sym != name or is_hidden_stub(name):
+                lines.append(".hidden %s" % sym)
+            lines += [
+                ".type %s, %%function" % sym,
+                ".p2align 2",
+                "%s:" % sym,
+            ] + body + [
+                ".size %s, . - %s" % (sym, sym),
                 "",
             ]
             if shared is not None:

@@ -49,67 +49,149 @@ std::uint32_t HostJni::Impl::mirror_direct_buffer(JniBackend::Env env, JniBacken
         return 0;
     }
     const auto size = static_cast<std::uint64_t>(capacity);
-    std::uint32_t guest = 0;
+    std::uint32_t existing_guest = 0;
+    std::uint64_t existing_size = 0;
     {
         std::lock_guard<std::mutex> lock(mirror_mutex);
         auto found = mirrors.find(host);
-        if (found != mirrors.end()) guest = found->second.guest;
-        if (guest == 0 && mirrored_bytes + size > kMirrorCapBytes) {
-            ++mirror_failures;
-            failure = "over-cap";
-            return 0;
+        if (found != mirrors.end() && found->second.size >= size) {
+            existing_guest = found->second.guest;
+            existing_size = found->second.size;
+        } else {
+            const std::uint64_t existing_bytes = found != mirrors.end() ? found->second.size : 0;
+            if (mirrored_bytes - existing_bytes + size > kMirrorCapBytes) {
+                ++mirror_failures;
+                failure = "over-cap";
+                return 0;
+            }
         }
     }
-    if (guest == 0) {
-        // Guest malloc runs guest code on this thread, so it must never run under mirror_mutex:
-        // another thread holding the guest allocator's own lock and waiting here would deadlock.
-        runtime_report().note_jni_detail("direct-buffer-allocating", "size=" + std::to_string(size), true);
-        GuestCall args;
-        args.regs = {static_cast<std::uint32_t>(size), 0, 0, 0};
-        const auto allocated = runtime.call_on_current(runtime.service_api().malloc_fn, args);
-        if (!allocated || allocated->r0 == 0) {
-            std::lock_guard<std::mutex> lock(mirror_mutex);
-            ++mirror_failures;
-            failure = "no-guest-memory";
+    if (existing_guest != 0) {
+        std::uint8_t* dst = runtime.memory().host_ptr(existing_guest, size, kPageWrite);
+        if (dst == nullptr) {
+            failure = "unwritable-mirror";
             return 0;
         }
-        guest = allocated->r0;
+        std::memcpy(dst, host, size);
+        (void)existing_size;
+        return existing_guest;
     }
-    std::lock_guard<std::mutex> lock(mirror_mutex);
-    auto found = mirrors.find(host);
-    if (found == mirrors.end()) {
-        // A concurrent call may have mirrored the same buffer first; then its allocation wins and
-        // ours is simply left unused (the guest heap keeps it, which is bounded by the cap).
-        found = mirrors.emplace(host, BufferMirror{guest, size, backend.new_global_ref(env, buffer)}).first;
-        mirrored_bytes += size;
+
+    // Guest malloc runs guest code on this thread, so it must never run under mirror_mutex:
+    // another thread holding the guest allocator's own lock and waiting here would deadlock.
+    runtime_report().note_jni_detail("direct-buffer-allocating", "size=" + std::to_string(size), true);
+    GuestCall args;
+    args.regs = {static_cast<std::uint32_t>(size), 0, 0, 0};
+    const auto allocated = runtime.call_on_current(runtime.service_api().malloc_fn, args);
+    if (!allocated || allocated->r0 == 0) {
+        std::lock_guard<std::mutex> lock(mirror_mutex);
+        ++mirror_failures;
+        failure = "no-guest-memory";
+        return 0;
     }
-    // Java may have written into the buffer since the last call, so refresh the copy. A guest
-    // write made before this point is overwritten; that is the documented cost of the mirror.
-    const std::uint64_t bytes = std::min(size, found->second.size);
-    std::memcpy(runtime.memory().base() + found->second.guest, host, bytes);
-    return found->second.guest;
+    const std::uint32_t guest = allocated->r0;
+    const JniBackend::Ref new_global = backend.new_global_ref(env, buffer);
+
+    std::uint32_t unused_guest = 0;
+    JniBackend::Ref unused_global = 0;
+    std::uint32_t result_guest = 0;
+    {
+        std::lock_guard<std::mutex> lock(mirror_mutex);
+        auto found = mirrors.find(host);
+        if (found != mirrors.end() && found->second.size >= size) {
+            // A concurrent call already installed a big-enough mirror; release ours outside the lock.
+            unused_guest = guest;
+            unused_global = new_global;
+            result_guest = found->second.guest;
+        } else {
+            const std::uint64_t old_size = found != mirrors.end() ? found->second.size : 0;
+            if (mirrored_bytes - old_size + size > kMirrorCapBytes) {
+                ++mirror_failures;
+                failure = "over-cap";
+                unused_guest = guest;
+                unused_global = new_global;
+            } else {
+                if (found != mirrors.end()) {
+                    unused_guest = found->second.guest;
+                    unused_global = found->second.global;
+                    mirrored_bytes -= found->second.size;
+                    found->second = BufferMirror{guest, size, new_global};
+                } else {
+                    mirrors.emplace(host, BufferMirror{guest, size, new_global});
+                }
+                mirrored_bytes += size;
+                has_mirrors.store(true, std::memory_order_release);
+                result_guest = guest;
+            }
+        }
+    }
+    if (unused_global != 0) backend.delete_global_ref(env, unused_global);
+    if (unused_guest != 0) {
+        GuestCall free_args;
+        free_args.regs = {unused_guest, 0, 0, 0};
+        (void)runtime.call_on_current(runtime.service_api().free_fn, free_args);
+    }
+    if (result_guest == 0) return 0;
+    std::uint8_t* dst = runtime.memory().host_ptr(result_guest, size, kPageWrite);
+    if (dst == nullptr) {
+        failure = "unwritable-mirror";
+        return 0;
+    }
+    std::memcpy(dst, host, size);
+    return result_guest;
 }
 
 void HostJni::Impl::flush_buffer_mirrors(JniBackend::Env env) {
-    std::lock_guard<std::mutex> lock(mirror_mutex);
-    const std::uint8_t* base = runtime.memory().base();
-    for (auto it = mirrors.begin(); it != mirrors.end();) {
-        const BufferMirror& mirror = it->second;
-        // Ask Java again rather than trusting the address we stored: a buffer whose memory moved,
-        // shrank or went away must never be written through a stale pointer.
-        const void* host = mirror.global != 0 ? backend.get_direct_buffer_address(env, mirror.global) : nullptr;
+    if (!has_mirrors.load(std::memory_order_acquire)) return;
+    if (backend.exception_check(env)) return;
+    struct Snapshot {
+        const void* host = nullptr;
+        std::uint32_t guest = 0;
+        std::uint64_t size = 0;
+        JniBackend::Ref global = 0;
+    };
+    std::vector<Snapshot> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mirror_mutex);
+        if (mirrors.empty()) {
+            has_mirrors.store(false, std::memory_order_release);
+            return;
+        }
+        snapshot.reserve(mirrors.size());
+        for (const auto& [h, m] : mirrors) snapshot.push_back({h, m.guest, m.size, m.global});
+    }
+    std::vector<std::uint32_t> stale_guests;
+    std::vector<JniBackend::Ref> stale_globals;
+    for (const Snapshot& s : snapshot) {
+        // Ask Java outside mirror_mutex so JNI calls never nest inside mirror_mutex.
+        const void* host = s.global != 0 ? backend.get_direct_buffer_address(env, s.global) : nullptr;
         const std::int64_t capacity =
-            host != nullptr ? backend.get_direct_buffer_capacity(env, mirror.global) : 0;
-        if (host != it->first || capacity < 0 ||
-            static_cast<std::uint64_t>(capacity) < mirror.size) {
-            log("direct buffer mirror dropped: the Java buffer changed or went away");
-            if (mirror.global != 0) backend.delete_global_ref(env, mirror.global);
-            mirrored_bytes -= mirror.size;
-            it = mirrors.erase(it);
+            host != nullptr ? backend.get_direct_buffer_capacity(env, s.global) : 0;
+        if (backend.exception_check(env)) {
+            backend.exception_clear(env);
             continue;
         }
-        std::memcpy(const_cast<void*>(host), base + mirror.guest, mirror.size);
-        ++it;
+        if (host != s.host || capacity < 0 || static_cast<std::uint64_t>(capacity) < s.size) {
+            log("direct buffer mirror dropped: the Java buffer changed or went away");
+            std::lock_guard<std::mutex> lock(mirror_mutex);
+            auto it = mirrors.find(s.host);
+            if (it != mirrors.end() && it->second.guest == s.guest && it->second.global == s.global) {
+                mirrored_bytes -= it->second.size;
+                stale_guests.push_back(it->second.guest);
+                if (it->second.global != 0) stale_globals.push_back(it->second.global);
+                mirrors.erase(it);
+                if (mirrors.empty()) has_mirrors.store(false, std::memory_order_release);
+            }
+            continue;
+        }
+        const std::uint8_t* src = runtime.memory().host_ptr(s.guest, s.size, kPageRead);
+        if (src != nullptr) std::memcpy(const_cast<void*>(host), src, s.size);
+    }
+    for (JniBackend::Ref g : stale_globals) backend.delete_global_ref(env, g);
+    for (std::uint32_t g : stale_guests) {
+        GuestCall free_args;
+        free_args.regs = {g, 0, 0, 0};
+        (void)runtime.call_on_current(runtime.service_api().free_fn, free_args);
     }
 }
 
@@ -201,7 +283,12 @@ bool HostJni::Impl::serve_data(JniCall& call) {
         const JniBackend::Env env = call.env();
         const std::uint32_t address = call.arg(0);
         const auto capacity = static_cast<std::int64_t>(call.arg(1) | (static_cast<std::uint64_t>(call.arg(2)) << 32));
-        if (capacity < 0 || capacity > std::numeric_limits<std::int32_t>::max()) {
+        if (capacity < 0) {
+            // Delegate negative capacity to ART so it throws IllegalArgumentException cleanly.
+            call.set(local(state, backend.new_direct_byte_buffer(env, nullptr, capacity)));
+            return true;
+        }
+        if (capacity > std::numeric_limits<std::int32_t>::max()) {
             fatal(env, "NewDirectByteBuffer: capacity %lld is outside the 32-bit guest range",
                   static_cast<long long>(capacity));
         }
@@ -245,12 +332,12 @@ bool HostJni::Impl::serve_data(JniCall& call) {
         if (seen <= 4) {
             char text[200];
             std::snprintf(text, sizeof text, "buffer=0x%08x host=%p %s guest=0x%08x mirrored=%s%s",
-                          call.arg(1), static_cast<const void*>(host), inside ? "inside" : "outside",
+                          call.arg(0), static_cast<const void*>(host), inside ? "inside" : "outside",
                           answer, mirrored ? "yes" : "no", mirrored || inside ? "" : failure);
             runtime_report().note_jni_detail("direct-buffer-" + std::to_string(seen), text, false);
         }
-        runtime_report().note_jni_detail("direct-buffer-calls", std::to_string(seen), true);
-        {
+        if (seen <= 4 || (seen % 128) == 0 || (!inside && host != nullptr && !mirrored)) {
+            runtime_report().note_jni_detail("direct-buffer-calls", std::to_string(seen), true);
             std::lock_guard<std::mutex> lock(mirror_mutex);
             runtime_report().note_jni_detail("direct-buffer-mirrored-bytes", std::to_string(mirrored_bytes), true);
             if (mirror_failures != 0) {

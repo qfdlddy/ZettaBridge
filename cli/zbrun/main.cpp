@@ -30,21 +30,29 @@ int main(int argc, char** argv) {
     // Host loader variables describe 64-bit host libraries; the 32-bit guest linker would try to
     // load them (Termux sets LD_PRELOAD) and fail. Pass guest ones explicitly with --env.
     std::vector<std::string> guest_envp;
-    for (char** e = environ; *e != nullptr; ++e) {
-        const std::string entry = *e;
-        if (entry.rfind("LD_PRELOAD=", 0) == 0 || entry.rfind("LD_LIBRARY_PATH=", 0) == 0) continue;
-        guest_envp.push_back(entry);
+    if (environ != nullptr) {
+        for (char** e = environ; *e != nullptr; ++e) {
+            const std::string entry = *e;
+            if (entry.rfind("LD_PRELOAD=", 0) == 0 || entry.rfind("LD_LIBRARY_PATH=", 0) == 0) continue;
+            guest_envp.push_back(entry);
+        }
     }
 
     int i = 1;
     while (i < argc && std::strncmp(argv[i], "--", 2) == 0) {
+        if (std::strcmp(argv[i], "--") == 0) {
+            ++i;
+            break;
+        }
         if (std::strcmp(argv[i], "--sysroot") == 0 && i + 1 < argc) {
             sysroot = argv[i + 1];
             i += 2;
         } else if (std::strcmp(argv[i], "--precise-faults") == 0) {
             precise_faults = true;
             ++i;
-        } else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc && std::strchr(argv[i + 1], '=') != nullptr) {
+        } else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
+            const char* eq = std::strchr(argv[i + 1], '=');
+            if (eq == nullptr || eq == argv[i + 1]) return usage();
             const std::string assignment = argv[i + 1];
             const std::string prefix = assignment.substr(0, assignment.find('=') + 1);
             std::erase_if(guest_envp, [&](const std::string& e) { return e.compare(0, prefix.size(), prefix) == 0; });

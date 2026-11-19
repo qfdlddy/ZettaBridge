@@ -1,5 +1,6 @@
 package com.zettabridge.launcher;
 
+import android.app.ActionBar;
 import android.app.Activity;
 import android.content.res.TypedArray;
 import android.os.Build;
@@ -44,7 +45,7 @@ final class GuestWindowStyle {
         if (window == null) return;
         final int flags = window.getAttributes().flags;
         if ((flags & WindowManager.LayoutParams.FLAG_FULLSCREEN) == 0) return;
-        if (activity.getActionBar() != null) activity.getActionBar().hide();
+        hideActionBar(activity);
         hideSystemBars(activity);
         final View decor = window.getDecorView();
         decor.getViewTreeObserver().addOnWindowFocusChangeListener(focused -> {
@@ -81,7 +82,7 @@ final class GuestWindowStyle {
             } catch (RuntimeException e) {
                 Log.w(TAG, "cannot drop the title bar: " + e);
             }
-            if (activity.getActionBar() != null) activity.getActionBar().hide();
+            hideActionBar(activity);
         }
         if (!fullscreen) return;
 
@@ -89,17 +90,52 @@ final class GuestWindowStyle {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN);
         hideSystemBars(activity);
         // The bars come back on every focus change (a dialog, the recents switcher), and the
-        // guest's own setSystemUiVisibility no longer brings them down, so re-apply.
+        // guest's own setSystemUiVisibility no longer brings them down, so re-apply. This runs
+        // before the plugin's onCreate, where building the decor is not safe (see hideActionBar),
+        // so the listener is only attached if the decor already exists; afterCreate() attaches it
+        // otherwise, once the plugin has created its content view.
+        if (!isDecorInstalled(activity)) return;
         final View decor = window.getDecorView();
         decor.getViewTreeObserver().addOnWindowFocusChangeListener(focused -> {
             if (focused) hideSystemBars(activity);
         });
     }
 
+    /**
+     * Hides the action bar if the window has one.
+     *
+     * <p>Activity.getActionBar() installs the window decor as a side effect, and
+     * PhoneWindow can only build that decor while the activity still resolves framework resources:
+     * generateLayout() inflates a platform layout and looks for its content container afterwards.
+     * In prepareActivity the plugin's resources are already in place, so that inflation finds no
+     * container and throws "Window couldn't find content container view" before the plugin's
+     * onCreate ever runs. The bar is therefore only hidden when the decor is already installed;
+     * a window that has not built its decor yet gets the feature request instead, which is what
+     * actually prevents the bar.
+     */
+    private static void hideActionBar(Activity activity) {
+        if (!isDecorInstalled(activity)) return;
+        try {
+            ActionBar bar = activity.getActionBar();
+            if (bar != null) bar.hide();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "cannot hide the action bar: " + e);
+        }
+    }
+
+    /** True once PhoneWindow has built its decor, read from the window without building it. */
+    private static boolean isDecorInstalled(Activity activity) {
+        Window window = activity.getWindow();
+        return window != null && window.peekDecorView() != null;
+    }
+
     @SuppressWarnings("deprecation")
     private static void hideSystemBars(Activity activity) {
         Window window = activity.getWindow();
         if (window == null) return;
+        // getDecorView() / getInsetsController() builds the decor, which is only safe once the
+        // plugin has created its content view (see hideActionBar).
+        if (!isDecorInstalled(activity)) return;
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window.setDecorFitsSystemWindows(false);

@@ -54,8 +54,9 @@ bool HostConfiguration::handle_host_call(std::uint32_t index, GuestThread& threa
         return true;
     }
     case ZB_CONFIG_HC_AConfiguration_fromAssetManager: {
-        void* config = live_config(regs[0]);
-        if (config == nullptr) { regs[0] = 0; return reject("AConfiguration_fromAssetManager", regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* config = live_config(bad);
+        if (config == nullptr) { regs[0] = 0; return reject("AConfiguration_fromAssetManager", bad); }
         void* manager = resolve_asset_manager_ ? resolve_asset_manager_(regs[1]) : nullptr;
         if (manager == nullptr) {
             runtime_report().note_jni_detail("configuration-asset-manager", "unknown handle", true);
@@ -70,8 +71,9 @@ bool HostConfiguration::handle_host_call(std::uint32_t index, GuestThread& threa
     case ZB_CONFIG_HC_AConfiguration_getCountry: {
         const bool language = index == ZB_CONFIG_HC_AConfiguration_getLanguage;
         const char* function = language ? "AConfiguration_getLanguage" : "AConfiguration_getCountry";
-        void* config = live_config(regs[0]);
-        if (config == nullptr) { regs[0] = 0; return reject(function, regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* config = live_config(bad);
+        if (config == nullptr) { regs[0] = 0; return reject(function, bad); }
         // The NDK writes exactly two characters and does not terminate them.
         std::uint8_t* out = runtime_.memory().host_ptr(regs[1], 2, kPageRead | kPageWrite);
         if (out == nullptr) { regs[0] = 0; return reject(function, regs[1]); }
@@ -89,8 +91,9 @@ bool HostConfiguration::handle_host_call(std::uint32_t index, GuestThread& threa
     case ZB_CONFIG_HC_AConfiguration_setCountry: {
         const bool language = index == ZB_CONFIG_HC_AConfiguration_setLanguage;
         const char* function = language ? "AConfiguration_setLanguage" : "AConfiguration_setCountry";
-        void* config = live_config(regs[0]);
-        if (config == nullptr) { regs[0] = 0; return reject(function, regs[0]); }
+        const std::uint32_t bad = regs[0];
+        void* config = live_config(bad);
+        if (config == nullptr) { regs[0] = 0; return reject(function, bad); }
         char value[3] = {0, 0, 0};
         if (regs[1] != 0) {
             const std::uint8_t* text = runtime_.memory().host_ptr(regs[1], 2, kPageRead);

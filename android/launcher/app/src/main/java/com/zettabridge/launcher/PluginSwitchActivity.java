@@ -23,6 +23,7 @@ public class PluginSwitchActivity extends Activity {
     private static final String EXTRA_PACKAGE = "zb.package";
     private static final int WAIT_STEPS = 40;
     private static final long WAIT_STEP_MS = 50;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     static Intent intent(Context context, String packageName) {
         return new Intent(Intent.ACTION_MAIN)
@@ -37,7 +38,7 @@ public class PluginSwitchActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         final String packageName = getIntent().getStringExtra(EXTRA_PACKAGE);
-        if (packageName == null) {
+        if (!PluginStore.isValidPackageName(packageName) || PluginStore.find(this, packageName) == null) {
             finish();
             return;
         }
@@ -58,11 +59,17 @@ public class PluginSwitchActivity extends Activity {
         waitForGuestToGo(0, packageName);
     }
 
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
+    }
+
     /** The new process must not start before the old one is gone, or it inherits the old plugin. */
     private void waitForGuestToGo(int step, String packageName) {
+        if (isFinishing() || isDestroyed()) return;
         if (step < WAIT_STEPS && ActivePlugin.guestIsRunning(this)) {
-            new Handler(Looper.getMainLooper()).postDelayed(
-                    () -> waitForGuestToGo(step + 1, packageName), WAIT_STEP_MS);
+            handler.postDelayed(() -> waitForGuestToGo(step + 1, packageName), WAIT_STEP_MS);
             return;
         }
         startGuest(packageName, true);

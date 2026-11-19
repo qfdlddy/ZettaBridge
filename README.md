@@ -1,11 +1,34 @@
-## I’ve had very little free time over the last couple of weeks. Some fixes are still sitting on my device. Don’t worry – development is continuing, and your bug reports with logs are a great help.
-
 # ZettaBridge
 
 **Run 32-bit Android apps on 64-bit-only ARM phones.**
 An source-available ARM32 -> ARM64 native code translator and app launcher.
 
-[Читать на русском](README.ru.md)
+[Читать на русском](README.ru.md) | [简体中文](README.cn.md)
+
+---
+
+## Changes
+
+Targeted at Snapdragon 7s Gen 4, with the following additions relative to upstream `ZettaBridge`:
+
+- **Audio & Compatibility Shims**
+  - **OpenSL ES audio bridge (`Phase 7c`):** Arm32 `libOpenSLES.so` stub (`guest/stubs/libOpenSLES.S`) and host backend (`HostOpenSl` / `AndroidOpenSlBackend`) driving host 64-bit OpenSL ES for FMOD/Unity audio, with a lock-free single-queue refill fast path.
+  - **Offline Play Licensing shim (`PlayLicensingShim`) & Ad Hider (`AdHider`):** Synthesizes local `ILicensingService` Binder/Proxy responses for LVL-gated games when Google Play Store is absent inside the plugin sandbox, and optionally hides bundled ad SDK views.
+  - **Packed ELF & loader fixups:** Handles packed `.so` libraries with spoofed `e_phentsize` (e.g. `libRMS.so`) and overlapping `PT_LOAD` page permissions (`elf_fixups.cpp`, `elf_loader.cpp`, `tools/fix_guest_lib.py`).
+- **Graphics (`GLES 2.0 / 3.0`) Caching & Batching**
+  - **Guest-side per-thread GL state cache & batch buffer (`guest/stubs/libGLESv2_cache.c`):** 61 cached/batched wrappers filter redundant GL state calls inside translated arm32 code with zero SVC exit and pack non-redundant void calls (including `glUniformMatrix3fv`/`4fv`, `glUniform2i`/`2fv`, `glBindBufferBase`/`Range`, state & draw calls) into a 2048-word per-thread batch buffer.
+  - **Host-side GL fast paths (`host_gl.cpp`, `gl_manual.cpp`):** Caches validated batch-buffer host pointers on `GuestThread`, separates dynamic state-filter invalidation from immutable EGL context string/extension caches, and supports optional `FrameProbe` frame-cost breakdowns.
+- **Core Translator, Syscall, Memory & Toolchain Optimizations**
+  - **In-JIT fast SVC & JNI/Futex paths (`process.cpp`, `syscalls.cpp`, `host_jni.cpp`):** High-frequency syscalls (`clock_gettime`, `gettid`, `futex` wake + non-blocking `FUTEX_WAIT` `-EAGAIN` fast-fail, cached `read`/`pread64`) and leaf GL/JNI calls (including non-static `GetField`/`SetField`) execute inside Dynarmic callbacks without exiting `Jit::Run()`; pure-integer syscalls skip `HostFpcrGuard` (`mrs fpcr`).
+  - **User-space APK/OBB I/O cache (`guest_io.cpp`):** Lock-free fd table + 64 KiB read-only chunk cache and mmap path for Unity/ZIP readers.
+  - **8-page batched `GuestMemory::accessible_span()`**, **`ZB_UNSAFE_FP`** relaxed IEEE-754 JIT optimizations, **Android ADPF** (`APerformanceHintManager`, API 31+ in `cpu_tuning.cpp`), **`-moutline-atomics`** (LSE hardware atomics on ARMv8.1+), **ThinLTO** (`ZB_ENABLE_LTO=ON`), **16 KiB ELF alignment**, and **`ZB_DISABLE_TELEMETRY`** (`ZB_NO_TELEMETRY=1`, ON by default in `Release`).
+- **Launcher Toggles & On-Device Standalone APK Export (`android/launcher/`)**
+  - Per-plugin settings (`Fast FP`, `Unity MT` / `-force-gfx-mt`, `Hide ads`, `Precise faults`, `GL diagnostics`, `Application` class override).
+  - **On-device Standalone APK Exporter (`ApkExporter`, `ApkSignerHelper`, `AxmlEditor`, `ArscIconFinder`, `StandaloneLaunchActivity`):** Repackages imported 32-bit plugins into standalone v1/v2/v3-signed arm64 APKs via `apksig` (including OBB bundling, manifest/icon patching, pre-fixed `.so` libs, and optional zero-telemetry `assets/zb-standalone/libzbridge.so`).
+- **Additional Host Tests:** Added `exclusive_aba_test`, `fast_svc_test`, `gl_state_cache_test`, `guest_io_apk_cache_test`, and `opensl_chain_test`.
+- **Additional Dynarmic Patch:** Added `third_party/patches/dynarmic-0003-zbridge-all.patch` (apply alongside `dynarmic-0001-thumb32-armv8.patch` and `dynarmic-0002-asimd-narrowing.patch` after initializing submodules).
+
+> **Note:** All modifications and documentation above were authored by Gemini 4, GLM 5.3 Flash, and DeepSeek Flash 1017; no warranty or guarantee of availability/usability is provided.
 
 ---
 

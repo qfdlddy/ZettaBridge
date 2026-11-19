@@ -5,6 +5,7 @@
 
 #include "zb/jni_shorty.h"
 #include "zb/log.h"
+#include "zb/runtime_report.h"
 
 namespace zb {
 
@@ -30,12 +31,33 @@ bool HostJni::Impl::serve_objects(JniCall& call) {
         const JniBackend::Ref cls = ref(0);
         const std::string method = read_string(env, call.arg(1), name);
         const std::string signature = read_string(env, call.arg(2), name);
-        const JniBackend::Id id = backend.get_method_id(env, cls, method.c_str(), signature.c_str(), call.arg(3) != 0);
-        if (id == 0) return true;
+        const bool is_static = call.arg(3) != 0;
+        const JniBackend::Id id = backend.get_method_id(env, cls, method.c_str(), signature.c_str(), is_static);
+        if (id == 0) {
+            // ART left an exception pending and the guest gets a null jmethodID. Record which
+            // method, because the guest's own failure will surface far away from here.
+            note_null_result("GetMethodID " + method + signature);
+            return true;
+        }
         const std::optional<std::string> shorty = shorty_from_signature(signature);
         if (!shorty) fatal(env, "GetMethodID: the backend accepted a malformed signature %s", signature.c_str());
         write_shorty(env, call.arg(4), *shorty, name);
-        call.set(intern_method(id, *shorty));
+        AudioMethodHook audio_hook = AudioMethodHook::None;
+        if (!is_static) {
+            if ((method == "isBluetoothA2dpOn" || method == "isBluetoothScoOn") && signature == "()Z") {
+                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::IsBluetoothOn;
+            } else if (method == "getDevices" && signature == "(I)[Landroid/media/AudioDeviceInfo;") {
+                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::GetDevices;
+            } else if ((method == "registerAudioDeviceCallback" &&
+                        signature == "(Landroid/media/AudioDeviceCallback;Landroid/os/Handler;)V") ||
+                       (method == "unregisterAudioDeviceCallback" &&
+                        signature == "(Landroid/media/AudioDeviceCallback;)V")) {
+                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::DeviceCallbackNoop;
+            } else if (method == "getProperty" && signature == "(Ljava/lang/String;)Ljava/lang/String;") {
+                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::GetProperty;
+            }
+        }
+        call.set(intern_method(id, *shorty, audio_hook, method, signature));
         return true;
     }
     case ZB_JNI_HC_GetFieldID: {
@@ -58,7 +80,10 @@ bool HostJni::Impl::serve_objects(JniCall& call) {
         const JniBackend::Env env = call.env();
         std::string signature;
         const JniBackend::Id id = backend.from_reflected_method(env, ref(0), signature);
-        if (id == 0) return true;
+        if (id == 0) {
+            note_null_result("FromReflectedMethod");
+            return true;
+        }
         const std::optional<std::string> shorty = shorty_from_signature(signature);
         if (!shorty) fatal(env, "FromReflectedMethod: malformed signature %s", signature.c_str());
         write_shorty(env, call.arg(1), *shorty, name);
@@ -202,6 +227,8 @@ bool HostJni::Impl::serve_objects(JniCall& call) {
         const JniBackend::Env env = call.env();
         const std::string message = read_string(env, call.arg(0), name);
         log("guest FatalError: %s", message.c_str());
+        runtime_report().note_jni_detail("guest-fatal-error", message, true);
+        runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
         backend.fatal_error(env, message.c_str());
         std::abort();
     }

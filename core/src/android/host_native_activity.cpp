@@ -42,7 +42,17 @@ std::optional<std::uint32_t> HostNativeActivity::create(const Description& descr
     const std::optional<std::uint32_t> obb_path = copy_string(description.obb_path);
     const std::optional<std::uint32_t> state =
         saved_state_size != 0 ? copy_bytes(saved_state, saved_state_size) : std::optional<std::uint32_t>(0u);
+    const auto free_allocations = [&] {
+        if (!deallocate_) return;
+        if (state && *state != 0) deallocate_(*state);
+        if (obb_path && *obb_path != 0) deallocate_(*obb_path);
+        if (external_path && *external_path != 0) deallocate_(*external_path);
+        if (internal_path && *internal_path != 0) deallocate_(*internal_path);
+        if (callbacks && *callbacks != 0) deallocate_(*callbacks);
+        if (activity && *activity != 0) deallocate_(*activity);
+    };
     if (!activity || !callbacks || !internal_path || !external_path || !obb_path || !state) {
+        free_allocations();
         error = "cannot allocate the guest activity";
         return std::nullopt;
     }
@@ -50,6 +60,7 @@ std::optional<std::uint32_t> HostNativeActivity::create(const Description& descr
     std::uint8_t* fields = runtime_.memory().host_ptr(*activity, kGuestActivitySize, kPageRead | kPageWrite);
     std::uint8_t* table = runtime_.memory().host_ptr(*callbacks, kGuestCallbackTableSize, kPageRead | kPageWrite);
     if (fields == nullptr || table == nullptr) {
+        free_allocations();
         error = "the guest allocator returned unreadable memory";
         return std::nullopt;
     }
@@ -77,8 +88,11 @@ std::optional<std::uint32_t> HostNativeActivity::create(const Description& descr
     GuestCall call;
     call.regs = {*activity, *state, static_cast<std::uint32_t>(saved_state_size), 0};
     if (!call_(description.guest_on_create, call)) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        activities_.erase(*activity);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            activities_.erase(*activity);
+        }
+        free_allocations();
         error = "the guest ANativeActivity_onCreate failed";
         return std::nullopt;
     }

@@ -60,12 +60,12 @@ final class LoadedPlugin {
     /** onParsed runs before the plugin Application is created (the runtime marks it current). */
     static LoadedPlugin load(Application host, PluginRecord record, Consumer<LoadedPlugin> onParsed) throws Exception {
         PackageManager pm = host.getPackageManager();
-        PackageInfo info = pm.getPackageArchiveInfo(record.apk().getPath(), PluginStore.ARCHIVE_FLAGS);
+        PackageInfo info = PluginStore.loadPackageInfo(host, record);
         if (info == null) throw new IllegalStateException("cannot parse " + record.apk());
         ApplicationInfo ai = PluginStore.applicationInfo(info, record);
         ai.uid = android.os.Process.myUid();
         // Public API; works for an APK that is not installed once sourceDir points at it.
-        Resources res = pm.getResourcesForApplication(ai);
+        Resources res = new PluginResources(pm.getResourcesForApplication(ai), record.packageName, host.getPackageName());
 
         File codeCache = new File(host.getCodeCacheDir(), "plugins/" + record.packageName);
         if (!codeCache.isDirectory() && !codeCache.mkdirs()) {
@@ -75,6 +75,10 @@ final class LoadedPlugin {
             throw new IllegalStateException("cannot create " + record.dataDir());
         }
         if (record.isTranslated()) RuntimeBundle.install(host);
+        // Android 14+ refuses to load dex code from writable APK files.
+        if (record.apk().isFile() && record.apk().canWrite()) {
+            record.apk().setReadOnly();
+        }
         // Plugin dex is child-first and isolated from launcher implementation classes. Only the
         // stable com.zettabridge.core bridge is explicitly delegated to the launcher loader.
         ClassLoader cl = new PluginClassLoader(record, codeCache, RuntimeBundle.proxyLibrary(host),
@@ -87,9 +91,13 @@ final class LoadedPlugin {
             // ZB_PRECISE_FAULTS only once, at the first Process construction it triggers.
             ZBridge.setPreciseFaults(record.preciseFaults);
             // Same rule: the GL instrumentation is read once, when the guest JNI runtime is built.
-            ZBridge.setGlDiagnostics(record.diagnostics);
+            ZBridge.setGlDiagnostics(record.diagnostics && !BuildConfig.DISABLE_DIAGNOSTICS);
+            // Relaxed FP optimizations (ZB_UNSAFE_FP): read once per thread when Dynarmic initializes.
+            ZBridge.setUnsafeFp(record.unsafeFp);
             // Must precede every plugin class initialization, provider and Application callback.
-            ZBridge.activatePlugin(record.dir.getCanonicalPath(), record.targetSdk, cl);
+            // Pass the raw path rather than getCanonicalPath() so ProxyRuntime also aliases any
+            // symlinked Java view (such as /data/user/0/... -> /data/data/.../lib/).
+            ZBridge.activatePlugin(record.dir.getPath(), record.targetSdk, cl);
         }
         if (info.activities != null) {
             for (ActivityInfo a : info.activities) {
@@ -122,10 +130,23 @@ final class LoadedPlugin {
         // p.application is set before attach, so getApplicationContext() already returns the
         // plugin Application inside attachBaseContext (apps commonly cache it there).
         String appClass = ai.className != null ? ai.className : Application.class.getName();
+        // A modded APK can ship its own Application that re-hooks PackageManager or fails pack
+        // verification (5play/BinMT signature killers). An explicit override (or known BinMT hook)
+        // swaps it for the framework Application so the launcher's own PM virtualization stays in control.
+        if (record.application != null && !record.application.isEmpty()) {
+            appClass = record.application;
+        } else if ("cc.binmt.signature.PmsHookApplication".equals(appClass)) {
+            appClass = Application.class.getName();
+        }
+        if (record.isTranslated()) {
+            PluginStore.ensureBundledObb(host, record, info);
+        }
         PluginContext appContext = new PluginContext(host.getBaseContext(), p);
         p.application = (Application) cl.loadClass(appClass).getDeclaredConstructor().newInstance();
         Reflect.method(Application.class, "attach", Context.class).invoke(p.application, appContext);
-        Log.i(TAG, "plugin " + p.packageName + ": application " + appClass + " attached");
+        if (!BuildConfig.DISABLE_DIAGNOSTICS) {
+            Log.i(TAG, "plugin " + p.packageName + ": application " + appClass + " attached");
+        }
         installProviders(p, info, ai);
         p.application.onCreate();
         return p;
@@ -145,7 +166,9 @@ final class LoadedPlugin {
                         .getDeclaredConstructor().newInstance();
                 provider.attachInfo(p.application, pi);
                 p.providers.add(provider);
-                Log.i(TAG, "plugin " + p.packageName + ": provider " + pi.name + " started");
+                if (!BuildConfig.DISABLE_DIAGNOSTICS) {
+                    Log.i(TAG, "plugin " + p.packageName + ": provider " + pi.name + " started");
+                }
             } catch (Throwable t) {
                 Diagnostics.report(p.application, "plugin " + p.packageName + ": provider " + pi.name + " failed", t,
                         false);

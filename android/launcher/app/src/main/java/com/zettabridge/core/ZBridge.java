@@ -129,4 +129,11 @@ public final class ZBridge {
      * runtime of this plugin is constructed, since it reads the variable only once.
      */
     public static native void setGlDiagnostics(boolean enabled);
+
+    /**
+     * Sets ZB_UNSAFE_FP in this process's environment (setenv), enabling relaxed IEEE-754
+     * floating-point optimizations in the translator for higher game performance. Must be called
+     * before the guest runtime/Process is constructed.
+     */
+    public static native void setUnsafeFp(boolean enabled);
 }

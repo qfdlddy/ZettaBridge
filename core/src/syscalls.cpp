@@ -1,5 +1,7 @@
 #include "zb/syscalls.h"
 
+#include "cpu_tuning.h"
+
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <sched.h>
@@ -26,7 +28,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <csignal>
 #include <cstdio>
@@ -41,6 +46,7 @@
 #include "gen/syscall_nrs_arm.h"
 #include "zb/elf_fixups.h"
 #include "zb/guest_abi.h"
+#include "zb/guest_io.h"
 #include "zb/guest_memory.h"
 #include "zb/guest_thread.h"
 #include "zb/hang_watchdog.h"
@@ -99,6 +105,17 @@ constexpr std::uint64_t kUnblockableMask = (1ULL << (SIGKILL - 1)) | (1ULL << (S
 
 bool has_deliverable_signal(GuestThread& thread) {
     return thread.has_pending_signals(thread.sigmask);
+}
+
+template <typename Fn>
+std::int32_t run_blocking(GuestThread& thread, Fn&& fn) {
+    BlockingSection blocking(thread);
+    for (;;) {
+        if (has_deliverable_signal(thread)) return -EINTR;
+        const std::int32_t res = fn();
+        if (res != -EINTR) return res;
+        if (has_deliverable_signal(thread)) return -EINTR;
+    }
 }
 
 // ZB_STRACE=1 logs every guest syscall with its first four arguments and result.
@@ -212,12 +229,138 @@ bool write_timespec(GuestMemory& m, std::uint32_t addr, bool time64, const times
     return write_guest(m, addr, g::timespec32{static_cast<std::int32_t>(ts.tv_sec), static_cast<std::int32_t>(ts.tv_nsec)});
 }
 
+// Which guest code reads the plugin archive. The reader is the one piece of the asset path the
+// report could not see: "9135 reads" says nothing about who is reading or why. Every read arrives
+// through bionic's read(), so the caller is recovered from the guest stack: the first
+// kMaxApkReaders distinct call chains are named by library and offset, with a count.
+constexpr std::size_t kMaxApkReaders = 8;
+constexpr std::size_t kMaxApkReaderFrames = 4;
+// Every read arrives through the same bionic pc, so the caller has to come from the stack, which
+// is too expensive to walk on all of them. Sample the first reads sparsely and stop after this.
+constexpr std::uint64_t kApkReaderSamples = 1024;
+constexpr std::uint64_t kApkReaderStride = 16;
+
+struct ReaderEntry {
+    std::string where;
+    std::uint64_t count = 0;
+};
+
+struct ReaderTracker {
+    std::mutex mutex;
+    ReaderEntry entries[kMaxApkReaders];
+    std::atomic<std::uint64_t> samples{0};
+};
+
+ReaderTracker& apk_reader_tracker() {
+    static ReaderTracker tracker;
+    return tracker;
+}
+
+ReaderTracker& obb_reader_tracker() {
+    static ReaderTracker tracker;
+    return tracker;
+}
+
+// The guest call chain at the current stop, skipping bionic frames. The scan mirrors
+// Process::sample_thread_state, but reads the calling thread's own stack directly: the thread is
+// running, so taking the thread registry lock here would risk a self-deadlock.
+std::string apk_reader_chain(Ctx& c) {
+    std::string chain;
+    std::size_t frames = 0;
+    const std::uint32_t sp = c.thread.regs()[13];
+    if (sp == 0) return chain;
+    for (std::uint32_t offset = 0; offset < 4096 && frames < kMaxApkReaderFrames; offset += 4) {
+        const std::uint32_t addr = sp + offset;
+        if (addr < sp) break;
+        const std::uint8_t* word = c.mem.host_ptr(addr, 4, kPageRead);
+        if (word == nullptr) continue;
+        std::uint32_t value = 0;
+        std::memcpy(&value, word, sizeof value);
+        if ((value & 1u) == 0) continue;  // Thumb return addresses are odd
+        std::string label = c.proc.describe_code_address(value & ~1u);
+        if (label.empty()) continue;
+        if (label.rfind("libc.so", 0) == 0) continue;
+        if (label.rfind("libdl", 0) == 0) continue;
+        if (!chain.empty()) chain += " <- ";
+        chain += label;
+        ++frames;
+    }
+    return chain;
+}
+
+void note_reader(Ctx& c, ReaderTracker& tracker, const char* key_prefix) {
+    if (tracker.samples.load(std::memory_order_relaxed) >= kApkReaderSamples) return;
+    const std::uint64_t sample = tracker.samples.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sample > kApkReaderSamples || sample % kApkReaderStride != 1) return;
+    const std::string chain = apk_reader_chain(c);
+    if (chain.empty()) return;
+    const std::size_t first_end = chain.find(" <- ");
+    const std::string where = first_end == std::string::npos ? chain : chain.substr(0, first_end);
+    std::string line;
+    std::size_t slot = kMaxApkReaders;
+    bool announce = false;
+    {
+        std::lock_guard<std::mutex> lock(tracker.mutex);
+        ReaderEntry* readers = tracker.entries;
+        for (std::size_t i = 0; i < kMaxApkReaders; ++i) {
+            if (readers[i].where == where) {
+                ++readers[i].count;
+                slot = i;
+                break;
+            }
+        }
+        if (slot == kMaxApkReaders) {
+            for (std::size_t i = 0; i < kMaxApkReaders; ++i) {
+                if (readers[i].where.empty()) {
+                    readers[i].where = where;
+                    readers[i].count = 1;
+                    slot = i;
+                    announce = true;
+                    break;
+                }
+            }
+        }
+        if (announce) {
+            line = chain + " x" + std::to_string(readers[slot].count);
+        } else if (slot < kMaxApkReaders && (readers[slot].count & 0x7F) == 0) {
+            line = chain + " x" + std::to_string(readers[slot].count);
+            announce = true;
+        }
+    }
+    if (announce) {
+        runtime_report().note_io_detail(std::string(key_prefix) + std::to_string(slot + 1), line);
+    }
+}
+
+void note_apk_reader(Ctx& c) {
+    note_reader(c, apk_reader_tracker(), "apk-reader-");
+}
+
+void note_obb_reader(Ctx& c) {
+    note_reader(c, obb_reader_tracker(), "obb-reader-");
+}
+
 std::int32_t sys_read_write(Ctx& c, bool is_write) {
     const std::uint32_t len = c.a[2];
     std::uint8_t* buf = c.mem.host_ptr(c.a[1], len, is_write ? kPageRead : kPageWrite);
     if (len != 0 && buf == nullptr) return -EFAULT;
     const int fd = static_cast<int>(c.a[0]);
-    return result_of(is_write ? ::write(fd, buf, len) : ::read(fd, buf, len));
+    if (is_write) guest_log_note_write(fd, buf, len);
+    const std::optional<std::int32_t> cached =
+        is_write ? std::nullopt : guest_io_apk_read(fd, buf, len);
+    const std::int32_t res =
+        cached ? *cached
+               : run_blocking(c.thread, [&] {
+                     return result_of(is_write ? ::write(fd, buf, len) : ::read(fd, buf, len));
+                 });
+    if (!is_write) {
+        if (res > 0 && guest_io_note_read(fd, static_cast<std::size_t>(res), false)) note_apk_reader(c);
+        if (guest_io_is_obb_fd(fd) &&
+            guest_io_note_obb_io(fd, ObbIoOp::kRead, 0, len, res)) {
+            note_obb_reader(c);
+        }
+    }
+    return res;
 }
 
 std::int32_t sys_pread_pwrite(Ctx& c, bool is_write) {
@@ -226,22 +369,62 @@ std::int32_t sys_pread_pwrite(Ctx& c, bool is_write) {
     if (len != 0 && buf == nullptr) return -EFAULT;
     const off_t offset = static_cast<off_t>(static_cast<std::uint64_t>(c.a[4]) | (static_cast<std::uint64_t>(c.a[5]) << 32));
     const int fd = static_cast<int>(c.a[0]);
-    return result_of(is_write ? ::pwrite(fd, buf, len, offset) : ::pread(fd, buf, len, offset));
+    if (is_write) guest_log_note_write(fd, buf, len);
+    const std::optional<std::int32_t> cached =
+        is_write ? std::nullopt : guest_io_apk_pread(fd, buf, len, offset);
+    const std::int32_t res =
+        cached ? *cached
+               : result_of(is_write ? ::pwrite(fd, buf, len, offset) : ::pread(fd, buf, len, offset));
+    if (!is_write) {
+        guest_io_note_pread64(fd, static_cast<std::int64_t>(offset), len, res, cached.has_value());
+        if (res > 0 && guest_io_note_read(fd, static_cast<std::size_t>(res), true)) note_apk_reader(c);
+        if (guest_io_is_obb_fd(fd) &&
+            guest_io_note_obb_io(fd, ObbIoOp::kPread64, static_cast<std::uint64_t>(offset), len, res)) {
+            note_obb_reader(c);
+        }
+    }
+    return res;
 }
 
 std::int32_t sys_readv_writev(Ctx& c, bool is_write) {
     const std::uint32_t count = c.a[2];
     if (count > IOV_MAX) return -EINVAL;
-    std::vector<iovec> iov(count);
+    std::array<iovec, 16> small_iov{};
+    std::vector<iovec> heap_iov;
+    iovec* iov_ptr = small_iov.data();
+    if (count > small_iov.size()) {
+        heap_iov.resize(count);
+        iov_ptr = heap_iov.data();
+    }
+    if (static_cast<std::uint64_t>(c.a[1]) + static_cast<std::uint64_t>(count) * sizeof(g::iovec32) > kGuestSpaceSize) {
+        return -EFAULT;
+    }
     for (std::uint32_t i = 0; i < count; ++i) {
         g::iovec32 v;
         if (!read_guest(c.mem, c.a[1] + i * sizeof(g::iovec32), v)) return -EFAULT;
         std::uint8_t* base = c.mem.host_ptr(v.iov_base, v.iov_len, is_write ? kPageRead : kPageWrite);
         if (v.iov_len != 0 && base == nullptr) return -EFAULT;
-        iov[i] = {base, v.iov_len};
+        iov_ptr[i] = {base, v.iov_len};
     }
     const int fd = static_cast<int>(c.a[0]);
-    return result_of(is_write ? ::writev(fd, iov.data(), static_cast<int>(count)) : ::readv(fd, iov.data(), static_cast<int>(count)));
+    if (is_write) guest_log_note_writev(fd, iov_ptr, static_cast<int>(count));
+    const std::optional<std::int32_t> cached =
+        is_write ? std::nullopt : guest_io_apk_readv(fd, iov_ptr, static_cast<int>(count));
+    const std::int32_t res =
+        cached ? *cached
+               : run_blocking(c.thread, [&] {
+                     return result_of(is_write ? ::writev(fd, iov_ptr, static_cast<int>(count))
+                                               : ::readv(fd, iov_ptr, static_cast<int>(count)));
+                 });
+    if (!is_write) {
+        if (res > 0 && guest_io_note_read(fd, static_cast<std::size_t>(res), false)) note_apk_reader(c);
+        if (guest_io_is_obb_fd(fd)) {
+            std::size_t req_len = 0;
+            for (std::uint32_t i = 0; i < count; ++i) req_len += iov_ptr[i].iov_len;
+            if (guest_io_note_obb_io(fd, ObbIoOp::kReadv, 0, req_len, res)) note_obb_reader(c);
+        }
+    }
+    return res;
 }
 
 std::int32_t sys_brk(Ctx& c) {
@@ -257,8 +440,14 @@ std::int32_t sys_brk(Ctx& c) {
             return static_cast<std::int32_t>(p.brk_current);
         }
     } else if (new_top < old_top) {
-        c.mem.unmap(static_cast<std::uint32_t>(new_top), old_top - new_top);
-        p.invalidate(static_cast<std::uint32_t>(new_top), static_cast<std::uint32_t>(old_top - new_top));
+        const auto start = static_cast<std::uint32_t>(new_top);
+        const std::uint64_t cut = old_top - new_top;
+        const bool had_exec = c.mem.any_flag(start, cut, kPageExec);
+        c.mem.unmap(start, cut);
+        if (had_exec) p.invalidate(start, cut);
+    }
+    if (new_top != old_top) {
+        record_guest_brk(static_cast<std::int64_t>(new_top) - static_cast<std::int64_t>(old_top));
     }
     p.brk_current = want;
     return static_cast<std::int32_t>(want);
@@ -294,11 +483,17 @@ std::int32_t sys_mmap2(Ctx& c) {
     // Code of libraries marked DT_ZB_TEXTREL stays writable so the linker can relocate it.
     const bool textrel = !(flags & MAP_ANONYMOUS) && (prot & PROT_EXEC) && elf_has_textrel_marker(fd);
     const int effective_prot = textrel ? (prot | PROT_WRITE) : prot;
+    const bool had_exec = fixed && c.mem.any_flag(at, size, kPageExec);
 
     errno = 0;
     const bool ok = (flags & MAP_ANONYMOUS) ? c.mem.map_anon(at, size, effective_prot)
                                             : c.mem.map_file(at, size, effective_prot, flags, fd, offset);
-    if (!ok) return errno ? -errno : -ENOMEM;
+    const int map_errno = errno;
+    if (!(flags & MAP_ANONYMOUS) && guest_io_is_obb_fd(fd)) {
+        guest_io_note_obb_io(fd, ObbIoOp::kMmap2, offset, static_cast<std::size_t>(size),
+                             ok ? static_cast<std::int64_t>(at) : -(map_errno ? map_errno : ENOMEM));
+    }
+    if (!ok) return map_errno ? -map_errno : -ENOMEM;
     if (flags & MAP_ANONYMOUS) {
         c.proc.forget_mappings(at, size);
     } else {
@@ -310,7 +505,14 @@ std::int32_t sys_mmap2(Ctx& c) {
                                    n > 0 ? std::string(target, static_cast<std::size_t>(n)) : std::string("fd"));
         if (textrel) c.proc.add_textrel_range(at, static_cast<std::uint32_t>(size));
     }
-    c.proc.invalidate(at, static_cast<std::uint32_t>(size));
+    if (had_exec || (effective_prot & PROT_EXEC)) {
+        c.proc.invalidate(at, size);
+    }
+    if (!(flags & MAP_ANONYMOUS) && size >= (256u << 10) && size <= (64u << 20) &&
+        ((effective_prot & PROT_EXEC) != 0 || ((effective_prot & PROT_WRITE) == 0 && size >= (1u << 20)))) {
+        (void)::madvise(c.mem.base() + at, size, MADV_WILLNEED);
+    }
+    record_guest_mmap(size);
     return static_cast<std::int32_t>(at);
 }
 
@@ -348,15 +550,18 @@ std::int32_t sys_mremap(Ctx& c) {
         if (new_size < old_size) {
             const std::uint32_t tail = old_addr + static_cast<std::uint32_t>(new_size);
             const std::uint64_t cut = old_size - new_size;
+            const bool had_exec = c.mem.any_flag(tail, cut, kPageExec);
             if (!c.mem.unmap(tail, cut)) return -EINVAL;
             c.proc.forget_mappings(tail, cut);
-            c.proc.invalidate(tail, static_cast<std::uint32_t>(cut));
+            if (had_exec) c.proc.invalidate(tail, cut);
         }
+        record_guest_mremap();
         return static_cast<std::int32_t>(old_addr);
     }
-    if (!fixed && old_addr + new_size <= kGuestSpaceSize &&
+    if (!fixed && static_cast<std::uint64_t>(old_addr) + new_size <= kGuestSpaceSize &&
         c.mem.range_free(old_addr + static_cast<std::uint32_t>(old_size), new_size - old_size) &&
         c.mem.map_anon(old_addr + static_cast<std::uint32_t>(old_size), new_size - old_size, prot)) {
+        record_guest_mremap();
         return static_cast<std::int32_t>(old_addr);
     }
     if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
@@ -373,24 +578,50 @@ std::int32_t sys_mremap(Ctx& c) {
         at = c.mem.find_free(new_size, c.proc.mmap_limit);
         if (at == 0) return -ENOMEM;
     }
-    // Mapped writable for the copy, then given the protection the old range had.
+    // Mapped writable for the copy, then given the original per-page protections.
     if (!c.mem.map_anon(at, new_size, PROT_READ | PROT_WRITE)) return -ENOMEM;
     const std::uint64_t copied = std::min(old_size, new_size);
-    const std::uint8_t* from = c.mem.host_ptr(old_addr, copied, kPageMapped);
-    std::uint8_t* to = c.mem.host_ptr(at, copied, kPageMapped);
-    if (from == nullptr || to == nullptr) {
-        c.mem.unmap(at, new_size);
-        return -EFAULT;
+    bool any_non_rw = prot != (PROT_READ | PROT_WRITE);
+    for (std::uint64_t off = 0; off < copied; off += kPageSize) {
+        const std::uint32_t src_page = old_addr + static_cast<std::uint32_t>(off);
+        const std::uint32_t dst_page = at + static_cast<std::uint32_t>(off);
+        const std::uint8_t flags_byte = c.mem.page_flags(src_page);
+        const int page_prot = prot_of_flags(flags_byte);
+        if (page_prot != (PROT_READ | PROT_WRITE)) any_non_rw = true;
+        if ((flags_byte & (kPageRead | kPageExec | kPageWrite)) == 0) {
+            // PROT_NONE page: skip reading host memory so we never SIGSEGV.
+            continue;
+        }
+        const std::uint8_t* from = c.mem.host_ptr(src_page, kPageSize, 0);
+        std::uint8_t* to = c.mem.host_ptr(dst_page, kPageSize, kPageWrite);
+        if (from == nullptr || to == nullptr) {
+            c.mem.unmap(at, new_size);
+            return -EFAULT;
+        }
+        std::memcpy(to, from, kPageSize);
     }
-    std::memcpy(to, from, copied);
-    if (prot != (PROT_READ | PROT_WRITE) && !c.mem.protect(at, new_size, prot)) {
-        c.mem.unmap(at, new_size);
-        return -EACCES;
+    if (any_non_rw) {
+        for (std::uint64_t off = 0; off < new_size; off += kPageSize) {
+            const int target_prot =
+                off < copied ? prot_of_flags(c.mem.page_flags(old_addr + static_cast<std::uint32_t>(off))) : prot;
+            if (target_prot != (PROT_READ | PROT_WRITE) &&
+                !c.mem.protect(at + static_cast<std::uint32_t>(off), kPageSize, target_prot)) {
+                c.mem.unmap(at, new_size);
+                return -EACCES;
+            }
+        }
     }
-    if (!c.mem.unmap(old_addr, old_size)) return -EINVAL;
+    const bool had_exec = c.mem.any_flag(old_addr, old_size, kPageExec) || (prot & PROT_EXEC) != 0;
+    if (!c.mem.unmap(old_addr, old_size)) {
+        c.mem.unmap(at, new_size);
+        return -EINVAL;
+    }
     c.proc.forget_mappings(old_addr, old_size);
-    c.proc.invalidate(old_addr, static_cast<std::uint32_t>(old_size));
-    c.proc.invalidate(at, static_cast<std::uint32_t>(new_size));
+    if (had_exec) {
+        c.proc.invalidate(old_addr, old_size);
+        c.proc.invalidate(at, new_size);
+    }
+    record_guest_mremap();
     return static_cast<std::int32_t>(at);
 }
 
@@ -399,9 +630,11 @@ std::int32_t sys_munmap(Ctx& c) {
     if ((addr & kPageMask) || c.a[1] == 0) return -EINVAL;
     const std::uint64_t size = page_round_up(c.a[1]);
     if (static_cast<std::uint64_t>(addr) + size > kGuestSpaceSize) return -EINVAL;
+    const bool had_exec = c.mem.any_flag(addr, size, kPageExec);
     if (!c.mem.unmap(addr, size)) return -EINVAL;
     c.proc.forget_mappings(addr, size);
-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+    if (had_exec) c.proc.invalidate(addr, size);
+    record_guest_munmap(size);
     return 0;
 }
 
@@ -413,8 +646,9 @@ std::int32_t sys_mprotect(Ctx& c) {
     if (!c.mem.accessible(addr, size, 0)) return -ENOMEM;
     int prot = static_cast<int>(c.a[2]);
     if ((prot & PROT_EXEC) && c.proc.overlaps_textrel_range(addr, size)) prot |= PROT_WRITE;
+    const bool had_exec = c.mem.any_flag(addr, size, kPageExec);
     if (!c.mem.protect(addr, size, prot)) return -EACCES;
-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+    if (had_exec || (prot & PROT_EXEC)) c.proc.invalidate(addr, size);
     return 0;
 }
 
@@ -424,7 +658,10 @@ std::int32_t sys_madvise(Ctx& c) {
     if (c.a[1] == 0) return 0;
     const std::uint64_t size = page_round_up(c.a[1]);
     if (!c.mem.accessible(addr, size, 0)) return -ENOMEM;
-    return result_of(::madvise(c.mem.base() + addr, size, static_cast<int>(c.a[2])));
+    const int advice = static_cast<int>(c.a[2]);
+    const std::int32_t res = result_of(::madvise(c.mem.base() + addr, size, advice));
+    if (res == 0 && advice == MADV_DONTNEED) record_guest_madvise_dontneed(size);
+    return res;
 }
 
 std::int32_t sys_rt_sigaction(Ctx& c) {
@@ -500,7 +737,7 @@ std::int32_t sys_send_signal(Ctx& c, bool process_directed, std::int32_t tgid, s
             if (c.proc.first_time(kSeenSignal | sig)) log("signal %u to another process refused", sig);
             return -EPERM;
         }
-        if (sig != 0) c.thread.post_signal(info);
+        if (sig != 0) c.proc.post_process_signal(c.thread, info);
         return 0;
     }
     if (tgid != -1 && tgid != pid) return -ESRCH;
@@ -541,6 +778,27 @@ std::int32_t sys_clock_get(Ctx& c, bool res, bool time64) {
     timespec ts;
     const clockid_t clk = static_cast<clockid_t>(static_cast<std::int32_t>(c.a[0]));
     if ((res ? ::clock_getres(clk, &ts) : ::clock_gettime(clk, &ts)) != 0) return -errno;
+    if (!res) {
+        // Unity's frame clock (Time.deltaTime, coroutine deadlines, WaitForSeconds) comes from
+        // this call. A guest whose time source is frozen renders steadily while every
+        // time-driven script stalls, which is indistinguishable from a hung game on screen.
+        // Sample sparsely: the count proves the call is on the frame path, and the guest value
+        // is compared against the host's monotonic clock (same origin on Linux) to prove it
+        // advances at the same rate.
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t n = calls.fetch_add(1, std::memory_order_relaxed);
+        if (n < 3 || (n & 65535u) == 0) {
+            const auto host = std::chrono::steady_clock::now().time_since_epoch();
+            const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(host).count();
+            char line[160];
+            std::snprintf(line, sizeof line, "n=%llu clk=%d guest=%lld.%09ld host=%lld.%09lld",
+                          static_cast<unsigned long long>(n), static_cast<int>(clk),
+                          static_cast<long long>(ts.tv_sec), static_cast<long>(ts.tv_nsec),
+                          static_cast<long long>(host_ns / 1000000000),
+                          static_cast<long long>(host_ns % 1000000000));
+            runtime_report().note_watch_detail("clock-" + std::to_string(n < 3 ? n : 3), line);
+        }
+    }
     if (c.a[1] == 0) return 0;
     return write_timespec(c.mem, c.a[1], time64, ts) ? 0 : -EFAULT;
 }
@@ -562,26 +820,47 @@ std::int32_t sys_clock_nanosleep(Ctx& c, bool time64) {
     timespec rem{};
     if (!read_timespec(c.mem, c.a[2], time64, req)) return -EFAULT;
     const clockid_t clk = static_cast<clockid_t>(static_cast<std::int32_t>(c.a[0]));
-    const int rc = ::clock_nanosleep(clk, static_cast<int>(c.a[1]), &req, &rem);
-    if (rc == EINTR && c.a[3] != 0) write_timespec(c.mem, c.a[3], time64, rem);
-    return -rc;
+    const int flags = static_cast<int>(c.a[1]);
+    BlockingSection blocking(c.thread);
+    for (;;) {
+        if (has_deliverable_signal(c.thread)) return -EINTR;
+        const int rc = ::clock_nanosleep(clk, flags, &req, &rem);
+        if (rc != EINTR) return -rc;
+        if (has_deliverable_signal(c.thread)) {
+            if (c.a[3] != 0 && (flags & TIMER_ABSTIME) == 0) write_timespec(c.mem, c.a[3], time64, rem);
+            return -EINTR;
+        }
+        if ((flags & TIMER_ABSTIME) == 0) req = rem;
+    }
 }
 
 std::int32_t sys_nanosleep(Ctx& c) {
     timespec req;
     timespec rem{};
     if (!read_timespec(c.mem, c.a[0], false, req)) return -EFAULT;
-    if (::nanosleep(&req, &rem) == 0) return 0;
-    const int err = errno;
-    if (err == EINTR && c.a[1] != 0) write_timespec(c.mem, c.a[1], false, rem);
-    return -err;
+    BlockingSection blocking(c.thread);
+    for (;;) {
+        if (has_deliverable_signal(c.thread)) return -EINTR;
+        if (::nanosleep(&req, &rem) == 0) return 0;
+        const int err = errno;
+        if (err != EINTR) return -err;
+        if (has_deliverable_signal(c.thread)) {
+            if (c.a[1] != 0) write_timespec(c.mem, c.a[1], false, rem);
+            return -EINTR;
+        }
+        req = rem;
+    }
 }
 
-std::int32_t sys_stat_common(Ctx& c, int rc, const struct stat& st, std::uint32_t out_addr) {
+std::int32_t sys_stat_raw(GuestMemory& mem, int rc, const struct stat& st, std::uint32_t out_addr) {
     if (rc != 0) return -errno;
     g::stat64 out;
     fill_stat64(out, st);
-    return write_guest(c.mem, out_addr, out) ? 0 : -EFAULT;
+    return write_guest(mem, out_addr, out) ? 0 : -EFAULT;
+}
+
+std::int32_t sys_stat_common(Ctx& c, int rc, const struct stat& st, std::uint32_t out_addr) {
+    return sys_stat_raw(c.mem, rc, st, out_addr);
 }
 
 std::int32_t sys_statfs_common(Ctx& c, int rc, const struct statfs& st, std::uint32_t out_addr) {
@@ -639,16 +918,70 @@ std::int32_t sys_fcntl64(Ctx& c) {
     const int cmd = static_cast<int>(c.a[1]);
     switch (cmd) {
     case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        const std::int32_t res =
+            result_of(::fcntl(static_cast<int>(c.a[0]), cmd, static_cast<long>(c.a[2])));
+        if (res >= 0) guest_io_note_dup(static_cast<int>(c.a[0]), res);
+        return res;
+    }
     case F_GETFD:
     case F_SETFD:
     case F_GETFL:
     case F_SETFL:
-    case F_DUPFD_CLOEXEC:
         return result_of(::fcntl(static_cast<int>(c.a[0]), cmd, static_cast<long>(c.a[2])));
     default:
         if (c.proc.first_time(kSeenFcntl | static_cast<std::uint32_t>(cmd))) log("unsupported fcntl command %d", cmd);
         return -EINVAL;
     }
+}
+
+cpu_set_t capture_initial_cpuset() {
+    cpu_set_t s;
+    CPU_ZERO(&s);
+    if (::sched_getaffinity(0, sizeof(s), &s) == 0 && CPU_COUNT(&s) > 0) return s;
+    const long n = ::sysconf(_SC_NPROCESSORS_CONF);
+    for (long i = 0; i < n && i < CPU_SETSIZE; ++i) CPU_SET(static_cast<int>(i), &s);
+    return s;
+}
+
+const cpu_set_t kInitialCpuSet = capture_initial_cpuset();
+const int kInitialCpuCount = CPU_COUNT(&kInitialCpuSet);
+
+bool affinity_rebalance_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ZB_REBALANCE_AFFINITY");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+bool is_rebalance_worker_name(const char* name) {
+    return std::strncmp(name, "Job.Worker", 10) == 0 ||
+           std::strncmp(name, "UnityChoreograp", 15) == 0;
+}
+
+bool should_widen_big_only_mask(const cpu_set_t& req) {
+    const int req_count = CPU_COUNT(&req);
+    return kInitialCpuCount > 1 && req_count > 0 && req_count < kInitialCpuCount &&
+           !CPU_ISSET(0, &req);
+}
+
+bool target_thread_should_rebalance(pid_t target_tid) {
+    char label[17]{};
+    if (target_tid == 0) {
+        if (::prctl(PR_GET_NAME, label, 0, 0, 0) != 0) return false;
+    } else {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", static_cast<int>(target_tid));
+        const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        ssize_t n = ::read(fd, label, 16);
+        ::close(fd);
+        if (n <= 0) return false;
+        while (n > 0 && (label[n - 1] == '\n' || label[n - 1] == '\r')) --n;
+        label[n] = '\0';
+    }
+    return is_rebalance_worker_name(label);
 }
 
 std::int32_t sys_prctl(Ctx& c) {
@@ -666,7 +999,25 @@ std::int32_t sys_prctl(Ctx& c) {
     case PR_GET_NAME: {
         std::uint8_t* name = c.mem.host_ptr(c.a[1], 16, option == PR_SET_NAME ? kPageRead : kPageWrite);
         if (!name) return -EFAULT;
-        return result_of(::prctl(option, name, 0, 0, 0));
+        const std::int32_t rc = result_of(::prctl(option, name, 0, 0, 0));
+        if (option == PR_SET_NAME && rc == 0) {
+            char label[17];
+            std::memcpy(label, name, 16);
+            label[16] = '\0';
+            if (std::strncmp(label, "FMOD", 4) == 0 || std::strncmp(label, "Audio", 5) == 0) {
+                register_tuned_thread(c.thread.tid, CpuRole::AudioThread);
+                (void)::setpriority(PRIO_PROCESS, 0, -20);
+            } else if (affinity_rebalance_enabled() && is_rebalance_worker_name(label)) {
+                cpu_set_t cur;
+                CPU_ZERO(&cur);
+                if (::sched_getaffinity(0, sizeof(cur), &cur) == 0 &&
+                    should_widen_big_only_mask(cur)) {
+                    (void)::syscall(SYS_sched_setaffinity, 0, sizeof(kInitialCpuSet),
+                                    &kInitialCpuSet);
+                }
+            }
+        }
+        return rc;
     }
     default:
         if (c.proc.first_time(kSeenPrctl | static_cast<std::uint32_t>(option))) log("unsupported prctl option %d", option);
@@ -681,11 +1032,20 @@ std::int32_t sys_uname(Ctx& c) {
     return write_guest(c.mem, c.a[0], u) ? 0 : -EFAULT;
 }
 
+bool futex_telemetry_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ZB_FUTEX_TRACE");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 std::int32_t sys_futex(Ctx& c, bool time64) {
     const int op = static_cast<int>(c.a[1]);
     const int cmd = op & FUTEX_CMD_MASK;
     std::uint8_t* uaddr = c.mem.host_ptr(c.a[0], 4, kPageRead);
     if (!uaddr) return -EFAULT;
+    const bool trace_futex = futex_telemetry_enabled();
     switch (cmd) {
     case FUTEX_WAIT:
     case FUTEX_WAIT_BITSET: {
@@ -700,7 +1060,20 @@ std::int32_t sys_futex(Ctx& c, bool time64) {
             // Ordered against post_signal(): the flag above is set before this check, and a poster
             // sets the pending bit before it reads the flag, so a signal is never missed here.
             if (has_deliverable_signal(c.thread)) return -EINTR;
+            if (trace_futex) {
+                // Futex census: opt-in via ZB_FUTEX_TRACE=1 so normal frames avoid futex_mutex_ contention.
+                thread_local std::uint64_t t_fallback_tid = 0;
+                std::uint64_t report_tid = static_cast<std::uint64_t>(c.thread.tid);
+                if (report_tid == 0) {
+                    if (t_fallback_tid == 0) t_fallback_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+                    report_tid = t_fallback_tid;
+                }
+                runtime_report().note_futex_wait(c.a[0], c.a[2], report_tid);
+            }
             const std::int32_t res = result_of(::syscall(SYS_futex, uaddr, op, c.a[2], tsp, nullptr, c.a[5]));
+            if (trace_futex) {
+                runtime_report().note_futex_returned(c.a[0], res);
+            }
             if (res != -EINTR) return res;
             if (has_deliverable_signal(c.thread)) return -EINTR;
             // Interrupted by our own wakeup with nothing to deliver: wait again. A timed wait
@@ -708,8 +1081,17 @@ std::int32_t sys_futex(Ctx& c, bool time64) {
         }
     }
     case FUTEX_WAKE:
-    case FUTEX_WAKE_BITSET:
-        return result_of(::syscall(SYS_futex, uaddr, op, c.a[2], nullptr, nullptr, c.a[5]));
+    case FUTEX_WAKE_BITSET: {
+        const std::int32_t res =
+            result_of(::syscall(SYS_futex, uaddr, op, c.a[2], nullptr, nullptr, c.a[5]));
+        if (trace_futex) {
+            // A wake that reports nothing woken on a word that still has parked waiters is the
+            // lost-wakeup signature this census exists to catch.
+            runtime_report().note_futex_wake(c.a[0], res);
+        }
+        return res;
+    }
+
     default:
         if (c.proc.first_time(kSeenFutex | static_cast<std::uint32_t>(cmd))) log("unsupported futex command %d", cmd);
         return -ENOSYS;
@@ -731,18 +1113,48 @@ std::int32_t sys_prlimit64(Ctx& c) {
     return result_of(::syscall(SYS_prlimit64, static_cast<pid_t>(c.a[0]), static_cast<int>(c.a[1]), new_limit, old_limit));
 }
 
+std::int32_t sys_llseek_raw(GuestMemory& mem, int fd, std::int64_t offset,
+                            std::uint32_t result_addr, int whence) {
+    const bool is_obb = guest_io_is_obb_fd(fd);
+    if (const auto cached = guest_io_apk_lseek(fd, offset, whence, false)) {
+        if (is_obb) guest_io_note_obb_io(fd, ObbIoOp::kLlseek, static_cast<std::uint64_t>(offset), static_cast<std::size_t>(whence), *cached);
+        if (*cached < 0) return static_cast<std::int32_t>(*cached);
+        return write_guest(mem, result_addr, *cached) ? 0 : -EFAULT;
+    }
+    const off_t r = ::lseek(fd, static_cast<off_t>(offset), whence);
+    const int err = errno;
+    if (is_obb) {
+        guest_io_note_obb_io(fd, ObbIoOp::kLlseek, static_cast<std::uint64_t>(offset),
+                             static_cast<std::size_t>(whence),
+                             r == -1 ? -err : static_cast<std::int64_t>(r));
+    }
+    if (r == -1) return -err;
+    return write_guest(mem, result_addr, static_cast<std::int64_t>(r)) ? 0 : -EFAULT;
+}
+
 std::int32_t sys_llseek(Ctx& c) {
-    const off_t offset = static_cast<off_t>((static_cast<std::uint64_t>(c.a[1]) << 32) | c.a[2]);
-    const off_t r = ::lseek(static_cast<int>(c.a[0]), offset, static_cast<int>(c.a[4]));
-    if (r == -1) return -errno;
-    return write_guest(c.mem, c.a[3], static_cast<std::int64_t>(r)) ? 0 : -EFAULT;
+    const auto offset = static_cast<std::int64_t>((static_cast<std::uint64_t>(c.a[1]) << 32) | c.a[2]);
+    return sys_llseek_raw(c.mem, static_cast<int>(c.a[0]), offset, c.a[3], static_cast<int>(c.a[4]));
+}
+
+std::int32_t sys_lseek_raw(int fd, std::int64_t offset, int whence) {
+    const bool is_obb = guest_io_is_obb_fd(fd);
+    if (const auto cached = guest_io_apk_lseek(fd, offset, whence, true)) {
+        if (is_obb) guest_io_note_obb_io(fd, ObbIoOp::kLseek, static_cast<std::uint64_t>(offset), static_cast<std::size_t>(whence), *cached);
+        return static_cast<std::int32_t>(*cached);
+    }
+    const off_t r = ::lseek(fd, static_cast<off_t>(offset), whence);
+    const int err = errno;
+    const std::int64_t res = (r == -1) ? -err : (r > INT32_MAX ? -EOVERFLOW : static_cast<std::int64_t>(r));
+    if (is_obb) {
+        guest_io_note_obb_io(fd, ObbIoOp::kLseek, static_cast<std::uint64_t>(offset),
+                             static_cast<std::size_t>(whence), res);
+    }
+    return static_cast<std::int32_t>(res);
 }
 
 std::int32_t sys_lseek(Ctx& c) {
-    const off_t r = ::lseek(static_cast<int>(c.a[0]), static_cast<std::int32_t>(c.a[1]), static_cast<int>(c.a[2]));
-    if (r == -1) return -errno;
-    if (r > INT32_MAX) return -EOVERFLOW;
-    return static_cast<std::int32_t>(r);
+    return sys_lseek_raw(static_cast<int>(c.a[0]), static_cast<std::int32_t>(c.a[1]), static_cast<int>(c.a[2]));
 }
 
 std::int32_t sys_pipe2(Ctx& c) {
@@ -777,7 +1189,11 @@ std::int32_t sys_poll(Ctx& c, bool ppoll, bool time64) {
     if (nfds > 65536) return -EINVAL;
     std::uint8_t* fds = c.mem.host_ptr(c.a[0], static_cast<std::uint64_t>(nfds) * sizeof(pollfd), kPageRead | kPageWrite);
     if (nfds != 0 && fds == nullptr) return -EFAULT;
-    if (!ppoll) return result_of(::poll(reinterpret_cast<pollfd*>(fds), nfds, static_cast<int>(c.a[2])));
+    if (!ppoll) {
+        return run_blocking(c.thread, [&] {
+            return result_of(::poll(reinterpret_cast<pollfd*>(fds), nfds, static_cast<int>(c.a[2])));
+        });
+    }
     timespec ts;
     timespec* tsp = nullptr;
     if (c.a[2] != 0) {
@@ -785,7 +1201,9 @@ std::int32_t sys_poll(Ctx& c, bool ppoll, bool time64) {
         tsp = &ts;
     }
     // The guest signal mask is emulated; a host mask would affect the wrong signals.
-    return result_of(::ppoll(reinterpret_cast<pollfd*>(fds), nfds, tsp, nullptr));
+    return run_blocking(c.thread, [&] {
+        return result_of(::ppoll(reinterpret_cast<pollfd*>(fds), nfds, tsp, nullptr));
+    });
 }
 
 fd_set* guest_fd_set(GuestMemory& m, std::uint32_t addr, bool& fault) {
@@ -814,8 +1232,10 @@ std::int32_t sys_select(Ctx& c, bool pselect, bool time64) {
             tv.tv_usec = t.tv_usec;
             tvp = &tv;
         }
-        const int res = ::select(nfds, r, w, e, tvp);
-        if (res < 0) return -errno;
+        const std::int32_t res = run_blocking(c.thread, [&] {
+            return result_of(::select(nfds, r, w, e, tvp));
+        });
+        if (res < 0) return res;
         if (tvp != nullptr) {
             write_guest(c.mem, c.a[4], g::timeval32{static_cast<std::int32_t>(tv.tv_sec), static_cast<std::int32_t>(tv.tv_usec)});
         }
@@ -827,7 +1247,9 @@ std::int32_t sys_select(Ctx& c, bool pselect, bool time64) {
         if (!read_timespec(c.mem, c.a[4], time64, ts)) return -EFAULT;
         tsp = &ts;
     }
-    return result_of(::pselect(nfds, r, w, e, tsp, nullptr));
+    return run_blocking(c.thread, [&] {
+        return result_of(::pselect(nfds, r, w, e, tsp, nullptr));
+    });
 }
 
 std::int32_t sys_sockaddr_in(Ctx& c, long host_nr) {
@@ -840,26 +1262,44 @@ std::int32_t sys_sockaddr_in(Ctx& c, long host_nr) {
 std::int32_t sys_sockaddr_out(Ctx& c, long host_nr, bool with_flags) {
     std::uint8_t* addr = nullptr;
     std::uint8_t* len = nullptr;
+    socklen_t local_len = 0;
+    socklen_t* len_ptr = nullptr;
     if (c.a[2] != 0) {
         len = c.mem.host_ptr(c.a[2], 4, kPageRead | kPageWrite);
         if (len == nullptr) return -EFAULT;
-        std::uint32_t capacity;
+        std::uint32_t capacity = 0;
         std::memcpy(&capacity, len, 4);
         if (c.a[1] != 0) {
             addr = c.mem.host_ptr(c.a[1], capacity, kPageWrite);
             if (capacity != 0 && addr == nullptr) return -EFAULT;
         }
+        local_len = capacity;
+        len_ptr = &local_len;
     }
-    if (with_flags) return result_of(::syscall(host_nr, static_cast<int>(c.a[0]), addr, len, static_cast<int>(c.a[3])));
-    return result_of(::syscall(host_nr, static_cast<int>(c.a[0]), addr, len));
+    const bool may_block = host_nr == SYS_accept || host_nr == SYS_accept4;
+    const auto invoke = [&] {
+        if (with_flags) {
+            return result_of(::syscall(host_nr, static_cast<int>(c.a[0]), addr, len_ptr, static_cast<int>(c.a[3])));
+        }
+        return result_of(::syscall(host_nr, static_cast<int>(c.a[0]), addr, len_ptr));
+    };
+    const std::int32_t res = may_block ? run_blocking(c.thread, invoke) : invoke();
+    if (res >= 0 && len != nullptr) {
+        const std::uint32_t written = static_cast<std::uint32_t>(local_len);
+        write_guest(c.mem, c.a[2], written);
+    }
+    return res;
 }
 
 std::int32_t sys_sendto(Ctx& c, std::uint32_t dest, std::uint32_t dest_len) {
     std::uint8_t* buf = c.mem.host_ptr(c.a[1], c.a[2], kPageRead);
     std::uint8_t* to = dest != 0 ? c.mem.host_ptr(dest, dest_len, kPageRead) : nullptr;
     if ((c.a[2] != 0 && buf == nullptr) || (dest != 0 && to == nullptr)) return -EFAULT;
-    return result_of(::syscall(SYS_sendto, static_cast<int>(c.a[0]), buf, c.a[2], static_cast<int>(c.a[3]), to,
-                               dest != 0 ? dest_len : 0));
+    guest_log_note_write(static_cast<int>(c.a[0]), buf, c.a[2]);
+    return run_blocking(c.thread, [&] {
+        return result_of(::syscall(SYS_sendto, static_cast<int>(c.a[0]), buf, c.a[2], static_cast<int>(c.a[3]), to,
+                                   dest != 0 ? dest_len : 0));
+    });
 }
 
 std::int32_t sys_recvfrom(Ctx& c, std::uint32_t src, std::uint32_t src_len_addr) {
@@ -867,17 +1307,29 @@ std::int32_t sys_recvfrom(Ctx& c, std::uint32_t src, std::uint32_t src_len_addr)
     if (c.a[2] != 0 && buf == nullptr) return -EFAULT;
     std::uint8_t* from = nullptr;
     std::uint8_t* from_len = nullptr;
+    socklen_t local_len = 0;
+    socklen_t* len_ptr = nullptr;
     if (src_len_addr != 0) {
         from_len = c.mem.host_ptr(src_len_addr, 4, kPageRead | kPageWrite);
         if (from_len == nullptr) return -EFAULT;
-        std::uint32_t capacity;
+        std::uint32_t capacity = 0;
         std::memcpy(&capacity, from_len, 4);
         if (src != 0) {
             from = c.mem.host_ptr(src, capacity, kPageWrite);
             if (capacity != 0 && from == nullptr) return -EFAULT;
         }
+        local_len = capacity;
+        len_ptr = &local_len;
     }
-    return result_of(::syscall(SYS_recvfrom, static_cast<int>(c.a[0]), buf, c.a[2], static_cast<int>(c.a[3]), from, from_len));
+    const std::int32_t res = run_blocking(c.thread, [&] {
+        return result_of(::syscall(SYS_recvfrom, static_cast<int>(c.a[0]), buf, c.a[2], static_cast<int>(c.a[3]), from,
+                                   len_ptr));
+    });
+    if (res >= 0 && from_len != nullptr) {
+        const std::uint32_t written = static_cast<std::uint32_t>(local_len);
+        write_guest(c.mem, src_len_addr, written);
+    }
+    return res;
 }
 
 // SO_RCVTIMEO/SO_SNDTIMEO with the old option numbers take a native-width struct timeval.
@@ -923,7 +1375,13 @@ std::int32_t sys_getsockopt(Ctx& c) {
     }
     std::uint8_t* value = c.mem.host_ptr(c.a[3], capacity, kPageWrite);
     if (capacity != 0 && value == nullptr) return -EFAULT;
-    return result_of(::syscall(SYS_getsockopt, static_cast<int>(c.a[0]), level, name, value, len));
+    socklen_t local_len = capacity;
+    const std::int32_t res = result_of(::syscall(SYS_getsockopt, static_cast<int>(c.a[0]), level, name, value, &local_len));
+    if (res >= 0) {
+        const std::uint32_t written = static_cast<std::uint32_t>(local_len);
+        write_guest(c.mem, c.a[4], written);
+    }
+    return res;
 }
 
 struct HostMessage {
@@ -934,6 +1392,10 @@ struct HostMessage {
 
 std::int32_t build_host_message(Ctx& c, const g::msghdr32& gm, bool receiving, HostMessage& out) {
     if (gm.msg_iovlen > IOV_MAX) return -EMSGSIZE;
+    if (static_cast<std::uint64_t>(gm.msg_iov) + static_cast<std::uint64_t>(gm.msg_iovlen) * sizeof(g::iovec32) >
+        kGuestSpaceSize) {
+        return -EFAULT;
+    }
     out.iov.resize(gm.msg_iovlen);
     for (std::uint32_t i = 0; i < gm.msg_iovlen; ++i) {
         g::iovec32 v;
@@ -959,10 +1421,10 @@ bool control_to_host(GuestMemory& m, std::uint32_t addr, std::uint32_t len, std:
     const std::uint8_t* src = m.host_ptr(addr, len, kPageRead);
     if (src == nullptr) return false;
     std::uint32_t offset = 0;
-    while (offset + sizeof(g::cmsghdr32) <= len) {
+    while (len - offset >= sizeof(g::cmsghdr32)) {
         g::cmsghdr32 header;
         std::memcpy(&header, src + offset, sizeof header);
-        if (header.cmsg_len < sizeof header || offset + header.cmsg_len > len) break;
+        if (header.cmsg_len < sizeof header || header.cmsg_len > len - offset) break;
         const std::uint32_t data_len = header.cmsg_len - sizeof header;
         const std::size_t host_offset = out.size();
         out.resize(host_offset + CMSG_SPACE(data_len));
@@ -971,7 +1433,9 @@ bool control_to_host(GuestMemory& m, std::uint32_t addr, std::uint32_t len, std:
         host->cmsg_level = header.cmsg_level;
         host->cmsg_type = header.cmsg_type;
         std::memcpy(CMSG_DATA(host), src + offset + sizeof header, data_len);
-        offset += (header.cmsg_len + 3) & ~3u;
+        const std::uint64_t step = (static_cast<std::uint64_t>(header.cmsg_len) + 3u) & ~3ULL;
+        if (step > len - offset) break;
+        offset += static_cast<std::uint32_t>(step);
     }
     return true;
 }
@@ -1003,7 +1467,9 @@ std::int32_t sys_sendmsg(Ctx& c) {
         hm.msg.msg_control = hm.control.data();
         hm.msg.msg_controllen = hm.control.size();
     }
-    return result_of(::sendmsg(static_cast<int>(c.a[0]), &hm.msg, static_cast<int>(c.a[2])));
+    return run_blocking(c.thread, [&] {
+        return result_of(::sendmsg(static_cast<int>(c.a[0]), &hm.msg, static_cast<int>(c.a[2])));
+    });
 }
 
 std::int32_t sys_recvmsg(Ctx& c) {
@@ -1019,14 +1485,16 @@ std::int32_t sys_recvmsg(Ctx& c) {
         hm.msg.msg_control = hm.control.data();
         hm.msg.msg_controllen = hm.control.size();
     }
-    const ssize_t n = ::recvmsg(static_cast<int>(c.a[0]), &hm.msg, static_cast<int>(c.a[2]));
-    if (n < 0) return -errno;
+    const std::int32_t n = run_blocking(c.thread, [&] {
+        return result_of(::recvmsg(static_cast<int>(c.a[0]), &hm.msg, static_cast<int>(c.a[2])));
+    });
+    if (n < 0) return n;
     int flags = hm.msg.msg_flags;
     gm.msg_controllen = guest_control != nullptr ? control_to_guest(hm.msg, guest_control, gm.msg_controllen, flags) : 0;
     gm.msg_namelen = static_cast<std::uint32_t>(hm.msg.msg_namelen);
     gm.msg_flags = flags;
     write_guest(c.mem, c.a[1], gm);
-    return static_cast<std::int32_t>(n);
+    return n;
 }
 
 std::int32_t sys_epoll_wait(Ctx& c) {
@@ -1035,8 +1503,10 @@ std::int32_t sys_epoll_wait(Ctx& c) {
     std::uint8_t* events = c.mem.host_ptr(c.a[1], static_cast<std::uint64_t>(max_events) * sizeof(epoll_event), kPageWrite);
     if (events == nullptr) return -EFAULT;
     // epoll_pwait's guest signal mask is ignored: guest masks are emulated.
-    return result_of(::epoll_pwait(static_cast<int>(c.a[0]), reinterpret_cast<epoll_event*>(events), max_events,
-                                   static_cast<int>(c.a[3]), nullptr));
+    return run_blocking(c.thread, [&] {
+        return result_of(::epoll_pwait(static_cast<int>(c.a[0]), reinterpret_cast<epoll_event*>(events), max_events,
+                                       static_cast<int>(c.a[3]), nullptr));
+    });
 }
 
 bool read_itimerval(GuestMemory& m, std::uint32_t addr, itimerval& out) {
@@ -1116,7 +1586,9 @@ std::int32_t sys_utimensat(Ctx& c, bool time64) {
     timespec* tp = nullptr;
     if (c.a[2] != 0) {
         const std::uint32_t step = time64 ? sizeof(g::timespec64) : sizeof(g::timespec32);
-        if (!read_timespec(c.mem, c.a[2], time64, times[0]) || !read_timespec(c.mem, c.a[2] + step, time64, times[1])) {
+        if (static_cast<std::uint64_t>(c.a[2]) + 2ULL * step > kGuestSpaceSize ||
+            !read_timespec(c.mem, c.a[2], time64, times[0]) ||
+            !read_timespec(c.mem, c.a[2] + step, time64, times[1])) {
             return -EFAULT;
         }
         tp = times;
@@ -1182,21 +1654,191 @@ bool restartable_syscall(std::uint32_t nr, const std::uint32_t* args) {
     }
 }
 
+bool try_fast_syscall(Process& proc, GuestThread& thread) {
+    if (trace_enabled()) return false;
+    auto& regs = thread.regs();
+    const std::uint32_t nr = regs[7];
+    std::int32_t res = 0;
+    switch (nr) {
+    case NR_clock_gettime:
+    case NR_clock_gettime64: {
+        Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+        res = sys_clock_get(c, false, nr == NR_clock_gettime64);
+        break;
+    }
+    case NR_gettimeofday: {
+        Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+        res = sys_gettimeofday(c);
+        break;
+    }
+    case NR_gettid:
+        res = thread.tid != 0 ? thread.tid : static_cast<std::int32_t>(::syscall(SYS_gettid));
+        break;
+    case NR_getpid:
+        res = result_of(::getpid());
+        break;
+    case NR_getuid32:
+        res = static_cast<std::int32_t>(::getuid());
+        break;
+    case NR_geteuid32:
+        res = static_cast<std::int32_t>(::geteuid());
+        break;
+    case NR_getgid32:
+        res = static_cast<std::int32_t>(::getgid());
+        break;
+    case NR_getegid32:
+        res = static_cast<std::int32_t>(::getegid());
+        break;
+    case NR_fstat64: {
+        const int fd = static_cast<int>(regs[0]);
+        struct stat st {};
+        const int rc = ::fstat(fd, &st);
+        const int err = errno;
+        if (guest_io_is_obb_fd(fd)) {
+            guest_io_note_obb_io(fd, ObbIoOp::kFstat64, 0, 0, rc == 0 ? 0 : -err);
+        }
+        errno = err;
+        res = sys_stat_raw(proc.memory(), rc, st, regs[1]);
+        break;
+    }
+    case NR_fcntl64: {
+        const int cmd = static_cast<int>(regs[1]);
+        if (cmd != F_GETFD && cmd != F_SETFD && cmd != F_GETFL && cmd != F_SETFL) return false;
+        res = result_of(::fcntl(static_cast<int>(regs[0]), cmd, static_cast<long>(regs[2])));
+        break;
+    }
+    case NR_sched_yield:
+        res = result_of(::sched_yield());
+        break;
+    case NR_rt_sigprocmask: {
+        // Unblocking a pending signal must fall back to the slow path so delivery runs at this stop.
+        if (thread.pending_signals() != 0) return false;
+        Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+        res = sys_rt_sigprocmask(c);
+        break;
+    }
+    case NR_futex:
+    case NR_futex_time64: {
+        if (__builtin_expect(futex_telemetry_enabled(), 0)) return false;
+        const int op = static_cast<int>(regs[1]);
+        const int cmd = op & FUTEX_CMD_MASK;
+        if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+            // Fast-fail when *uaddr != expected: kernel would immediately return -EAGAIN
+            // without blocking, so skip JIT exit and syscall overhead.
+            if ((regs[0] & 3u) != 0) return false;
+            std::uint8_t* uaddr = proc.memory().host_ptr(regs[0], 4, kPageRead);
+            if (uaddr == nullptr) {
+                res = -EFAULT;
+                break;
+            }
+            const std::uint32_t cur = __atomic_load_n(reinterpret_cast<const std::uint32_t*>(uaddr), __ATOMIC_ACQUIRE);
+            if (cur != regs[2]) {
+                res = -EAGAIN;
+                break;
+            }
+            return false;
+        }
+        if (cmd != FUTEX_WAKE && cmd != FUTEX_WAKE_BITSET) return false;
+        std::uint8_t* uaddr = proc.memory().host_ptr(regs[0], 4, kPageRead);
+        if (uaddr == nullptr) {
+            res = -EFAULT;
+            break;
+        }
+        res = result_of(::syscall(SYS_futex, uaddr, op, regs[2], nullptr, nullptr, regs[5]));
+        break;
+    }
+    case NR_lseek:
+        res = sys_lseek_raw(static_cast<int>(regs[0]), static_cast<std::int32_t>(regs[1]),
+                            static_cast<int>(regs[2]));
+        break;
+    case NR__llseek:
+        res = sys_llseek_raw(
+            proc.memory(), static_cast<int>(regs[0]),
+            static_cast<std::int64_t>((static_cast<std::uint64_t>(regs[1]) << 32) | regs[2]),
+            regs[3], static_cast<int>(regs[4]));
+        break;
+    case NR_read: {
+        const int fd = static_cast<int>(regs[0]);
+        if (!guest_io_is_cached_fd(fd)) return false;
+        const std::uint32_t len = regs[2];
+        std::uint8_t* buf = proc.memory().host_ptr(regs[1], len, kPageWrite);
+        if (len != 0 && buf == nullptr) {
+            res = -EFAULT;
+            break;
+        }
+        const std::optional<std::int32_t> cached = guest_io_apk_read(fd, buf, len);
+        if (!cached) return false;
+        res = *cached;
+        if (res > 0 && guest_io_note_read(fd, static_cast<std::size_t>(res), false)) {
+            Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+            note_apk_reader(c);
+        }
+        if (guest_io_is_obb_fd(fd) &&
+            guest_io_note_obb_io(fd, ObbIoOp::kRead, 0, len, res)) {
+            Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+            note_obb_reader(c);
+        }
+        break;
+    }
+    case NR_pread64: {
+        const int fd = static_cast<int>(regs[0]);
+        if (!guest_io_is_cached_fd(fd)) return false;
+        const std::uint32_t len = regs[2];
+        std::uint8_t* buf = proc.memory().host_ptr(regs[1], len, kPageWrite);
+        if (len != 0 && buf == nullptr) {
+            res = -EFAULT;
+            break;
+        }
+        const off_t offset = static_cast<off_t>(
+            static_cast<std::uint64_t>(regs[4]) | (static_cast<std::uint64_t>(regs[5]) << 32));
+        const std::optional<std::int32_t> cached = guest_io_apk_pread(fd, buf, len, offset);
+        if (!cached) return false;
+        res = *cached;
+        guest_io_note_pread64(fd, static_cast<std::int64_t>(offset), len, res, true);
+        if (res > 0 && guest_io_note_read(fd, static_cast<std::size_t>(res), true)) {
+            Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+            note_apk_reader(c);
+        }
+        if (guest_io_is_obb_fd(fd) &&
+            guest_io_note_obb_io(fd, ObbIoOp::kPread64, static_cast<std::uint64_t>(offset), len, res)) {
+            Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+            note_obb_reader(c);
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+    regs[0] = static_cast<std::uint32_t>(res);
+    return true;
+}
+
 bool handle_syscall(Process& proc, GuestThread& thread) {
     auto& regs = thread.regs();
     Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
     const std::uint32_t nr = regs[7];
     std::int32_t res = -ENOSYS;
+    // Diagnostics attribute work to the executing carrier/host thread; guest-visible tids must
+    // preserve the parked guest thread's own tid (`thread.tid`) so TLS caches stay coherent.
+    const auto diag_tid = [&] {
+        const std::int32_t tid = thread.diagnostic_tid();
+        return tid != 0 ? tid : static_cast<std::int32_t>(::syscall(SYS_gettid));
+    };
     const auto guest_tid = [&] {
         return thread.tid != 0 ? thread.tid : static_cast<std::int32_t>(::syscall(SYS_gettid));
     };
-    record_thread_activity(guest_tid(), ThreadActivityKind::kSyscall, nr);
+    const auto host_target_tid = [&](std::uint32_t raw_pid) -> pid_t {
+        const auto pid = static_cast<std::int32_t>(raw_pid);
+        if (pid == 0) return 0;
+        return pid == guest_tid() ? static_cast<pid_t>(diag_tid()) : static_cast<pid_t>(pid);
+    };
+    record_thread_activity(diag_tid(), ThreadActivityKind::kSyscall, nr);
     // Marks the syscall finished on every exit path, so a thread sitting inside one (a blocking
     // futex, a poll) reads differently from a thread that merely stopped calling out.
     struct ActivityDone {
         std::int32_t tid;
         ~ActivityDone() { record_thread_activity_done(tid); }
-    } activity_done{guest_tid()};
+    } activity_done{diag_tid()};
 
     switch (nr) {
     case NR_exit:
@@ -1206,8 +1848,11 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         return false;
     case NR_exit_group:
         if (trace_enabled()) log("exit_group(%d)", static_cast<int>(c.a[0]));
-        if (proc.thread_count() > 1) std::_Exit(static_cast<int>(c.a[0] & 0xff));
         proc.request_exit(static_cast<int>(c.a[0] & 0xff));
+        if (proc.thread_count() > 1) {
+            std::fflush(stderr);
+            std::_Exit(static_cast<int>(c.a[0] & 0xff));
+        }
         return false;
     case NR_clone: {
         constexpr std::uint32_t kRequired = 0x00000100 | 0x00010000;  // CLONE_VM | CLONE_THREAD
@@ -1217,6 +1862,7 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
             break;
         }
         res = proc.clone_thread(thread, c.a[0], c.a[1], c.a[2], c.a[3], c.a[4]);
+        if (res > 0) record_guest_clone();
         break;
     }
 
@@ -1226,9 +1872,27 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     case NR_pwrite64: res = sys_pread_pwrite(c, true); break;
     case NR_readv: res = sys_readv_writev(c, false); break;
     case NR_writev: res = sys_readv_writev(c, true); break;
-    case NR_close: res = result_of(::close(static_cast<int>(c.a[0]))); break;
-    case NR_dup: res = result_of(::dup(static_cast<int>(c.a[0]))); break;
-    case NR_dup3: res = result_of(::dup3(static_cast<int>(c.a[0]), static_cast<int>(c.a[1]), static_cast<int>(c.a[2]))); break;
+    case NR_close: {
+        const int fd = static_cast<int>(c.a[0]);
+        // Clear fd cache/tracking BEFORE releasing fd to the kernel so a concurrent openat()
+        // reusing the same fd number cannot inherit stale cache state or get wiped afterward.
+        if (fd >= 0) guest_log_note_close(fd);
+        res = result_of(::close(fd));
+        break;
+    }
+    case NR_dup: {
+        const int fd = static_cast<int>(c.a[0]);
+        res = result_of(::dup(fd));
+        if (res >= 0) guest_io_note_dup(fd, res);
+        break;
+    }
+    case NR_dup3: {
+        const int from = static_cast<int>(c.a[0]);
+        const int to = static_cast<int>(c.a[1]);
+        res = result_of(::dup3(from, to, static_cast<int>(c.a[2])));
+        if (res >= 0) guest_io_note_dup(from, res);
+        break;
+    }
     case NR_pipe2: res = sys_pipe2(c); break;
     case NR_lseek: res = sys_lseek(c); break;
     case NR__llseek: res = sys_llseek(c); break;
@@ -1245,7 +1909,23 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         res = sys_path_call(c, 1, [](Ctx& x, const char* p) -> long {
             return ::syscall(SYS_openat, static_cast<int>(x.a[0]), p, static_cast<int>(x.a[2]), static_cast<mode_t>(x.a[3]));
         });
-        if (watched) note_watched_open(guest_path, res);
+        if (watched) {
+            note_watched_open(guest_path, res);
+            if (guest_path != nullptr) {
+                const std::string_view path_sv(guest_path);
+                // The plugin's own APK is how a Unity guest reaches its archive: meter it, so the
+                // report can tell "still reading the archive" from "stopped reading".
+                if (res >= 0 && path_sv.find(".apk") != std::string_view::npos) {
+                    const int open_flags = static_cast<int>(c.a[2]);
+                    const bool read_only =
+                        (open_flags & O_ACCMODE) == O_RDONLY && (open_flags & O_PATH) == 0;
+                    guest_io_note_apk_fd(res, read_only);
+                }
+                if (path_sv.find(".obb") != std::string_view::npos) {
+                    guest_io_note_obb_open(guest_path, res, static_cast<int>(c.a[2]));
+                }
+            }
+        }
         break;
     }
     case NR_faccessat:
@@ -1276,9 +1956,13 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
             break;
         }
         if (std::strcmp(path, "/proc/self/exe") == 0) {
+            if (static_cast<std::int32_t>(c.a[3]) <= 0) {
+                res = -EINVAL;
+                break;
+            }
             const std::string& exe = proc.exe_path();
             const std::size_t n = std::min<std::size_t>(exe.size(), c.a[3]);
-            std::memcpy(buf, exe.data(), n);
+            if (n != 0) std::memcpy(buf, exe.data(), n);
             res = static_cast<std::int32_t>(n);
             break;
         }
@@ -1292,8 +1976,14 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         break;
     }
     case NR_fstat64: {
+        const int fd = static_cast<int>(c.a[0]);
         struct stat st;
-        const int rc = ::fstat(static_cast<int>(c.a[0]), &st);
+        const int rc = ::fstat(fd, &st);
+        const int err = errno;
+        if (guest_io_is_obb_fd(fd)) {
+            guest_io_note_obb_io(fd, ObbIoOp::kFstat64, 0, 0, rc == 0 ? 0 : -err);
+        }
+        errno = err;
         res = sys_stat_common(c, rc, st, c.a[1]);
         break;
     }
@@ -1350,7 +2040,11 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         res = sys_madvise(c);
         break;
     }
-    case NR_mremap: res = sys_mremap(c); break;
+    case NR_mremap: {
+        std::lock_guard<std::mutex> lock(proc.mm_mutex());
+        res = sys_mremap(c);
+        break;
+    }
 
     case NR_ARM_set_tls:
         thread.set_tls(c.a[0]);
@@ -1414,8 +2108,27 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     case NR_futex_time64: res = sys_futex(c, true); break;
     case NR_sched_yield: res = result_of(::sched_yield()); break;
     case NR_sched_getaffinity: {
-        std::uint8_t* mask = c.mem.host_ptr(c.a[2], c.a[1], kPageWrite);
-        res = !mask ? -EFAULT : result_of(::syscall(SYS_sched_getaffinity, static_cast<pid_t>(c.a[0]), c.a[1], mask));
+        const std::uint32_t guest_len = c.a[1];
+        if (guest_len == 0 || (guest_len % 4) != 0) {
+            res = -EINVAL;
+            break;
+        }
+        std::uint8_t* mask = c.mem.host_ptr(c.a[2], guest_len, kPageWrite);
+        if (mask == nullptr) {
+            res = -EFAULT;
+            break;
+        }
+        cpu_set_t host_set;
+        CPU_ZERO(&host_set);
+        const long rc = ::syscall(SYS_sched_getaffinity, host_target_tid(c.a[0]), sizeof(host_set), &host_set);
+        if (rc < 0) {
+            res = -errno;
+            break;
+        }
+        std::memset(mask, 0, guest_len);
+        const std::size_t copy_bytes = std::min<std::size_t>(guest_len, sizeof(host_set));
+        std::memcpy(mask, &host_set, copy_bytes);
+        res = static_cast<std::int32_t>(copy_bytes);
         break;
     }
     case NR_getrandom: {
@@ -1434,7 +2147,48 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         res = static_cast<std::int32_t>(previous);
         break;
     }
-    case NR_sched_getscheduler: res = result_of(::sched_getscheduler(static_cast<pid_t>(c.a[0]))); break;
+    case NR_sched_setparam: {
+        std::int32_t prio = 0;
+        if (!read_guest(c.mem, c.a[1], prio)) {
+            res = -EFAULT;
+        } else {
+            struct sched_param param {};
+            param.sched_priority = prio;
+            res = result_of(::sched_setparam(host_target_tid(c.a[0]), &param));
+        }
+        break;
+    }
+    case NR_sched_getparam: {
+        struct sched_param param {};
+        const int r = ::sched_getparam(host_target_tid(c.a[0]), &param);
+        if (r == -1) {
+            res = -errno;
+        } else {
+            const auto prio = static_cast<std::int32_t>(param.sched_priority);
+            res = write_guest(c.mem, c.a[1], prio) ? 0 : -EFAULT;
+        }
+        break;
+    }
+    case NR_sched_setscheduler: {
+        std::int32_t prio = 0;
+        if (!read_guest(c.mem, c.a[2], prio)) {
+            res = -EFAULT;
+        } else {
+            struct sched_param param {};
+            param.sched_priority = prio;
+            res = result_of(::sched_setscheduler(host_target_tid(c.a[0]), static_cast<int>(c.a[1]), &param));
+        }
+        break;
+    }
+    case NR_sched_getscheduler:
+        res = result_of(::sched_getscheduler(host_target_tid(c.a[0])));
+        break;
+    case NR_sched_get_priority_max:
+        res = result_of(::sched_get_priority_max(static_cast<int>(c.a[0])));
+        break;
+    case NR_sched_get_priority_min:
+        res = result_of(::sched_get_priority_min(static_cast<int>(c.a[0])));
+        break;
     case NR_socket:
         res = result_of(::syscall(SYS_socket, static_cast<int>(c.a[0]), static_cast<int>(c.a[1]), static_cast<int>(c.a[2])));
         break;
@@ -1442,6 +2196,7 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         std::uint8_t* addr = c.mem.host_ptr(c.a[1], c.a[2], kPageRead);
         res = (c.a[2] != 0 && !addr) ? -EFAULT
                                      : result_of(::syscall(SYS_connect, static_cast<int>(c.a[0]), addr, c.a[2]));
+        if (res == 0) guest_log_note_connect(static_cast<int>(c.a[0]), addr, c.a[2]);
         break;
     }
     case NR_rt_tgsigqueueinfo: {
@@ -1516,7 +2271,13 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     case NR_flock: res = result_of(::flock(static_cast<int>(c.a[0]), static_cast<int>(c.a[1]))); break;
     case NR_umask: res = static_cast<std::int32_t>(::umask(static_cast<mode_t>(c.a[0]))); break;
     case NR_fchdir: res = result_of(::fchdir(static_cast<int>(c.a[0]))); break;
-    case NR_dup2: res = result_of(::dup2(static_cast<int>(c.a[0]), static_cast<int>(c.a[1]))); break;
+    case NR_dup2: {
+        const int from = static_cast<int>(c.a[0]);
+        const int to = static_cast<int>(c.a[1]);
+        res = result_of(::dup2(from, to));
+        if (res >= 0) guest_io_note_dup(from, res);
+        break;
+    }
     case NR_pipe: {
         std::uint8_t* out = c.mem.host_ptr(c.a[0], 8, kPageWrite);
         int fds[2];
@@ -1659,9 +2420,11 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     case NR_wait4: {
         int status = 0;
         rusage ru{};
-        const pid_t r = ::wait4(static_cast<pid_t>(c.a[0]), &status, static_cast<int>(c.a[2]), &ru);
+        const std::int32_t r = run_blocking(c.thread, [&] {
+            return result_of(::wait4(static_cast<pid_t>(c.a[0]), &status, static_cast<int>(c.a[2]), &ru));
+        });
         if (r < 0) {
-            res = -errno;
+            res = r;
             break;
         }
         if (c.a[1] != 0 && !write_guest(c.mem, c.a[1], static_cast<std::int32_t>(status))) {
@@ -1677,13 +2440,56 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         break;
     }
     case NR_sysinfo: res = sys_sysinfo(c); break;
-    case NR_getpriority: res = result_of(::syscall(SYS_getpriority, static_cast<int>(c.a[0]), static_cast<int>(c.a[1]))); break;
-    case NR_setpriority:
-        res = result_of(::syscall(SYS_setpriority, static_cast<int>(c.a[0]), static_cast<int>(c.a[1]), static_cast<int>(c.a[2])));
+    case NR_getpriority: {
+        const int which = static_cast<int>(c.a[0]);
+        const int who = which == PRIO_PROCESS ? static_cast<int>(host_target_tid(c.a[1]))
+                                              : static_cast<int>(c.a[1]);
+        res = result_of(::syscall(SYS_getpriority, which, who));
         break;
+    }
+    case NR_setpriority: {
+        const int which = static_cast<int>(c.a[0]);
+        const std::int32_t target_tid = host_target_tid(c.a[1]);
+        const int who = which == PRIO_PROCESS ? static_cast<int>(target_tid)
+                                              : static_cast<int>(c.a[1]);
+        int prio = static_cast<int>(c.a[2]);
+        if (which == PRIO_PROCESS) {
+            if (is_audio_thread_tid(target_tid)) {
+                prio = -20;
+            } else if (prio < -18) {
+                // Leave top nice headroom (-19..-20) so FMOD audio threads preempt heavy render work.
+                prio = -18;
+            }
+        }
+        res = result_of(::syscall(SYS_setpriority, which, who, prio));
+        break;
+    }
     case NR_sched_setaffinity: {
-        std::uint8_t* mask = c.mem.host_ptr(c.a[2], c.a[1], kPageRead);
-        res = !mask ? -EFAULT : result_of(::syscall(SYS_sched_setaffinity, static_cast<pid_t>(c.a[0]), c.a[1], mask));
+        const std::uint32_t guest_len = c.a[1];
+        if (guest_len == 0) {
+            res = -EINVAL;
+            break;
+        }
+        const std::uint8_t* mask = c.mem.host_ptr(c.a[2], guest_len, kPageRead);
+        if (!mask) {
+            res = -EFAULT;
+            break;
+        }
+        cpu_set_t req;
+        CPU_ZERO(&req);
+        const std::size_t copy_bytes = std::min<std::size_t>(guest_len, sizeof(req));
+        std::memcpy(&req, mask, copy_bytes);
+        const pid_t target = host_target_tid(c.a[0]);
+        if (affinity_rebalance_enabled() &&
+            (target == 0 || target == diag_tid() ? target_thread_should_rebalance(0)
+                                                 : target_thread_should_rebalance(target))) {
+            if (should_widen_big_only_mask(req)) {
+                res = result_of(::syscall(SYS_sched_setaffinity, target, sizeof(kInitialCpuSet),
+                                          &kInitialCpuSet));
+                break;
+            }
+        }
+        res = result_of(::syscall(SYS_sched_setaffinity, target, sizeof(req), &req));
         break;
     }
     case NR_getpgid: res = result_of(::getpgid(static_cast<pid_t>(c.a[0]))); break;
@@ -1701,7 +2507,13 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     }
 
     default:
-        if (proc.first_time(nr)) log("unimplemented syscall %s (%u)", syscall_name(nr), nr);
+        if (proc.first_time(nr)) {
+            log("unimplemented syscall %s (%u)", syscall_name(nr), nr);
+            if (nr == NR_preadv || nr == NR_preadv2 || nr == NR_open) {
+                runtime_report().note_io_detail(
+                    "unimpl-io-syscall", std::string(syscall_name(nr)) + "(" + std::to_string(nr) + ")");
+            }
+        }
         res = -ENOSYS;
         break;
     }
@@ -1714,7 +2526,7 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     // bytes where ARM is four.
     thread.syscall_restartable = res == -EINTR && restartable_syscall(nr, c.a);
     if (res == -EINTR) {
-        runtime_report().note_syscall_eintr(nr, syscall_name(nr), guest_tid(),
+        runtime_report().note_syscall_eintr(nr, syscall_name(nr), diag_tid(),
                                             thread.syscall_restartable);
     }
     if (thread.syscall_restartable) {

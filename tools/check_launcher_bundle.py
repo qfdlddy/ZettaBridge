@@ -30,10 +30,16 @@ RUNTIME = {
     "assets/zb/guest/lib/libEGL.so",
     "assets/zb/guest/lib/libandroid.so",
     "assets/zb/guest/lib/libjnigraphics.so",
+    "assets/zb/guest/lib/libOpenSLES.so",
     "assets/zb/host/libzbproxy.so",
     "assets/zb-files.txt",
     "assets/zb-version.txt",
     "jniLibs/arm64-v8a/libzbridge.so",
+}
+
+
+OPTIONAL = {
+    "assets/zb-standalone/libzbridge.so",
 }
 
 
@@ -52,10 +58,11 @@ def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: check_launcher_bundle.py build/launcher")
     root = pathlib.Path(sys.argv[1])
-    actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
-    if actual != RUNTIME:
-        missing = sorted(RUNTIME - actual)
-        extra = sorted(actual - RUNTIME)
+    # Report POSIX-style relative paths on every host, so the check works on Windows too.
+    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+    missing = sorted(RUNTIME - actual)
+    extra = sorted(actual - (RUNTIME | OPTIONAL))
+    if missing or extra:
         raise SystemExit(f"launcher bundle file mismatch; missing={missing}, extra={extra}")
 
     for relative in sorted(SYSROOT):
@@ -66,21 +73,25 @@ def main() -> None:
         "assets/zb/guest/lib/libzbjni.so",
         "assets/zb/guest/lib/libGLESv2.so",
         "assets/zb/guest/lib/libGLESv1_CM.so",
-    "assets/zb/guest/lib/libGLESv1_CM.so",
         "assets/zb/guest/lib/libEGL.so",
         "assets/zb/guest/lib/libandroid.so",
         "assets/zb/guest/lib/libjnigraphics.so",
+        "assets/zb/guest/lib/libOpenSLES.so",
     ]:
         elf(root / relative, 1, 40)
     elf(root / "assets/zb/host/libzbproxy.so", 2, 183)  # ELF64, EM_AARCH64
     elf(root / "jniLibs/arm64-v8a/libzbridge.so", 2, 183)
+    has_standalone = "assets/zb-standalone/libzbridge.so" in actual
+    if has_standalone:
+        elf(root / "assets/zb-standalone/libzbridge.so", 2, 183)
 
     listed = (root / "assets/zb-files.txt").read_text(encoding="utf-8").splitlines()
     expected_list = sorted(path[len("assets/") :] for path in RUNTIME if path.startswith("assets/zb/"))
     if listed != expected_list:
         raise SystemExit("zb-files.txt does not match the runtime assets")
-    if sum(path.stat().st_size for path in root.rglob("*") if path.is_file()) > 8 * 1024 * 1024:
-        raise SystemExit("launcher bundle exceeds 8 MiB")
+    limit = 16 * 1024 * 1024 if has_standalone else 8 * 1024 * 1024
+    if sum(path.stat().st_size for path in root.rglob("*") if path.is_file()) > limit:
+        raise SystemExit(f"launcher bundle exceeds {limit // (1024 * 1024)} MiB")
     print("launcher bundle PASS")
 
 

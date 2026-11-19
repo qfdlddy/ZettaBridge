@@ -21,6 +21,8 @@ void dispatch_native(std::uint32_t slot, NativeRegs& regs) {
     const NativeTarget* target = jni != nullptr ? jni->slots.target(slot) : nullptr;
     if (target == nullptr) {
         log("native thunk slot %u has no target", slot);
+        runtime_report().note_jni_detail("fatal", "native thunk slot " + std::to_string(slot) + " has no target", true);
+        runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
         std::abort();
     }
     const char return_type = target->shorty[0];
@@ -34,7 +36,8 @@ void dispatch_native(std::uint32_t slot, NativeRegs& regs) {
         // The frame could not be opened because a Java exception is pending; ART throws it when
         // the native method returns. Any other failure cannot be reported to Java.
         if (!jni->backend.exception_check(regs.x[0])) {
-            jni->fatal(regs.x[0], "native method in thunk slot %u: the guest call failed", slot);
+            jni->fatal(regs.x[0], "native method %s in thunk slot %u: the guest call failed",
+                       target->label.c_str(), slot);
         }
         regs.x[0] = 0;
         regs.d[0] = 0;
@@ -66,7 +69,10 @@ std::int32_t HostJni::register_native(JniBackend::Env env, JniBackend::Ref cls, 
     if (!shorty) {
         log("RegisterNatives: malformed signature %s for %s", signature, name);
         const JniBackend::Ref error = jni.backend.find_class(env, "java/lang/NoSuchMethodError");
-        if (error != 0) jni.backend.throw_new(env, error, (std::string(name) + signature).c_str());
+        if (error != 0) {
+            jni.backend.throw_new(env, error, (std::string(name) + signature).c_str());
+            jni.backend.delete_local_ref(env, error);
+        }
         return -1;
     }
     // The native-call census (runtime_report.h) counts by "Class.method" when the caller (the
@@ -78,6 +84,11 @@ std::int32_t HostJni::register_native(JniBackend::Env env, JniBackend::Ref cls, 
         jni.slots.allocate(NativeTarget{guest_function, *shorty, is_static, std::move(label), &counter});
     if (slot < 0) {
         log("RegisterNatives: the native thunk pool is exhausted (%s%s)", name, signature);
+        const JniBackend::Ref oom = jni.backend.find_class(env, "java/lang/OutOfMemoryError");
+        if (oom != 0) {
+            jni.backend.throw_new(env, oom, "ZettaBridge native thunk pool exhausted");
+            jni.backend.delete_local_ref(env, oom);
+        }
         return -1;
     }
     const std::int32_t rc =

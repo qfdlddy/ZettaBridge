@@ -10,6 +10,9 @@
 namespace zb {
 
 void log(const char* fmt, ...) {
+#if defined(ZB_NO_TELEMETRY)
+    (void)fmt;
+#else
     va_list ap;
     va_start(ap, fmt);
 #if defined(__ANDROID__)
@@ -22,6 +25,7 @@ void log(const char* fmt, ...) {
     std::vfprintf(stderr, fmt, ap);
     std::fputc('\n', stderr);
     va_end(ap);
+#endif
 }
 
 }  // namespace zb

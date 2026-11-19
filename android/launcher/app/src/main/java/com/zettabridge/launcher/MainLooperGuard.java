@@ -29,10 +29,12 @@ final class MainLooperGuard {
                 try {
                     Looper.loop();
                     return;  // the looper quit
-                } catch (Throwable t) {
-                    if (!swallowed(t)) throw t;
-                    Diagnostics.report(app, "swallowed a Google Play services exception on the main thread", t, false);
-                    Log.w(TAG, "main looper guard: continuing after " + t);
+                } catch (Exception e) {
+                    if (!swallowed(e)) throw e;
+                    if (!BuildConfig.DISABLE_DIAGNOSTICS) {
+                        Diagnostics.report(app, "swallowed a Google Play services exception on the main thread", e, false);
+                        Log.w(TAG, "main looper guard: continuing after " + e);
+                    }
                 }
             }
         });

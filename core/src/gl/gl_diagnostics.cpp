@@ -83,7 +83,14 @@ constexpr GLenum kVertexAttribArrayType = 0x8625;
 constexpr GLenum kVertexAttribArrayNormalized = 0x886A;
 constexpr GLenum kVertexAttribArrayBufferBinding = 0x889F;
 constexpr GLenum kVertexAttribArrayPointer = 0x8645;
+constexpr GLenum kDepthFunc = 0x0B74;
+constexpr GLenum kDepthWritemask = 0x0B72;
 constexpr int kMaxTrackedVertexAttribs = 8;
+
+// Draws at which the whole default framebuffer is read before and after the draw. Chosen to
+// cover the early warm-up draws and the steady-state frame loop.
+constexpr std::uint64_t kOnscreenDiffDraws[] = {10, 100, 500, 1000, 1500, 2000, 2500, 3000};
+constexpr std::size_t kOnscreenDiffCount = sizeof(kOnscreenDiffDraws) / sizeof(kOnscreenDiffDraws[0]);
 
 // Bytes per pixel for GL_UNSIGNED_BYTE uploads of the formats seen in practice. Returns 0 for
 // anything else (compressed, float, or a format this diagnostic does not know), in which case the
@@ -100,6 +107,24 @@ GLint channels_for_format(GLenum format) {
     }
 }
 
+constexpr GLenum kPackAlignment = 0x0D05;
+
+// Diagnostics read directly into host memory, so temporarily unbind any guest GL_PIXEL_PACK_BUFFER
+// (otherwise the driver treats `pixels` as a PBO byte offset and crashes or corrupts GPU memory)
+// and force GL_PACK_ALIGNMENT = 1 so tight host buffers are never overrun.
+void safe_read_pixels(GlBackend& gl, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format,
+                      GLenum type, void* pixels) {
+    GLint prev_pbo = 0;
+    GLint prev_align = 4;
+    gl.glGetIntegerv(kPixelPackBufferBinding, &prev_pbo);
+    gl.glGetIntegerv(kPackAlignment, &prev_align);
+    if (prev_pbo != 0) gl.glBindBuffer(kPixelPackBuffer, 0);
+    if (prev_align != 1) gl.glPixelStorei(kPackAlignment, 1);
+    gl.glReadPixels(x, y, w, h, format, type, pixels);
+    if (prev_align != 1) gl.glPixelStorei(kPackAlignment, prev_align);
+    if (prev_pbo != 0) gl.glBindBuffer(kPixelPackBuffer, static_cast<GLuint>(prev_pbo));
+}
+
 struct Attrib {
     bool set = false;
     GLint size = 0;
@@ -109,12 +134,43 @@ struct Attrib {
 };
 
 // Draw numbers at which the state and a 3x3 pixel grid are sampled after the draw.
-constexpr std::uint64_t kSampleDraws[] = {1, 300, 3000, 30000};
+// Draws are sampled by absolute count. Unity's steady state here is exactly two draws per frame,
+// so an even run of consecutive numbers (3000, 3002, 3004, 3006) samples the same slot of four
+// consecutive frames: identical vertex data across them means the scene's geometry is frozen,
+// while differing positions or UVs prove the game is still rebuilding its UI every frame.
+constexpr std::uint64_t kSampleDraws[] = {1, 300, 3000, 3002, 3004, 3006, 30000};
+
+// Steady-state frame probe: armed at this draw number (past the splash, still early in the run) and
+// then measuring this many consecutive draws.
+constexpr std::uint64_t kLateProbeDraw = 5000;
+constexpr std::uint64_t kLateProbeDraws = 16;
 
 struct State {
     struct BufferSnapshot {
         std::vector<std::uint8_t> bytes;
         std::vector<std::uint8_t> known;
+    };
+
+    // What the bridge knows about one 2D texture object, so "the composite pass samples a texture
+    // that was never written" can be told apart from "it was written and is genuinely black".
+    // Only metadata and counters are kept (no pixels), so this stays cheap for a texture-heavy
+    // guest. A texture is "defined" once glTexImage2D/glCompressedTexImage2D allocated it, and
+    // "written" once any upload carried non-zero bytes.
+    struct TextureSnapshot {
+        GLuint id = 0;
+        bool defined = false;
+        bool written = false;
+        GLint width = 0;
+        GLint height = 0;
+        GLenum internal_format = 0;
+        std::uint64_t uploads = 0;
+        std::uint64_t written_uploads = 0;
+        std::uint64_t bytes_written = 0;
+        std::uint64_t nonzero_written = 0;
+        GLenum last_format = 0;
+        GLenum last_type = 0;
+        std::uint64_t last_tid = 0;
+        bool deleted = false;
     };
 
     std::mutex mutex;
@@ -142,6 +198,45 @@ struct State {
     std::uint64_t clear_samples = 0;
     GLuint bound_framebuffer = 0;
     Attrib attribs[8];
+
+    // Framebuffer traffic in the current frame, so the composite order (scene target -> screen)
+    // can be read from one report line, and every nonzero target can be sampled at swap time.
+    // Without this, "the guest presents black" cannot be split into "the offscreen render is
+    // black" and "the offscreen render never reaches the screen".
+    std::uint64_t fb_binds = 0;
+    std::string fb_trail;
+    std::vector<GLuint> fb_seen;
+
+    // Program object lifecycle. programs_ok/programs_failed count glLinkProgram results; these
+    // count the objects themselves so a bound program id can be checked against them.
+    std::uint64_t programs_created = 0;
+    std::uint64_t programs_deleted = 0;
+    std::uint64_t use_program_zero = 0;
+    std::uint64_t first_nonzero_program = 0;
+
+    // Whole-framebuffer before/after diff of a scheduled onscreen draw (kOnscreenDiffDraws).
+    std::size_t onscreen_diff_index = 0;
+    std::uint64_t onscreen_diff_done = 0;
+    bool onscreen_diff_pending = false;
+    GLint onscreen_diff_viewport[4] = {0, 0, 0, 0};
+    std::vector<std::uint8_t> onscreen_diff_before;
+
+    // Center-pixel probes of offscreen framebuffers, to show whether scene rendering into a
+    // render texture produces any colour at all.
+    std::uint64_t offscreen_probes = 0;
+
+    // Steady-state frame probe. A guest that draws every frame yet presents nothing looks exactly
+    // like a guest that renders correctly, unless each draw is measured: this reads the bound
+    // framebuffer's viewport before and after a short run of draws in a frame that is well past the
+    // splash, so "draws to an offscreen target", "changes no pixels" and "composites black" can be
+    // told apart.
+    bool late_probe_armed = false;
+    std::uint64_t late_probe_draws = 0;
+    bool late_probe_pending = false;
+    GLint late_probe_fb = 0;
+    GLint late_probe_viewport[4] = {0, 0, 0, 0};
+    GLuint late_probe_texture = 0;
+    std::vector<std::uint8_t> late_probe_before;
 
     // Per-glTexSubImage2D detail lines (first 12 calls).
     std::uint64_t texsub_details = 0;
@@ -265,6 +360,13 @@ struct State {
     std::unordered_map<GLuint, BufferSnapshot> buffer_snapshots;
     std::uint64_t buffer_uploads = 0;
 
+    // Bounded per-texture-object accounting (metadata only). Textures beyond kMaxTrackedTextures
+    // share one overflow entry so a texture-heavy guest cannot grow the report without bound.
+    static constexpr std::size_t kMaxTrackedTextures = 64;
+    std::unordered_map<GLuint, TextureSnapshot> textures;
+    TextureSnapshot texture_overflow;
+    std::uint64_t texture_definition_count = 0;
+
     // The GlBackend most recently seen by gl_diagnose/gl_diagnose_before, so gl_diagnose_swap()
     // (called from the EGL side, which has no GlBackend of its own) can issue its own readbacks.
     // Never owned here; it outlives the process the same way HostGl does.
@@ -292,6 +394,36 @@ std::string format(const char* fmt, ...) {
 
 void detail(const char* key, const std::string& value, bool overwrite = false) {
     runtime_report().note_gl_detail(key, value, overwrite);
+}
+
+// The account for one texture id, created on first sight. Never nullptr: once the table is full
+// new ids fold into the overflow entry, which is reported as "overflow" so a missing line is
+// never mistaken for an event that did not happen.
+State::TextureSnapshot& texture_account(State& s, GLuint id) {
+    auto it = s.textures.find(id);
+    if (it != s.textures.end()) return it->second;
+    if (s.textures.size() >= State::kMaxTrackedTextures) {
+        s.texture_overflow.id = 0;
+        return s.texture_overflow;
+    }
+    State::TextureSnapshot snapshot;
+    snapshot.id = id;
+    return s.textures.emplace(id, snapshot).first->second;
+}
+
+std::string texture_text(const State::TextureSnapshot& t) {
+    return format("defined=%d written=%d %dx%d internal=0x%x uploads=%llu written-uploads=%llu "
+                  "bytes=%llu nonzero=%llu format=0x%x type=0x%x tid=%llu",
+                  t.defined ? 1 : 0, t.written ? 1 : 0, t.width, t.height, t.internal_format,
+                  (unsigned long long)t.uploads, (unsigned long long)t.written_uploads,
+                  (unsigned long long)t.bytes_written, (unsigned long long)t.nonzero_written,
+                  t.last_format, t.last_type, (unsigned long long)t.last_tid);
+}
+
+std::string program_objects_text(const State& s) {
+    return format("created=%llu linked-ok=%llu linked-failed=%llu deleted=%llu",
+                  (unsigned long long)s.programs_created, (unsigned long long)s.programs_ok,
+                  (unsigned long long)s.programs_failed, (unsigned long long)s.programs_deleted);
 }
 
 std::uint64_t fnv1a(const std::uint8_t* bytes, std::uint64_t length) {
@@ -406,8 +538,13 @@ void record_ubo_buffer(HostGl& host, HostGl::Call& call, State& s, bool sub_data
                              dual_words(host, data_ptr, words));
 }
 
-constexpr std::uint64_t kMaxTrackedBufferBytes = 2u << 20;
-constexpr std::size_t kMaxTrackedBuffers = 4;
+// The draw probes need the vertex bytes of the mesh they sample, and Unity keeps that mesh in a
+// VBO rather than in client memory, so the shadow has to cover the buffers the UI actually uses:
+// a 27-buffer session filled four slots long before the canvas draw arrived. Only small buffers
+// are mirrored (engine mesh buffers can be megabytes and are not what a UI probe reads), which
+// bounds the whole table at 24 x 256 KiB.
+constexpr std::uint64_t kMaxTrackedBufferBytes = 256u << 10;
+constexpr std::size_t kMaxTrackedBuffers = 24;
 
 void record_buffer_upload(HostGl& host, HostGl::Call& call, State& s, bool sub_data) {
     const GLenum target = call.arg(0);
@@ -493,6 +630,55 @@ void record_bound_ubo_data(HostGl::Call& call, State& s, std::uint64_t bind_numb
     detail(key.c_str(), value);
 }
 
+// Decodes up to `max_floats` little-endian floats at `offset` bytes into the shadow copy of
+// uniform-buffer-bound `buffer`, from the same glBufferData/glBufferSubData shadow used by
+// record_bound_ubo_data(). Returns "(no-shadow)"/"(partially-known)" when the bytes were never
+// captured (e.g. uploaded before diagnostics started tracking that buffer).
+std::string shadow_floats(const State& s, GLint buffer, GLint offset, std::uint32_t max_floats) {
+    if (buffer <= 0 || offset < 0) return "(no-buffer)";
+    const auto found = s.buffer_snapshots.find(static_cast<GLuint>(buffer));
+    if (found == s.buffer_snapshots.end()) return "(no-shadow)";
+    const State::BufferSnapshot& snapshot = found->second;
+    const std::uint64_t o = static_cast<std::uint64_t>(offset);
+    if (o >= snapshot.bytes.size()) return "(offset-beyond-shadow)";
+    const std::uint64_t avail_bytes = snapshot.bytes.size() - o;
+    const std::uint32_t words = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_floats, avail_bytes / 4));
+    if (words == 0) return "(none)";
+    for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(words) * 4; ++i) {
+        if (!snapshot.known[o + i]) return "(partially-known)";
+    }
+    std::string out = "[";
+    for (std::uint32_t i = 0; i < words; ++i) {
+        float value;
+        std::memcpy(&value, snapshot.bytes.data() + o + 4 * i, 4);
+        out += format(i == 0 ? "%g" : " %g", static_cast<double>(value));
+    }
+    out += "]";
+    return out;
+}
+
+// Raw bytes of a captured buffer range, for non-float vertex attributes (packed colour, byte
+// indices, and so on). Same shadow and same "unknown bytes are not guessed" rule as
+// shadow_floats().
+std::string shadow_bytes(const State& s, GLint buffer, GLint offset, GLint count) {
+    if (buffer <= 0 || offset < 0 || count <= 0) return "(no-buffer)";
+    const auto found = s.buffer_snapshots.find(static_cast<GLuint>(buffer));
+    if (found == s.buffer_snapshots.end()) return "(no-shadow)";
+    const State::BufferSnapshot& snapshot = found->second;
+    const std::uint64_t o = static_cast<std::uint64_t>(offset);
+    const std::uint64_t n = static_cast<std::uint64_t>(count);
+    if (o + n > snapshot.bytes.size()) return "(beyond-shadow)";
+    for (std::uint64_t i = 0; i < n; ++i) {
+        if (!snapshot.known[o + i]) return "(partially-known)";
+    }
+    std::string out = "[";
+    for (std::uint64_t i = 0; i < n; ++i) {
+        out += format(i == 0 ? "%u" : " %u", snapshot.bytes[o + i]);
+    }
+    out += "]";
+    return out;
+}
+
 void sample(HostGl& host, std::uint64_t draw, GLenum mode, GLsizei count) {
     GlBackend& gl = host.backend();
     GLint framebuffer = -1, program = -1, array_buffer = -1;
@@ -506,13 +692,22 @@ void sample(HostGl& host, std::uint64_t draw, GLenum mode, GLsizei count) {
     gl.glGetIntegerv(kScissorBox, scissor);
     gl.glGetBooleanv(kColorWritemask, mask);
     const GLenum fb_status = gl.glCheckFramebufferStatus(kFramebuffer);
+    GLint depth_func = -1;
+    GLboolean depth_mask = 9;
+    gl.glGetIntegerv(kDepthFunc, &depth_func);
+    gl.glGetBooleanv(kDepthWritemask, &depth_mask);
+    GLint program_linked = -2;
+    if (program > 0) gl.glGetProgramiv(static_cast<GLuint>(program), kLinkStatus, &program_linked);
     std::string text = format(
-        "mode=0x%x count=%d fb=%d fb-status=0x%x program=%d array-buffer=%d viewport=%d,%d,%dx%d "
-        "scissor-test=%d box=%d,%d,%dx%d depth=%d blend=%d cull=%d stencil=%d colormask=%d%d%d%d",
-        mode, count, framebuffer, fb_status, program, array_buffer, viewport[0], viewport[1],
-        viewport[2], viewport[3], gl.glIsEnabled(kScissorTest), scissor[0], scissor[1], scissor[2],
-        scissor[3], gl.glIsEnabled(kDepthTest), gl.glIsEnabled(kBlend), gl.glIsEnabled(kCullFace),
-        gl.glIsEnabled(kStencilTest), mask[0], mask[1], mask[2], mask[3]);
+        "mode=0x%x count=%d fb=%d fb-status=0x%x program=%d program-linked=%d array-buffer=%d "
+        "viewport=%d,%d,%dx%d "
+        "scissor-test=%d box=%d,%d,%dx%d depth=%d depth-func=0x%x depth-mask=%d blend=%d cull=%d "
+        "stencil=%d colormask=%d%d%d%d",
+        mode, count, framebuffer, fb_status, program, program_linked, array_buffer, viewport[0],
+        viewport[1], viewport[2], viewport[3], gl.glIsEnabled(kScissorTest), scissor[0], scissor[1],
+        scissor[2], scissor[3], gl.glIsEnabled(kDepthTest), depth_func, depth_mask,
+        gl.glIsEnabled(kBlend), gl.glIsEnabled(kCullFace), gl.glIsEnabled(kStencilTest), mask[0],
+        mask[1], mask[2], mask[3]);
     const std::string key = "sample-draw-" + std::to_string(draw);
     detail(key.c_str(), text);
 
@@ -528,32 +723,73 @@ void sample(HostGl& host, std::uint64_t draw, GLenum mode, GLsizei count) {
     detail(texture_key.c_str(), format("active=0x%x bound=%d min=0x%x mag=0x%x wrap-s=0x%x wrap-t=0x%x",
                                        active, texture, params[0], params[1], params[2], params[3]));
 
+    // Does the colour texture this draw samples actually carry any content? A composite pass that
+    // samples a never-written texture is the difference between "the scene is black" and "the
+    // bridge lost the scene's pixels".
+    {
+        // NOTE: sample() is only ever called from gl_diagnose(), which already holds State::mutex
+        // for the whole switch. Locking it again here deadlocks the render thread on a
+        // non-recursive mutex, so this reads the account directly.
+        std::string account;
+        State& st = state();
+        if (texture <= 0) {
+            account = "bound=0 (fixed-function / no texture)";
+        } else {
+            auto it = st.textures.find(static_cast<GLuint>(texture));
+            if (it != st.textures.end()) {
+                account = texture_text(it->second);
+            } else if (st.texture_overflow.uploads != 0) {
+                account = "not-tracked (overflow) " + texture_text(st.texture_overflow);
+            } else {
+                account = "not-tracked (never uploaded through the bridge)";
+            }
+        }
+        const std::string key2 = key + "-sampled-texture";
+        detail(key2.c_str(), account);
+    }
+
     std::string vertices;
-    for (GLuint index = 0; index < 8; ++index) {
+    const State& s = state();
+    for (GLuint index = 0; index < static_cast<GLuint>(kMaxTrackedVertexAttribs); ++index) {
         GLint enabled = 0;
         gl.glGetVertexAttribiv(index, kAttribEnabled, &enabled);
         if (!enabled) continue;
-        const Attrib& attrib = state().attribs[index];
-        vertices += format("%sa%u:", vertices.empty() ? "" : " | ", index);
-        if (!attrib.set) {
-            vertices += "(no pointer)";
-            continue;
-        }
-        const GLint step = attrib.stride != 0 ? attrib.stride
-                                              : attrib.size * (attrib.type == kFloat ? 4 : 1);
+        GLint size = 0, type = 0, stride = 0, buffer = 0;
+        gl.glGetVertexAttribiv(index, kVertexAttribArraySize, &size);
+        gl.glGetVertexAttribiv(index, kVertexAttribArrayType, &type);
+        gl.glGetVertexAttribiv(index, kVertexAttribArrayStride, &stride);
+        gl.glGetVertexAttribiv(index, kVertexAttribArrayBufferBinding, &buffer);
+        void* raw = nullptr;
+        gl.glGetVertexAttribPointerv(index, kVertexAttribArrayPointer, &raw);
+        const std::uint32_t offset = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(raw));
+        const GLint step = stride != 0 ? stride : size * (type == kFloat ? 4 : 1);
+        vertices += format("%sa%u:size=%d type=0x%x stride=%d %s=%u", vertices.empty() ? "" : " | ",
+                           index, size, type, stride, buffer != 0 ? "buffer" : "guest", offset);
         for (int vertex = 0; vertex < 3; ++vertex) {
-            const std::uint32_t at = attrib.pointer + static_cast<std::uint32_t>(step * vertex);
-            if (attrib.type == kFloat) {
-                vertices += " [" + float_words(host, at, static_cast<std::uint32_t>(attrib.size)) + "]";
-            } else {
-                const std::uint8_t* bytes = host.runtime().memory().host_ptr(
-                    at, static_cast<std::uint64_t>(attrib.size), kPageRead);
-                vertices += " [";
-                for (GLint i = 0; bytes != nullptr && i < attrib.size; ++i) {
-                    vertices += format(i == 0 ? "%u" : " %u", bytes[i]);
-                }
-                vertices += "]";
+            const std::uint64_t at = static_cast<std::uint64_t>(offset) +
+                                     static_cast<std::uint64_t>(step) * static_cast<std::uint64_t>(vertex);
+            if (buffer != 0) {
+                // A buffer-backed attribute's pointer is a byte offset into the bound buffer, so
+                // reading it as a guest address is meaningless. Use the captured buffer shadow.
+                vertices += " ";
+                vertices += type == kFloat
+                                ? shadow_floats(s, buffer, static_cast<GLint>(at), static_cast<std::uint32_t>(size))
+                                : shadow_bytes(s, buffer, static_cast<GLint>(at), size);
+                continue;
             }
+            if (type == kFloat) {
+                vertices += " [" + float_words(host, static_cast<std::uint32_t>(at),
+                                               static_cast<std::uint32_t>(size)) + "]";
+                continue;
+            }
+            const std::uint8_t* bytes =
+                host.runtime().memory().host_ptr(static_cast<std::uint32_t>(at),
+                                                 static_cast<std::uint64_t>(size), kPageRead);
+            vertices += " [";
+            for (GLint i = 0; bytes != nullptr && i < size; ++i) {
+                vertices += format(i == 0 ? "%u" : " %u", bytes[i]);
+            }
+            vertices += "]";
         }
     }
     const std::string vertex_key = key + "-vertices";
@@ -566,7 +802,7 @@ void sample(HostGl& host, std::uint64_t draw, GLenum mode, GLsizei count) {
             const GLint x = viewport[0] + viewport[2] * column / 4;
             const GLint y = viewport[1] + viewport[3] * row / 4;
             std::uint8_t rgba[4] = {};
-            gl.glReadPixels(x, y, 1, 1, kRgba, kUnsignedByte, rgba);
+            safe_read_pixels(gl, x, y, 1, 1, kRgba, kUnsignedByte, rgba);
             pixels += format("%s%02x%02x%02x%02x", pixels.empty() ? "" : " ", rgba[0], rgba[1],
                              rgba[2], rgba[3]);
         }
@@ -693,11 +929,32 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
         }
         detail("programs", format("ok=%llu failed=%llu", (unsigned long long)s.programs_ok,
                                   (unsigned long long)s.programs_failed), true);
+        detail("program-objects", program_objects_text(s), true);
         break;
     }
-    case ZB_GL_HC_glUseProgram:
-        if (++s.use_programs == 1) detail("first-use-program", format("%u", call.arg(0)));
+    case ZB_GL_HC_glCreateProgram:
+        ++s.programs_created;
+        detail("program-objects", program_objects_text(s), true);
         break;
+    case ZB_GL_HC_glDeleteProgram:
+        ++s.programs_deleted;
+        detail("program-objects", program_objects_text(s), true);
+        break;
+    case ZB_GL_HC_glUseProgram: {
+        const GLuint program = call.arg(0);
+        if (++s.use_programs == 1) detail("first-use-program", format("%u", program));
+        if (program == 0) {
+            ++s.use_program_zero;
+        } else if (s.first_nonzero_program == 0) {
+            s.first_nonzero_program = program;
+            detail("first-nonzero-use-program", format("%u", program));
+        }
+        detail("use-programs",
+               format("total=%llu zero=%llu", (unsigned long long)s.use_programs,
+                      (unsigned long long)s.use_program_zero),
+               true);
+        break;
+    }
     case ZB_GL_HC_glDrawArrays:
     case ZB_GL_HC_glDrawElements: {
         const bool arrays = call.index() == ZB_GL_HC_glDrawArrays;
@@ -714,10 +971,86 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
         for (std::uint64_t at : kSampleDraws) {
             if (draw == at) sample(host, draw, mode, count);
         }
+        if (s.onscreen_diff_pending) {
+            s.onscreen_diff_pending = false;
+            ++s.onscreen_diff_done;
+            const GLint w = s.onscreen_diff_viewport[2];
+            const GLint h = s.onscreen_diff_viewport[3];
+            std::vector<std::uint8_t> after(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
+            safe_read_pixels(gl, s.onscreen_diff_viewport[0], s.onscreen_diff_viewport[1], w, h, kRgba,
+                            kUnsignedByte, after.data());
+            const GLenum error = gl.glGetError();
+            GLint current = -1, linked = -2;
+            gl.glGetIntegerv(kCurrentProgram, &current);
+            if (current > 0) gl.glGetProgramiv(static_cast<GLuint>(current), kLinkStatus, &linked);
+            const std::string key = "onscreen-diff-" + std::to_string(s.onscreen_diff_done);
+            std::string text = format("draw=%llu mode=0x%x count=%d program=%d program-linked=%d ",
+                                      (unsigned long long)draw, mode, count, current, linked);
+            if (error != 0) {
+                text += format("readback-failed glGetError=0x%x", error);
+                gl.set_error(error);
+            } else {
+                text += diff_report(s.onscreen_diff_before.data(), after.data(), w, h);
+            }
+            detail(key.c_str(), text);
+            std::vector<std::uint8_t>().swap(s.onscreen_diff_before);
+        }
+        if (s.late_probe_pending) {
+            s.late_probe_pending = false;
+            ++s.late_probe_draws;
+            const GLint w = s.late_probe_viewport[2];
+            const GLint h = s.late_probe_viewport[3];
+            std::vector<std::uint8_t> after(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
+            safe_read_pixels(gl, s.late_probe_viewport[0], s.late_probe_viewport[1], w, h, kRgba, kUnsignedByte,
+                            after.data());
+            const GLenum error = gl.glGetError();
+            GLint program = -1, array_buffer = -1;
+            gl.glGetIntegerv(kCurrentProgram, &program);
+            gl.glGetIntegerv(kArrayBufferBinding, &array_buffer);
+            const std::string key = "late-draw-" + std::to_string(s.late_probe_draws);
+            std::string text = format(
+                "draw=%llu fb=%d program=%d count=%d mode=0x%x texture=%u buffer=%d viewport=%d,%d,%dx%d ",
+                (unsigned long long)draw, s.late_probe_fb, program, count, mode, s.late_probe_texture,
+                array_buffer, s.late_probe_viewport[0], s.late_probe_viewport[1], w, h);
+            if (error != 0) {
+                text += format("readback-failed glGetError=0x%x", error);
+                gl.set_error(error);
+            } else {
+                text += diff_report(s.late_probe_before.data(), after.data(), w, h);
+            }
+            detail(key.c_str(), text);
+            std::vector<std::uint8_t>().swap(s.late_probe_before);
+        }
+        if (s.bound_framebuffer != 0 &&
+            (s.offscreen_probes < 8 || (draw % 200 == 0 && s.offscreen_probes < 16))) {
+            GLint fb = -1, program = -1;
+            GLint vp[4] = {0, 0, 0, 0};
+            gl.glGetIntegerv(kFramebufferBinding, &fb);
+            gl.glGetIntegerv(kViewport, vp);
+            gl.glGetIntegerv(kCurrentProgram, &program);
+            std::string center = "(empty-viewport)";
+            if (vp[2] > 0 && vp[3] > 0) {
+                std::uint8_t rgba[4] = {0, 0, 0, 0};
+                safe_read_pixels(gl, vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, kRgba, kUnsignedByte, rgba);
+                const GLenum error = gl.glGetError();
+                if (error != 0) {
+                    center = format("error=0x%x", error);
+                    gl.set_error(error);
+                } else {
+                    center = format("%02x%02x%02x%02x", rgba[0], rgba[1], rgba[2], rgba[3]);
+                }
+            }
+            ++s.offscreen_probes;
+            const std::string key = "offscreen-probe-" + std::to_string(s.offscreen_probes);
+            detail(key.c_str(),
+                   format("draw=%llu fb=%d viewport=%d,%d,%dx%d program=%d count=%d center=%s",
+                          (unsigned long long)draw, fb, vp[0], vp[1], vp[2], vp[3], program, count,
+                          center.c_str()));
+        }
         if (s.text_snapshot_pending) {
             s.text_snapshot_pending = false;
             std::uint8_t after[32 * 32 * 4] = {};
-            gl.glReadPixels(s.text_snapshot_x, s.text_snapshot_y, 32, 32, kRgba, kUnsignedByte, after);
+            safe_read_pixels(gl, s.text_snapshot_x, s.text_snapshot_y, 32, 32, kRgba, kUnsignedByte, after);
             const bool changed = std::memcmp(s.text_snapshot_before, after, sizeof after) != 0;
             ++s.text_draws_captured;
             auto pixels4 = [](const std::uint8_t* p) {
@@ -817,7 +1150,7 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
             std::uint8_t rgba[4] = {};
             GLint viewport[4] = {0, 0, 0, 0};
             gl.glGetIntegerv(kViewport, viewport);
-            gl.glReadPixels(viewport[0] + viewport[2] / 2, viewport[1] + viewport[3] / 2, 1, 1, kRgba,
+            safe_read_pixels(gl, viewport[0] + viewport[2] / 2, viewport[1] + viewport[3] / 2, 1, 1, kRgba,
                             kUnsignedByte, rgba);
             const std::string key = "clear-" + std::to_string(s.clears) + "-center-pixel";
             detail(key.c_str(), format("%02x%02x%02x%02x", rgba[0], rgba[1], rgba[2], rgba[3]));
@@ -860,6 +1193,24 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
             bytes != 0 ? host.runtime().memory().host_ptr(pixels, bytes, kPageRead) : nullptr;
         std::uint64_t nonzero = 0;
         for (std::uint64_t i = 0; data != nullptr && i < bytes; ++i) nonzero += data[i] != 0;
+
+        {
+            State::TextureSnapshot& t = texture_account(s, static_cast<GLuint>(texture));
+            t.last_format = sub_format;
+            t.last_type = type;
+            t.last_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+            ++t.uploads;
+            t.bytes_written += bytes;
+            t.nonzero_written += nonzero;
+            if (pixels != 0) {
+                ++t.written_uploads;
+                if (nonzero != 0 || bytes == 0) t.written = true;
+            }
+            if (texture != 0) {
+                const std::string key = "texture-" + std::to_string(texture);
+                detail(key.c_str(), texture_text(t), true);
+            }
+        }
 
         if (s.texsub_details < 12) {
             ++s.texsub_details;
@@ -926,17 +1277,45 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
                                           static_cast<double>(call.scalar<GLfloat>(2)),
                                           static_cast<double>(call.scalar<GLfloat>(3))), true);
         break;
-    case ZB_GL_HC_glBindFramebuffer:
+    case ZB_GL_HC_glBindFramebuffer: {
         s.bound_framebuffer = call.arg(1);
-        if (s.bound_framebuffer != 0 && ++s.fb_binds_nonzero <= 4) {
-            detail("framebuffer-binds-nonzero", format("%llu last=%u", (unsigned long long)s.fb_binds_nonzero,
-                                                      s.bound_framebuffer), true);
+        ++s.fb_binds;
+        if (s.fb_trail.size() < 220) {
+            if (!s.fb_trail.empty()) s.fb_trail += '>';
+            s.fb_trail += std::to_string(s.bound_framebuffer);
+        }
+        if (s.bound_framebuffer != 0) {
+            ++s.fb_binds_nonzero;
+            if (s.fb_seen.size() < 8 &&
+                std::find(s.fb_seen.begin(), s.fb_seen.end(), s.bound_framebuffer) == s.fb_seen.end()) {
+                s.fb_seen.push_back(s.bound_framebuffer);
+            }
+            if (s.fb_binds_nonzero <= 4) {
+                detail("framebuffer-binds-nonzero", format("%llu last=%u", (unsigned long long)s.fb_binds_nonzero,
+                                                          s.bound_framebuffer), true);
+            }
         }
         break;
+    }
     case ZB_GL_HC_glScissor:
         detail("last-scissor", format("%d,%d,%dx%d", static_cast<GLint>(call.arg(0)), static_cast<GLint>(call.arg(1)),
                                       static_cast<GLint>(call.arg(2)), static_cast<GLint>(call.arg(3))), true);
         break;
+    case ZB_GL_HC_glBindTexture:
+        detail("last-bind-texture", format("target=0x%x texture=%u", call.arg(0), call.arg(1)), true);
+        break;
+    case ZB_GL_HC_glDeleteTextures: {
+        const GLsizei count = static_cast<GLsizei>(call.arg(0));
+        const std::uint32_t names = call.arg(1);
+        const GLuint* ids = count > 0
+                                ? reinterpret_cast<const GLuint*>(
+                                      host.runtime().memory().host_ptr(names, std::uint64_t(count) * 4u, kPageRead))
+                                : nullptr;
+        for (GLsizei i = 0; ids != nullptr && i < count; ++i) {
+            texture_account(s, ids[i]).deleted = true;
+        }
+        break;
+    }
     case ZB_GL_HC_glTexImage2D:
         if (!s.legacy_texture_error_checked &&
             (call.arg(2) == kAlpha || call.arg(2) == kLuminance ||
@@ -954,7 +1333,7 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
             const GLint height = static_cast<GLint>(call.arg(4));
             const std::uint64_t bytes = (width > 0 && height > 0 && call.arg(7) == kUnsignedByte)
                                             ? std::uint64_t(width) * std::uint64_t(height) *
-                                                  (call.arg(6) == kRgba ? 4 : 3)
+                                                  std::uint64_t(channels_for_format(call.arg(6)))
                                             : 0;
             const std::uint8_t* data = bytes != 0 ? host.runtime().memory().host_ptr(call.arg(8), bytes, kPageRead)
                                                   : nullptr;
@@ -982,6 +1361,49 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
             }
         }
         detail("teximages", std::to_string(s.tex_images + 1), true);
+        {
+            // Account the allocation itself. Level 0 defines the object's size and internal
+            // format; a non-null pixel pointer means it also carries non-zero (or at least
+            // explicitly provided) content.
+            const GLint level = static_cast<GLint>(call.arg(1));
+            const GLint width = static_cast<GLint>(call.arg(3));
+            const GLint height = static_cast<GLint>(call.arg(4));
+            const GLenum internal = call.arg(2);
+            const std::uint32_t pixels = call.arg(8);
+            GLint bound = 0;
+            gl.glGetIntegerv(kTextureBinding2d, &bound);
+            State::TextureSnapshot& t = texture_account(s, static_cast<GLuint>(bound));
+            ++s.texture_definition_count;
+            if (level == 0) {
+                t.defined = true;
+                t.width = width;
+                t.height = height;
+                t.internal_format = internal;
+            }
+            t.last_format = call.arg(6);
+            t.last_type = call.arg(7);
+            t.last_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+            ++t.uploads;
+            if (pixels != 0) {
+                const std::uint64_t bytes =
+                    (width > 0 && height > 0 && call.arg(7) == kUnsignedByte)
+                        ? std::uint64_t(width) * std::uint64_t(height) *
+                              std::uint64_t(channels_for_format(call.arg(6)))
+                        : 0;
+                const std::uint8_t* data =
+                    bytes != 0 ? host.runtime().memory().host_ptr(pixels, bytes, kPageRead) : nullptr;
+                std::uint64_t nonzero = 0;
+                for (std::uint64_t i = 0; data != nullptr && i < bytes; ++i) nonzero += data[i] != 0;
+                t.bytes_written += bytes;
+                t.nonzero_written += nonzero;
+                if (pixels != 0) {
+                    ++t.written_uploads;
+                    if (nonzero != 0) t.written = true;
+                }
+            }
+            const std::string key = "texture-" + std::to_string(bound);
+            if (bound != 0) detail(key.c_str(), texture_text(t), true);
+        }
         if (++s.tex_images <= 2) {
             const std::string key = "teximage-" + std::to_string(s.tex_images);
             detail(key.c_str(), format("target=0x%x level=%d internal=0x%x %dx%d format=0x%x type=0x%x pixels=0x%x",
@@ -1068,6 +1490,34 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
     }
     case ZB_GL_HC_glCompressedTexImage2D:
     case ZB_GL_HC_glCompressedTexSubImage2D: {
+        {
+            // A compressed upload is content too: without this, a texture whose only pixels arrive
+            // through ETC2 would look "never written".
+            const bool is_sub = call.index() == ZB_GL_HC_glCompressedTexSubImage2D;
+            GLint bound = 0;
+            gl.glGetIntegerv(kTextureBinding2d, &bound);
+            State::TextureSnapshot& t = texture_account(s, static_cast<GLuint>(bound));
+            const GLint level = static_cast<GLint>(call.arg(1));
+            if (!is_sub && level == 0) {
+                t.defined = true;
+                t.width = static_cast<GLint>(call.arg(3));
+                t.height = static_cast<GLint>(call.arg(4));
+                t.internal_format = call.arg(2);
+            }
+            t.last_format = is_sub ? call.arg(6) : call.arg(2);
+            t.last_type = 0;
+            t.last_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+            ++t.uploads;
+            const std::uint32_t image_size = is_sub ? call.arg(7) : call.arg(6);
+            t.bytes_written += image_size;
+            t.nonzero_written += image_size;  // compressed data is opaque; size is the best proxy
+            ++t.written_uploads;
+            if (image_size != 0) t.written = true;
+            if (bound != 0) {
+                const std::string key = "texture-" + std::to_string(bound);
+                detail(key.c_str(), texture_text(t), true);
+            }
+        }
         if (s.compressed_calls < 4) {
             ++s.compressed_calls;
             const bool is_sub = call.index() == ZB_GL_HC_glCompressedTexSubImage2D;
@@ -1144,7 +1594,7 @@ void emit_readback_diff(GlBackend& gl, const char* key, std::vector<std::uint8_t
     const GLint w = viewport[2];
     const GLint h = viewport[3];
     std::vector<std::uint8_t> after(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
-    gl.glReadPixels(viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
+    safe_read_pixels(gl, viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
     const GLenum error = gl.glGetError();
     if (error != 0) {
         detail(key, format("readback-failed glGetError=0x%x", error));
@@ -1188,7 +1638,7 @@ void emit_text_box_diff(GlBackend& gl, State& s, std::uint64_t n, std::vector<st
     const GLint h = viewport[3];
     const std::string key = "text-box-" + std::to_string(n);
     std::vector<std::uint8_t> after(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
-    gl.glReadPixels(viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
+    safe_read_pixels(gl, viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
     const GLenum error = gl.glGetError();
     if (error != 0) {
         detail(key.c_str(), format("readback-failed glGetError=0x%x", error));
@@ -1248,7 +1698,7 @@ void emit_coloured_text_diff(GlBackend& gl, const char* key, std::vector<std::ui
                static_cast<double>(rgba[3]), program, fb, w, h, scissor[0], scissor[1], scissor[2],
                scissor[3]);
     std::vector<std::uint8_t> after(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
-    gl.glReadPixels(viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
+    safe_read_pixels(gl, viewport[0], viewport[1], w, h, kRgba, kUnsignedByte, after.data());
     const GLenum error = gl.glGetError();
     if (error != 0) {
         detail(key, prefix + format("readback-failed glGetError=0x%x", error));
@@ -1266,33 +1716,6 @@ void emit_coloured_text_diff(GlBackend& gl, const char* key, std::vector<std::ui
     }
     detail(key, prefix + format("pixels-changed=%llu box=%d,%d %dx%d", (unsigned long long)changed,
                                 min_x, min_y, max_x - min_x + 1, max_y - min_y + 1));
-}
-
-// Decodes up to `max_floats` little-endian floats at `offset` bytes into the shadow copy of
-// uniform-buffer-bound `buffer`, from the same glBufferData/glBufferSubData shadow used by
-// record_bound_ubo_data(). Returns "(no-shadow)"/"(partially-known)" when the bytes were never
-// captured (e.g. uploaded before diagnostics started tracking that buffer).
-std::string shadow_floats(const State& s, GLint buffer, GLint offset, std::uint32_t max_floats) {
-    if (buffer <= 0 || offset < 0) return "(no-buffer)";
-    const auto found = s.buffer_snapshots.find(static_cast<GLuint>(buffer));
-    if (found == s.buffer_snapshots.end()) return "(no-shadow)";
-    const State::BufferSnapshot& snapshot = found->second;
-    const std::uint64_t o = static_cast<std::uint64_t>(offset);
-    if (o >= snapshot.bytes.size()) return "(offset-beyond-shadow)";
-    const std::uint64_t avail_bytes = snapshot.bytes.size() - o;
-    const std::uint32_t words = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_floats, avail_bytes / 4));
-    if (words == 0) return "(none)";
-    for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(words) * 4; ++i) {
-        if (!snapshot.known[o + i]) return "(partially-known)";
-    }
-    std::string out = "[";
-    for (std::uint32_t i = 0; i < words; ++i) {
-        float value;
-        std::memcpy(&value, snapshot.bytes.data() + o + 4 * i, 4);
-        out += format(i == 0 ? "%g" : " %g", static_cast<double>(value));
-    }
-    out += "]";
-    return out;
 }
 
 // Decoded FragInfo fields, matching the [is_color_glyph, use_text_color, pad, pad, r, g, b, a]
@@ -1439,6 +1862,54 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
     GlBackend& gl = host.backend();
     s.backend_cache = &gl;
 
+    // Whole-framebuffer before/after diff at scheduled draws, independent of which texture is
+    // bound: answers whether an onscreen draw changes the presented image at all, and to what.
+    if (s.onscreen_diff_index < kOnscreenDiffCount) {
+        const std::uint64_t draw_number = s.draws + 1;
+        if (draw_number >= kOnscreenDiffDraws[s.onscreen_diff_index]) {
+            const std::size_t slot = s.onscreen_diff_index++;
+            if (!s.onscreen_diff_pending && draw_number == kOnscreenDiffDraws[slot]) {
+                GLint framebuffer = -1;
+                gl.glGetIntegerv(kFramebufferBinding, &framebuffer);
+                GLint viewport[4] = {0, 0, 0, 0};
+                gl.glGetIntegerv(kViewport, viewport);
+                GLboolean mask[4] = {0, 0, 0, 0};
+                gl.glGetBooleanv(kColorWritemask, mask);
+                if (framebuffer == 0 && viewport[2] > 64 && viewport[3] > 64 &&
+                    (mask[0] || mask[1] || mask[2] || mask[3])) {
+                    std::memcpy(s.onscreen_diff_viewport, viewport, sizeof viewport);
+                    s.onscreen_diff_before.assign(
+                        static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
+                    safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba,
+                                    kUnsignedByte, s.onscreen_diff_before.data());
+                    s.onscreen_diff_pending = true;
+                }
+            }
+        }
+    }
+
+    // Steady-state frame probe: read the destination rectangle before each sampled draw so the
+    // draw handler can report exactly what that draw changed, and on which framebuffer.
+    if (!s.late_probe_armed && s.draws + 1 >= kLateProbeDraw) s.late_probe_armed = true;
+    if (s.late_probe_armed && s.late_probe_draws < kLateProbeDraws && !s.late_probe_pending) {
+        GLint framebuffer = -1;
+        gl.glGetIntegerv(kFramebufferBinding, &framebuffer);
+        GLint viewport[4] = {0, 0, 0, 0};
+        gl.glGetIntegerv(kViewport, viewport);
+        if (viewport[2] > 0 && viewport[3] > 0 && viewport[2] <= 4096 && viewport[3] <= 4096) {
+            GLint texture = 0;
+            gl.glGetIntegerv(kTextureBinding2d, &texture);
+            s.late_probe_fb = framebuffer;
+            std::memcpy(s.late_probe_viewport, viewport, sizeof viewport);
+            s.late_probe_texture = static_cast<GLuint>(texture);
+            s.late_probe_before.assign(
+                static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
+            safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+                            s.late_probe_before.data());
+            s.late_probe_pending = true;
+        }
+    }
+
     GLint active_texture = -1;
     gl.glGetIntegerv(kTextureBinding2d, &active_texture);
     const bool uses_glyph_atlas =
@@ -1460,7 +1931,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
                     std::memcpy(s.nontext_diff_viewport, viewport, sizeof viewport);
                     s.nontext_diff_before.assign(
                         static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
-                    gl.glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+                    safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
                                    s.nontext_diff_before.data());
                     s.nontext_diff_pending = true;
                 }
@@ -1519,7 +1990,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
             s.coloured_text_fb0_rgba = {f.r, f.g, f.b, f.a};
             s.coloured_text_fb0_before.assign(
                 static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
-            gl.glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+            safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
                            s.coloured_text_fb0_before.data());
             s.coloured_text_fb0_pending = true;
         }
@@ -1535,7 +2006,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
             s.coloured_text_off_rgba = {f.r, f.g, f.b, f.a};
             s.coloured_text_off_before.assign(
                 static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
-            gl.glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+            safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
                            s.coloured_text_off_before.data());
             s.coloured_text_off_pending = true;
             s.coloured_text_off_seen = true;
@@ -1549,7 +2020,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
         std::memcpy(s.text_fullfb_viewport, viewport, sizeof viewport);
         s.text_fullfb_before.assign(
             static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
-        gl.glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+        safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
                        s.text_fullfb_before.data());
         s.text_fullfb_pending = true;
     }
@@ -1560,7 +2031,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
         std::memcpy(s.text_box_viewport, viewport, sizeof viewport);
         s.text_box_before.assign(
             static_cast<std::size_t>(viewport[2]) * static_cast<std::size_t>(viewport[3]) * 4, 0);
-        gl.glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+        safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
                        s.text_box_before.data());
         s.text_box_pending = true;
     }
@@ -1588,7 +2059,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
     s.text_snapshot_x = x;
     s.text_snapshot_y = y;
     std::memset(s.text_snapshot_before, 0, sizeof s.text_snapshot_before);
-    gl.glReadPixels(x, y, 32, 32, kRgba, kUnsignedByte, s.text_snapshot_before);
+    safe_read_pixels(gl, x, y, 32, 32, kRgba, kUnsignedByte, s.text_snapshot_before);
     s.text_snapshot_pending = true;
 }
 
@@ -1682,7 +2153,7 @@ void emit_glyph_box_region(GlBackend& gl, const std::string& map_suffix, const c
         return;
     }
     std::vector<std::uint8_t> pixels(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4, 0);
-    gl.glReadPixels(x, y, w, h, kRgba, kUnsignedByte, pixels.data());
+    safe_read_pixels(gl, x, y, w, h, kRgba, kUnsignedByte, pixels.data());
     const GLenum error = gl.glGetError();
     if (error != 0) {
         detail(map_key.c_str(),
@@ -1725,6 +2196,121 @@ void gl_diagnose_swap() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     const std::uint64_t swap = ++s.swap_count;
+
+    // What the surface holds immediately before it is presented. This is the one sample that
+    // separates "the guest draws black" from "the guest draws content that never reaches the
+    // window": it reads the same buffer eglSwapBuffers is about to show.
+    if (swap == 20 || swap == 60 || swap == 200 || swap == 400) {
+        const std::string key = "present-" + std::to_string(swap);
+        if (s.backend_cache == nullptr) {
+            detail(key.c_str(), "no-gl-backend-seen-yet");
+        } else {
+            GlBackend& gl = *s.backend_cache;
+            GLint framebuffer = -1;
+            gl.glGetIntegerv(kFramebufferBinding, &framebuffer);
+            GLint viewport[4] = {0, 0, 0, 0};
+            gl.glGetIntegerv(kViewport, viewport);
+            std::string text = format("fb=%d viewport=%d,%d %dx%d", framebuffer, viewport[0],
+                                      viewport[1], viewport[2], viewport[3]);
+            if (framebuffer != 0) {
+                text += " read=skipped(non-default-framebuffer)";
+            } else if (viewport[2] <= 0 || viewport[3] <= 0 || viewport[2] > 2048 || viewport[3] > 2048) {
+                text += " read=skipped(viewport)";
+            } else {
+                const std::size_t width = static_cast<std::size_t>(viewport[2]);
+                const std::size_t height = static_cast<std::size_t>(viewport[3]);
+                std::vector<std::uint8_t> pixels(width * height * 4, 0);
+                safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba,
+                                kUnsignedByte, pixels.data());
+                std::uint64_t nonzero = 0;
+                std::uint64_t sum[4] = {0, 0, 0, 0};
+                for (std::size_t i = 0; i < width * height; ++i) {
+                    const std::uint8_t* const px = pixels.data() + i * 4;
+                    if ((px[0] | px[1] | px[2] | px[3]) != 0) ++nonzero;
+                    for (int c = 0; c < 4; ++c) sum[c] += px[c];
+                }
+                const std::uint64_t total = static_cast<std::uint64_t>(width) * height;
+                text += format(" nonzero=%llu/%llu mean=%llu,%llu,%llu,%llu hash=%016llx",
+                               (unsigned long long)nonzero, (unsigned long long)total,
+                               (unsigned long long)(sum[0] / total), (unsigned long long)(sum[1] / total),
+                               (unsigned long long)(sum[2] / total), (unsigned long long)(sum[3] / total),
+                               (unsigned long long)fnv1a(pixels.data(), pixels.size()));
+                // A 3x3 lattice says whether the frame is uniform, a gradient, or real content.
+                static constexpr int kLattice[3] = {10, 50, 90};  // percent of the axis
+                text += " samples=";
+                for (int row = 0; row < 3; ++row) {
+                    for (int col = 0; col < 3; ++col) {
+                        const std::size_t x = width * kLattice[col] / 100;
+                        const std::size_t y = height * kLattice[row] / 100;
+                        const std::uint8_t* const px = pixels.data() + (y * width + x) * 4;
+                        text += format("%s%02x%02x%02x%02x", (row == 0 && col == 0) ? "" : ",",
+                                       px[0], px[1], px[2], px[3]);
+                    }
+                }
+            }
+            detail(key.c_str(), text);
+        }
+    }
+
+    // The composite: which targets the guest binds in one frame, and what each non-default target
+    // actually holds at present time. The default framebuffer readback above only proves the guest
+    // presents black; this proves whether the render the guest made elsewhere is black too.
+    if ((swap == 200 || swap == 400) && s.backend_cache != nullptr) {
+        const std::string suffix = std::to_string(swap);
+        detail(("fb-trail-" + suffix).c_str(),
+               s.fb_trail.empty() ? std::string("none") : s.fb_trail);
+        s.fb_trail.clear();
+        GlBackend& gl = *s.backend_cache;
+        GLint saved = 0;
+        gl.glGetIntegerv(kFramebufferBinding, &saved);
+        GLint viewport[4] = {0, 0, 0, 0};
+        gl.glGetIntegerv(kViewport, viewport);
+        std::string targets;
+        for (GLuint id : s.fb_seen) {
+            gl.glBindFramebuffer(0x8D40, id);
+            const GLenum status = gl.glCheckFramebufferStatus(0x8D40);
+            std::string text = format("fb=%u status=0x%x viewport=%d,%d %dx%d", id, status, viewport[0],
+                                      viewport[1], viewport[2], viewport[3]);
+            if (status != 0x8CD5 || viewport[2] <= 0 || viewport[3] <= 0 || viewport[2] > 2048 ||
+                viewport[3] > 2048) {
+                text += " read=skipped";
+            } else {
+                const std::size_t width = static_cast<std::size_t>(viewport[2]);
+                const std::size_t height = static_cast<std::size_t>(viewport[3]);
+                std::vector<std::uint8_t> pixels(width * height * 4, 0);
+                safe_read_pixels(gl, viewport[0], viewport[1], viewport[2], viewport[3], kRgba, kUnsignedByte,
+                                pixels.data());
+                const GLenum error = gl.glGetError();
+                if (error != 0) {
+                    text += format(" readback-failed glGetError=0x%x", error);
+                    gl.set_error(error);
+                } else {
+                    std::uint64_t nonzero = 0;
+                    std::uint64_t sum[4] = {0, 0, 0, 0};
+                    for (std::size_t i = 0; i < width * height; ++i) {
+                        const std::uint8_t* const px = pixels.data() + i * 4;
+                        if ((px[0] | px[1] | px[2] | px[3]) != 0) ++nonzero;
+                        for (int c = 0; c < 4; ++c) sum[c] += px[c];
+                    }
+                    const std::uint64_t total = static_cast<std::uint64_t>(width) * height;
+                    text += format(" nonzero=%llu/%llu mean=%llu,%llu,%llu,%llu hash=%016llx",
+                                   (unsigned long long)nonzero, (unsigned long long)total,
+                                   (unsigned long long)(sum[0] / total), (unsigned long long)(sum[1] / total),
+                                   (unsigned long long)(sum[2] / total), (unsigned long long)(sum[3] / total),
+                                   (unsigned long long)fnv1a(pixels.data(), pixels.size()));
+                    const std::uint8_t* const center =
+                        pixels.data() + ((height / 2) * width + width / 2) * 4;
+                    text += format(" center=%02x%02x%02x%02x", center[0], center[1], center[2], center[3]);
+                }
+            }
+            if (!targets.empty()) targets += " | ";
+            targets += text;
+        }
+        gl.glBindFramebuffer(0x8D40, static_cast<GLuint>(saved));
+        s.bound_framebuffer = static_cast<GLuint>(saved);
+        detail(("fb-targets-" + suffix).c_str(), targets.empty() ? std::string("none-bound") : targets);
+    }
+
     int moment = 0;
     if (swap == 60) moment = 1;
     else if (swap == 200) moment = 2;

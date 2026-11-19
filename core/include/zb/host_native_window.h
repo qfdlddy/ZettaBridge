@@ -32,6 +32,9 @@ public:
     // A guest handle for a window the platform handed us directly (the one the framework gives a
     // NativeActivity), so the guest callback can receive it like any other window.
     std::uint32_t handle_for_window(const void* window);
+    // Releases the platform's own reference for a handle returned by handle_for_window() once
+    // onNativeWindowDestroyed completes, so destroyed windows never remain reachable.
+    void release_window_handle(std::uint32_t handle);
 
     // The WindowResolver seam HostEgl::eglCreateWindowSurface uses to turn a guest window handle
     // into a host ANativeWindow*; nullptr for an unknown handle.

@@ -1,6 +1,9 @@
 #include "zb/host_gl.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -9,8 +12,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "gl/frame_probe.h"
 #include "gl/gl_diagnostics.h"
+#include "zb/gl_hostcalls.h"
 #include "zb/log.h"
+#include "zb/runtime_report.h"
 
 namespace zb {
 
@@ -36,6 +42,18 @@ constexpr GLbitfield kGlMapRead = 0x0001;
 constexpr GLbitfield kGlMapWrite = 0x0002;
 constexpr GLbitfield kGlMapInvalidateRange = 0x0004;
 constexpr GLbitfield kGlMapInvalidateBuffer = 0x0008;
+constexpr GLbitfield kGlMapFlushExplicit = 0x0010;
+
+struct BufferMapping {
+    std::uint32_t guest = 0;
+    std::uint8_t* data = nullptr;
+    std::uint64_t length = 0;
+    std::size_t capacity = 0;
+    GLbitfield access = 0;
+    GLintptr offset = 0;
+    bool shadow_only = false;
+    GlMapDiagnostic diagnostic;
+};
 
 struct GlThreadState {
     struct Attribute {
@@ -52,24 +70,180 @@ struct GlThreadState {
         bool integer = false;
     };
 
-    const HostGl* owner = nullptr;
+    struct LocalMapping {
+        std::uint64_t key = 0;
+        BufferMapping mapping;
+    };
+
+    struct ThreadMirrorBlock {
+        std::uint32_t address = 0;
+        std::size_t capacity = 0;
+    };
+
+    std::uint64_t owner_id = 0;
+    std::weak_ptr<HostGl::MirrorPoolState> owner_pool;
+    std::array<LocalMapping, 16> local_mappings{};
+    std::size_t local_mapping_count = 0;
+    std::vector<ThreadMirrorBlock> local_mirror_pool;
+    std::size_t local_mirror_pool_bytes = 0;
+
+    void recycle_to_pool() {
+        if (local_mirror_pool.empty()) return;
+        if (const auto pool = owner_pool.lock()) {
+            if (pool->alive.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(pool->mutex);
+                for (const auto& block : local_mirror_pool) {
+                    if (pool->blocks.size() >= HostGl::kMaxMirrorPoolEntries ||
+                        pool->bytes + block.capacity > HostGl::kMaxMirrorPoolBytes) {
+                        break;
+                    }
+                    pool->blocks.push_back(HostGl::MirrorBlock{block.address, block.capacity});
+                    pool->bytes += block.capacity;
+                }
+                pool->bytes_approx.store(pool->bytes, std::memory_order_relaxed);
+            }
+        }
+        local_mirror_pool.clear();
+        local_mirror_pool_bytes = 0;
+    }
+
+    ~GlThreadState() { recycle_to_pool(); }
     GLint pack_alignment = 4;
     GLint unpack_alignment = 4;
     GLuint array_buffer = 0;
     GLuint element_array_buffer = 0;
     GLuint pixel_pack_buffer = 0;
     GLuint pixel_unpack_buffer = 0;
-    std::unordered_map<GLuint, Attribute> attributes;
+    std::array<GLuint, 8> bound_buffers{};
+    std::uint8_t known_bindings = 0;
+    static constexpr std::size_t kFastAttributeCount = 16;
+    static constexpr std::size_t kCachedTextureUnits = 32;
+    static constexpr std::size_t kCachedTextureTargets = 4;
+    static constexpr std::size_t kCachedScalarStates = 11;
+
+    struct ScalarStateEntry {
+        std::array<std::uint32_t, 4> words{};
+        bool known = false;
+    };
+
+    std::uint64_t filter_egl_generation = UINT64_MAX;
+    std::uint64_t strings_egl_generation = UINT64_MAX;
+    std::uint64_t sampled_egl_generation = UINT64_MAX;
+    bool active_texture_known = false;
+    GLenum active_texture = 0x84C0;
+    bool current_program_known = false;
+    GLuint current_program = 0;
+    bool current_vao_known = false;
+    std::uint32_t cap_known = 0;
+    std::uint32_t cap_value = 0;
+    std::array<ScalarStateEntry, kCachedScalarStates> scalar_states{};
+    std::array<std::array<GLuint, kCachedTextureTargets>, kCachedTextureUnits> bound_textures{};
+    std::array<std::uint8_t, kCachedTextureUnits> bound_texture_known{};
+
+    void reset_dynamic_state_filter(std::uint64_t generation) {
+        filter_egl_generation = generation;
+        active_texture_known = false;
+        current_program_known = false;
+        current_vao_known = false;
+        cap_known = 0;
+        cap_value = 0;
+        for (auto& entry : scalar_states) entry.known = false;
+        bound_texture_known.fill(0);
+        known_bindings = 0;
+    }
+
+    void ensure_strings_epoch(std::uint64_t generation) {
+        if (strings_egl_generation == generation) return;
+        strings_egl_generation = generation;
+        strings.clear();
+        indexed_strings.clear();
+        extensions.clear();
+        extensions_known = false;
+    }
+
+    struct VaoAttributes {
+        std::array<Attribute, kFastAttributeCount> fast_attributes{};
+        std::unordered_map<GLuint, Attribute> overflow_attributes;
+        std::uint16_t fast_client_mask = 0;
+        std::uint32_t overflow_client_count = 0;
+    };
+
+    GLuint current_vao = 0;
+    std::unordered_map<GLuint, GLuint> vao_element_buffers;
+    std::unordered_map<GLuint, VaoAttributes> vao_attributes;
+    std::array<Attribute, kFastAttributeCount> fast_attributes{};
+    std::unordered_map<GLuint, Attribute> overflow_attributes;
+    std::uint16_t fast_client_mask = 0;
+    std::uint32_t overflow_client_count = 0;
     std::unordered_map<GLuint, std::unordered_map<GLint, std::uint64_t>> uniforms;
     std::unordered_map<GLenum, std::uint32_t> strings;
     std::unordered_map<std::uint64_t, std::uint32_t> indexed_strings;
     // The driver's extensions minus the ones this bridge cannot serve, in driver order.
     std::vector<std::string> extensions;
     bool extensions_known = false;
+
+    void switch_vao_attributes(GLuint next_vao) {
+        if (next_vao == current_vao) return;
+        VaoAttributes& saved = vao_attributes[current_vao];
+        saved.fast_attributes = fast_attributes;
+        saved.overflow_attributes = std::move(overflow_attributes);
+        saved.fast_client_mask = fast_client_mask;
+        saved.overflow_client_count = overflow_client_count;
+        current_vao = next_vao;
+        const auto found = vao_attributes.find(next_vao);
+        if (found != vao_attributes.end()) {
+            fast_attributes = found->second.fast_attributes;
+            overflow_attributes = found->second.overflow_attributes;
+            fast_client_mask = found->second.fast_client_mask;
+            overflow_client_count = found->second.overflow_client_count;
+        } else {
+            fast_attributes = {};
+            overflow_attributes.clear();
+            fast_client_mask = 0;
+            overflow_client_count = 0;
+        }
+    }
+
+    static bool is_client_array(const Attribute& attr) {
+        return attr.enabled && attr.defined && attr.buffer == 0;
+    }
+
+    Attribute& attribute_mut(GLuint index) {
+        if (index < kFastAttributeCount) return fast_attributes[index];
+        return overflow_attributes[index];
+    }
+
+    const Attribute* find_attribute(GLuint index) const {
+        if (index < kFastAttributeCount) return &fast_attributes[index];
+        const auto found = overflow_attributes.find(index);
+        return found == overflow_attributes.end() ? nullptr : &found->second;
+    }
+
+    void refresh_client_flag(GLuint index, const Attribute& attr) {
+        const bool active = is_client_array(attr);
+        if (index < kFastAttributeCount) {
+            const std::uint16_t bit = static_cast<std::uint16_t>(1u << index);
+            if (active) {
+                fast_client_mask |= bit;
+            } else {
+                fast_client_mask &= static_cast<std::uint16_t>(~bit);
+            }
+            return;
+        }
+        std::uint32_t count = 0;
+        for (const auto& [_, entry] : overflow_attributes) {
+            if (is_client_array(entry)) ++count;
+        }
+        overflow_client_count = count;
+    }
 };
 
+constexpr GLenum kGlVersion = 0x1F02;
 constexpr GLenum kGlExtensions = 0x1F03;
+constexpr GLenum kGlMajorVersion = 0x821B;
+constexpr GLenum kGlMinorVersion = 0x821C;
 constexpr GLenum kGlNumExtensions = 0x821D;
+constexpr GLenum kGlShadingLanguageVersion = 0x8B8C;
 
 // Extensions whose entry points this bridge does not serve. A driver advertises what the hardware
 // can do, and an engine that reads an extension out of the string calls its functions without
@@ -89,9 +263,11 @@ bool extension_served(std::string_view name) {
 thread_local GlThreadState t_state;
 
 GlThreadState& state(const HostGl& host) {
-    if (t_state.owner != &host) {
+    if (t_state.owner_id != host.id()) {
+        t_state.recycle_to_pool();
         t_state = {};
-        t_state.owner = &host;
+        t_state.owner_id = host.id();
+        t_state.owner_pool = host.mirror_pool_state();
     }
     return t_state;
 }
@@ -100,12 +276,14 @@ GlThreadState& state(const HostGl& host) {
 // enumerates them one by one; a GLES 2.0 context has only the single space-separated string.
 const std::vector<std::string>& served_extensions(HostGl& host) {
     GlThreadState& current = state(host);
+    const std::uint64_t egl_gen = runtime_report().egl_current_generation();
+    current.ensure_strings_epoch(egl_gen);
     if (current.extensions_known) return current.extensions;
-    current.extensions_known = true;
 
     GLint count = 0;
     host.backend().glGetIntegerv(kGlNumExtensions, &count);
     if (count > 0) {
+        current.extensions_known = true;
         for (GLint i = 0; i < count; ++i) {
             const GLubyte* entry = host.backend().glGetStringi(kGlExtensions, static_cast<GLuint>(i));
             if (entry == nullptr) continue;
@@ -116,6 +294,7 @@ const std::vector<std::string>& served_extensions(HostGl& host) {
     }
     const GLubyte* all = host.backend().glGetString(kGlExtensions);
     if (all == nullptr) return current.extensions;
+    current.extensions_known = true;
     std::string_view rest(reinterpret_cast<const char*>(all));
     while (!rest.empty()) {
         const std::size_t space = rest.find(' ');
@@ -146,26 +325,52 @@ std::uint32_t answer_with_string(HostGl& host, HostGl::Call& call, std::string_v
 std::uint64_t uniform_components(GLenum type) {
     switch (type) {
     case 0x1404:  // GL_INT
+    case 0x1405:  // GL_UNSIGNED_INT
     case 0x1406:  // GL_FLOAT
     case 0x8B56:  // GL_BOOL
     case 0x8B5E:  // GL_SAMPLER_2D
+    case 0x8B5F:  // GL_SAMPLER_3D
     case 0x8B60:  // GL_SAMPLER_CUBE
+    case 0x8B62:  // GL_SAMPLER_2D_SHADOW
+    case 0x8DC1:  // GL_SAMPLER_2D_ARRAY
+    case 0x8DC4:  // GL_SAMPLER_2D_ARRAY_SHADOW
+    case 0x8DC5:  // GL_SAMPLER_CUBE_SHADOW
+    case 0x8DCA:  // GL_INT_SAMPLER_2D
+    case 0x8DCB:  // GL_INT_SAMPLER_3D
+    case 0x8DCC:  // GL_INT_SAMPLER_CUBE
+    case 0x8DCF:  // GL_INT_SAMPLER_2D_ARRAY
+    case 0x8DD2:  // GL_UNSIGNED_INT_SAMPLER_2D
+    case 0x8DD3:  // GL_UNSIGNED_INT_SAMPLER_3D
+    case 0x8DD4:  // GL_UNSIGNED_INT_SAMPLER_CUBE
+    case 0x8DD7:  // GL_UNSIGNED_INT_SAMPLER_2D_ARRAY
         return 1;
     case 0x8B50:  // GL_FLOAT_VEC2
     case 0x8B53:  // GL_INT_VEC2
     case 0x8B57:  // GL_BOOL_VEC2
+    case 0x8DC6:  // GL_UNSIGNED_INT_VEC2
         return 2;
     case 0x8B51:  // GL_FLOAT_VEC3
     case 0x8B54:  // GL_INT_VEC3
     case 0x8B58:  // GL_BOOL_VEC3
+    case 0x8DC7:  // GL_UNSIGNED_INT_VEC3
         return 3;
     case 0x8B52:  // GL_FLOAT_VEC4
     case 0x8B55:  // GL_INT_VEC4
     case 0x8B59:  // GL_BOOL_VEC4
+    case 0x8DC8:  // GL_UNSIGNED_INT_VEC4
     case 0x8B5A:  // GL_FLOAT_MAT2
         return 4;
+    case 0x8B65:  // GL_FLOAT_MAT2x3
+    case 0x8B67:  // GL_FLOAT_MAT3x2
+        return 6;
+    case 0x8B66:  // GL_FLOAT_MAT2x4
+    case 0x8B69:  // GL_FLOAT_MAT4x2
+        return 8;
     case 0x8B5B:  // GL_FLOAT_MAT3
         return 9;
+    case 0x8B68:  // GL_FLOAT_MAT3x4
+    case 0x8B6A:  // GL_FLOAT_MAT4x3
+        return 12;
     case 0x8B5C:  // GL_FLOAT_MAT4
         return 16;
     default:
@@ -179,13 +384,65 @@ bool checked_multiply(std::uint64_t a, std::uint64_t b, std::uint64_t& result) {
     return true;
 }
 
+// Clamps an "<prefix><major>.<minor>[...]" GL/GLSL version string down to replacement (ES 3.0 /
+// GLSL ES 3.00) because this bridge only serves GLES 2.0 + 3.0 entry points; advertising 3.1+
+// causes engines like Unity to call unbridged core functions such as glGetProgramInterfaceiv
+// without null checking.
+std::optional<std::string> clamp_version_prefix(std::string_view text, std::string_view prefix,
+                                                std::string_view replacement) {
+    if (!text.starts_with(prefix)) return std::nullopt;
+    std::string_view rest = text.substr(prefix.size());
+    std::size_t pos = 0;
+    unsigned major = 0;
+    while (pos < rest.size() && rest[pos] >= '0' && rest[pos] <= '9') {
+        major = major * 10u + static_cast<unsigned>(rest[pos] - '0');
+        ++pos;
+    }
+    if (pos == 0 || pos >= rest.size() || rest[pos] != '.') return std::nullopt;
+    ++pos;
+    const std::size_t minor_start = pos;
+    unsigned minor = 0;
+    while (pos < rest.size() && rest[pos] >= '0' && rest[pos] <= '9') {
+        minor = minor * 10u + static_cast<unsigned>(rest[pos] - '0');
+        ++pos;
+    }
+    if (pos == minor_start) return std::nullopt;
+    if (pos < rest.size() && rest[pos] != ' ' && rest[pos] != '\t') return std::nullopt;
+    if (major < 3u || (major == 3u && minor == 0u)) return std::nullopt;
+    std::string out(replacement);
+    out.append(rest.substr(pos));
+    return out;
+}
+
+std::optional<std::string> clamp_gl_version_string(GLenum name, std::string_view text) {
+    if (name == kGlVersion) return clamp_version_prefix(text, "OpenGL ES ", "OpenGL ES 3.0");
+    if (name == kGlShadingLanguageVersion) {
+        return clamp_version_prefix(text, "OpenGL ES GLSL ES ", "OpenGL ES GLSL ES 3.00");
+    }
+    return std::nullopt;
+}
+
 template <typename T>
 bool serve_pname(HostGl& host, HostGl::Call& call, void (GlBackend::*function)(GLenum, T*)) {
     const GLenum pname = call.scalar<GLenum>(0);
+    if (pname == kGlNumExtensions) {
+        // Must match what glGetStringi hands out, or the guest reads past the filtered list.
+        T* data = call.pointer<T>(1, 1, kPageRead | kPageWrite);
+        if (!call.valid()) return true;
+        *data = static_cast<T>(served_extensions(host).size());
+        return true;
+    }
     const std::uint64_t count = gl_pname_count(host.backend(), pname);
     T* data = call.pointer<T>(1, count, kPageRead | kPageWrite);
     if (!call.valid()) return true;
     (host.backend().*function)(pname, data);
+    if (pname == kGlMajorVersion && *data > static_cast<T>(3)) {
+        *data = static_cast<T>(3);
+    } else if (pname == kGlMinorVersion && *data > static_cast<T>(0)) {
+        GLint major = 0;
+        host.backend().glGetIntegerv(kGlMajorVersion, &major);
+        if (major >= 3) *data = static_cast<T>(0);
+    }
     return true;
 }
 
@@ -197,6 +454,12 @@ bool pixel_pointer(HostGl& host, HostGl::Call& call, bool pack, GLenum format, G
                    unsigned position, std::uint8_t permission, void*& out) {
     if (host.pixel_buffer(pack) != 0) {
         out = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.arg(position)));
+        return call.valid();
+    }
+    if (call.arg(position) == 0) {
+        // Null pixels pointer (e.g. glTexImage2D allocating storage without initial upload)
+        // never dereferences guest memory.
+        out = nullptr;
         return call.valid();
     }
     if (depth < 0) {
@@ -297,9 +560,13 @@ bool materialize_client_arrays(HostGl& host, HostGl::Call& call, std::uint64_t f
     };
 
     GlThreadState& current = state(host);
-    std::vector<MaterializedAttribute> materialized;
-    for (const auto& [index, attribute] : current.attributes) {
-        if (!attribute.enabled || !attribute.defined || attribute.buffer != 0) continue;
+    // Common GLES3 VBO path: zero client arrays enabled, skip scanning attributes completely.
+    if (current.fast_client_mask == 0 && current.overflow_client_count == 0) return true;
+
+    std::array<MaterializedAttribute, GlThreadState::kFastAttributeCount> stack_items{};
+    std::size_t stack_count = 0;
+    std::vector<MaterializedAttribute> heap_items;
+    const auto collect = [&](GLuint index, const GlThreadState::Attribute& attribute) -> bool {
         const std::uint64_t component = attribute_component_bytes(attribute.type);
         if (attribute.size < 1 || attribute.size > 4 || component == 0 || attribute.stride < 0) {
             call.fail(kGlInvalidOperation, "client vertex attribute layout is invalid");
@@ -329,12 +596,37 @@ bool materialize_client_arrays(HostGl& host, HostGl::Call& call, std::uint64_t f
             return false;
         }
         const void* pointer = host.runtime().memory().base() + attribute.guest_pointer;
-        materialized.push_back({index, &attribute, pointer});
+        if (current.overflow_client_count == 0 && stack_count < stack_items.size()) {
+            stack_items[stack_count++] = {index, &attribute, pointer};
+        } else {
+            if (heap_items.empty() && stack_count > 0) {
+                heap_items.assign(stack_items.begin(), stack_items.begin() + stack_count);
+                stack_count = 0;
+            }
+            heap_items.push_back({index, &attribute, pointer});
+        }
+        return true;
+    };
+
+    std::uint16_t mask = current.fast_client_mask;
+    while (mask != 0) {
+        const auto bit = static_cast<GLuint>(std::countr_zero(mask));
+        mask &= static_cast<std::uint16_t>(mask - 1);
+        if (!collect(bit, current.fast_attributes[bit])) return false;
+    }
+    if (current.overflow_client_count != 0) {
+        for (const auto& [index, attribute] : current.overflow_attributes) {
+            if (!GlThreadState::is_client_array(attribute)) continue;
+            if (!collect(index, attribute)) return false;
+        }
     }
 
-    const bool rebound = !materialized.empty() && current.array_buffer != 0;
+    const MaterializedAttribute* items = heap_items.empty() ? stack_items.data() : heap_items.data();
+    const std::size_t item_count = heap_items.empty() ? stack_count : heap_items.size();
+    const bool rebound = item_count != 0 && current.array_buffer != 0;
     if (rebound) host.backend().glBindBuffer(kGlArrayBuffer, 0);
-    for (const auto& item : materialized) {
+    for (std::size_t i = 0; i < item_count; ++i) {
+        const auto& item = items[i];
         if (item.attribute->integer) {
             host.backend().glVertexAttribIPointer(item.index, item.attribute->size,
                                                   item.attribute->type, item.attribute->stride,
@@ -364,13 +656,18 @@ std::uint64_t gl_pname_count(GlBackend& backend, GLenum pname) {
     case 0x0C10:  // GL_SCISSOR_BOX
     case 0x0BA2:  // GL_VIEWPORT
         return 4;
+    case 0x821B:  // GL_MAJOR_VERSION
+    case 0x821C:  // GL_MINOR_VERSION
+    case 0x821D:  // GL_NUM_EXTENSIONS
+        return 1;
     case kGlCompressedTextureFormats:
-    case kGlShaderBinaryFormats: {
+    case kGlShaderBinaryFormats:
+    case 0x87FF: {  // GL_PROGRAM_BINARY_FORMATS
         GLint count = 0;
-        backend.glGetIntegerv(pname == kGlCompressedTextureFormats
-                                  ? kGlNumCompressedTextureFormats
-                                  : kGlNumShaderBinaryFormats,
-                              &count);
+        const GLenum num_pname = pname == kGlCompressedTextureFormats ? kGlNumCompressedTextureFormats
+                                 : pname == kGlShaderBinaryFormats    ? kGlNumShaderBinaryFormats
+                                                                      : static_cast<GLenum>(0x87FE);
+        backend.glGetIntegerv(num_pname, &count);
         return count > 0 ? static_cast<std::uint64_t>(count) : 0;
     }
     default: {
@@ -482,6 +779,20 @@ std::optional<std::uint64_t> gl_pixel_bytes(GLenum format, GLenum type, GLsizei 
     return preceding + row;
 }
 
+bool HostGl::thread_generation_matches(std::uint64_t egl_generation) const {
+    return state(*this).sampled_egl_generation == egl_generation;
+}
+
+bool HostGl::check_and_update_thread_generation(std::uint64_t egl_generation) {
+    GlThreadState& current = state(*this);
+    if (current.sampled_egl_generation == egl_generation) return false;
+    if (current.sampled_egl_generation == UINT64_MAX) {
+        gl_threads_seen_.fetch_add(1, std::memory_order_relaxed);
+    }
+    current.sampled_egl_generation = egl_generation;
+    return true;
+}
+
 void HostGl::note_pixel_store(GLenum pname, GLint param) {
     if (param != 1 && param != 2 && param != 4 && param != 8) return;
     GlThreadState& current = state(*this);
@@ -489,12 +800,113 @@ void HostGl::note_pixel_store(GLenum pname, GLint param) {
     if (pname == kGlUnpackAlignment) current.unpack_alignment = param;
 }
 
+namespace {
+
+void evict_buffer_mapping(HostGl& host, GLuint id);
+
+constexpr std::size_t kArrayBufferIndex = 0;
+constexpr std::size_t kElementArrayBufferIndex = 1;
+constexpr std::size_t kPixelPackBufferIndex = 2;
+constexpr std::size_t kPixelUnpackBufferIndex = 3;
+
+int buffer_target_index(GLenum target) {
+    switch (target) {
+    case kGlArrayBuffer: return 0;
+    case kGlElementArrayBuffer: return 1;
+    case kGlPixelPackBuffer: return 2;
+    case kGlPixelUnpackBuffer: return 3;
+    case 0x8A11: return 4;  // GL_UNIFORM_BUFFER
+    case 0x8C8E: return 5;  // GL_TRANSFORM_FEEDBACK_BUFFER
+    case 0x8F36: return 6;  // GL_COPY_READ_BUFFER
+    case 0x8F37: return 7;  // GL_COPY_WRITE_BUFFER
+    default: return -1;
+    }
+}
+
+void sync_legacy_binding_fields(GlThreadState& current) {
+    current.array_buffer = current.bound_buffers[kArrayBufferIndex];
+    current.element_array_buffer = current.bound_buffers[kElementArrayBufferIndex];
+    current.pixel_pack_buffer = current.bound_buffers[kPixelPackBufferIndex];
+    current.pixel_unpack_buffer = current.bound_buffers[kPixelUnpackBufferIndex];
+}
+
+}  // namespace
+
 void HostGl::note_bind_buffer(GLenum target, GLuint buffer) {
     GlThreadState& current = state(*this);
-    if (target == kGlArrayBuffer) current.array_buffer = buffer;
-    if (target == kGlElementArrayBuffer) current.element_array_buffer = buffer;
-    if (target == kGlPixelPackBuffer) current.pixel_pack_buffer = buffer;
-    if (target == kGlPixelUnpackBuffer) current.pixel_unpack_buffer = buffer;
+    const int idx = buffer_target_index(target);
+    if (idx < 0) return;
+    current.bound_buffers[static_cast<std::size_t>(idx)] = buffer;
+    current.known_bindings |= static_cast<std::uint8_t>(1u << idx);
+    if (static_cast<std::size_t>(idx) == kElementArrayBufferIndex) {
+        current.vao_element_buffers[current.current_vao] = buffer;
+    }
+    sync_legacy_binding_fields(current);
+}
+
+void HostGl::note_delete_buffers(GLsizei n, const GLuint* buffers) {
+    if (n <= 0 || buffers == nullptr) return;
+    GlThreadState& current = state(*this);
+    for (GLsizei i = 0; i < n; ++i) {
+        const GLuint id = buffers[i];
+        if (id == 0) continue;
+        for (std::size_t slot = 0; slot < current.bound_buffers.size(); ++slot) {
+            if (current.bound_buffers[slot] == id) {
+                current.bound_buffers[slot] = 0;
+                current.known_bindings &= static_cast<std::uint8_t>(~(1u << slot));
+            }
+        }
+        for (auto& [vao, ebo] : current.vao_element_buffers) {
+            if (ebo == id) ebo = 0;
+        }
+        evict_buffer_mapping(*this, id);
+    }
+    sync_legacy_binding_fields(current);
+    if (multi_thread_gl_active()) runtime_.bump_gl_delete_epoch();
+}
+
+void HostGl::invalidate_state_filter() {
+    GlThreadState& current = state(*this);
+    current.filter_egl_generation = UINT64_MAX;
+}
+
+void HostGl::note_bind_vertex_array(GLuint array) {
+    GlThreadState& current = state(*this);
+    current.switch_vao_attributes(array);
+    const auto it = current.vao_element_buffers.find(array);
+    if (it != current.vao_element_buffers.end()) {
+        current.bound_buffers[kElementArrayBufferIndex] = it->second;
+    } else {
+        // A freshly bound unseen VAO starts with EBO 0, never the previous VAO's EBO.
+        current.bound_buffers[kElementArrayBufferIndex] = 0;
+    }
+    current.known_bindings |= static_cast<std::uint8_t>(1u << kElementArrayBufferIndex);
+    sync_legacy_binding_fields(current);
+}
+
+void HostGl::note_delete_vertex_arrays(GLsizei n, const GLuint* arrays) {
+    if (n <= 0 || arrays == nullptr) return;
+    GlThreadState& current = state(*this);
+    for (GLsizei i = 0; i < n; ++i) {
+        const GLuint id = arrays[i];
+        if (id == 0) continue;
+        current.vao_element_buffers.erase(id);
+        current.vao_attributes.erase(id);
+        if (current.current_vao == id) {
+            current.current_vao_known = true;
+            note_bind_vertex_array(0);
+        }
+    }
+    if (multi_thread_gl_active()) runtime_.bump_gl_delete_epoch();
+}
+
+bool HostGl::buffer_binding(GLenum target, GLuint& buffer) const {
+    const GlThreadState& current = state(*this);
+    const int idx = buffer_target_index(target);
+    if (idx < 0) return false;
+    if ((current.known_bindings & (1u << idx)) == 0) return false;
+    buffer = current.bound_buffers[static_cast<std::size_t>(idx)];
+    return true;
 }
 
 GLuint HostGl::pixel_buffer(bool pack) const {
@@ -503,7 +915,10 @@ GLuint HostGl::pixel_buffer(bool pack) const {
 }
 
 void HostGl::note_vertex_attrib_enabled(GLuint index, bool enabled) {
-    state(*this).attributes[index].enabled = enabled;
+    GlThreadState& current = state(*this);
+    GlThreadState::Attribute& attribute = current.attribute_mut(index);
+    attribute.enabled = enabled;
+    current.refresh_client_flag(index, attribute);
 }
 
 GLint HostGl::pixel_alignment(bool pack) const {
@@ -515,6 +930,278 @@ void HostGl::invalidate_uniforms(GLuint program) {
     state(*this).uniforms.erase(program);
 }
 
+namespace {
+
+int texture_target_slot(GLenum target) {
+    switch (target) {
+    case 0x0DE1: return 0;  // GL_TEXTURE_2D
+    case 0x8513: return 1;  // GL_TEXTURE_CUBE_MAP
+    case 0x8C1A: return 2;  // GL_TEXTURE_2D_ARRAY
+    case 0x806F: return 3;  // GL_TEXTURE_3D
+    default: return -1;
+    }
+}
+
+int gl_cap_bit(GLenum cap) {
+    switch (cap) {
+    case 0x0BE2: return 0;  // GL_BLEND
+    case 0x0B44: return 1;  // GL_CULL_FACE
+    case 0x0B71: return 2;  // GL_DEPTH_TEST
+    case 0x0C11: return 3;  // GL_SCISSOR_TEST
+    case 0x0B90: return 4;  // GL_STENCIL_TEST
+    case 0x0BD0: return 5;  // GL_DITHER
+    case 0x8037: return 6;  // GL_POLYGON_OFFSET_FILL
+    case 0x809E: return 7;  // GL_SAMPLE_ALPHA_TO_COVERAGE
+    case 0x80A0: return 8;  // GL_SAMPLE_COVERAGE
+    default: return -1;
+    }
+}
+
+bool normalize_scalar_state(std::uint32_t index, const std::uint32_t (&in)[4], int& slot,
+                            std::array<std::uint32_t, 4>& out) {
+    out = {};
+    switch (index) {
+    case ZB_GL_HC_glDepthMask: slot = 0; out[0] = (in[0] != 0) ? 1u : 0u; return true;
+    case ZB_GL_HC_glDepthFunc: slot = 1; out[0] = in[0]; return true;
+    case ZB_GL_HC_glCullFace: slot = 2; out[0] = in[0]; return true;
+    case ZB_GL_HC_glFrontFace: slot = 3; out[0] = in[0]; return true;
+    case ZB_GL_HC_glBlendEquation:
+        slot = 4;
+        out[0] = in[0];
+        out[1] = in[0];
+        return true;
+    case ZB_GL_HC_glBlendEquationSeparate:
+        slot = 4;
+        out[0] = in[0];
+        out[1] = in[1];
+        return true;
+    case ZB_GL_HC_glBlendFunc:
+        slot = 5;
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[0];
+        out[3] = in[1];
+        return true;
+    case ZB_GL_HC_glBlendFuncSeparate:
+        slot = 5;
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[2];
+        out[3] = in[3];
+        return true;
+    case ZB_GL_HC_glColorMask:
+        slot = 6;
+        for (int i = 0; i < 4; ++i) out[i] = (in[i] != 0) ? 1u : 0u;
+        return true;
+    case ZB_GL_HC_glViewport:
+        slot = 7;
+        for (int i = 0; i < 4; ++i) out[i] = in[i];
+        return true;
+    case ZB_GL_HC_glScissor:
+        slot = 8;
+        for (int i = 0; i < 4; ++i) out[i] = in[i];
+        return true;
+    case ZB_GL_HC_glDepthRangef:
+        slot = 9;
+        out[0] = in[0];
+        out[1] = in[1];
+        return true;
+    case ZB_GL_HC_glClearColor:
+        slot = 10;
+        for (int i = 0; i < 4; ++i) out[i] = in[i];
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ensure_filter_epoch(GlThreadState& current, std::uint64_t egl_generation) {
+    if (current.filter_egl_generation != egl_generation) {
+        current.reset_dynamic_state_filter(egl_generation);
+    }
+}
+
+}  // namespace
+
+bool HostGl::try_skip_redundant_call(std::uint32_t index, GuestThread& thread, std::uint64_t egl_generation) {
+    switch (index) {
+    case ZB_GL_HC_glActiveTexture: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const GLenum tex = thread.regs()[0];
+        if (current.active_texture_known && current.active_texture == tex) return true;
+        break;
+    }
+    case ZB_GL_HC_glUseProgram: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const GLuint program = thread.regs()[0];
+        if (current.current_program_known && current.current_program == program) return true;
+        break;
+    }
+    case ZB_GL_HC_glBindVertexArray:
+    case ZB_GL_HC_glBindVertexArrayOES: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        if (current.current_vao_known && current.current_vao == thread.regs()[0]) return true;
+        break;
+    }
+    case ZB_GL_HC_glBindBuffer: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const int idx = buffer_target_index(thread.regs()[0]);
+        if (idx >= 0 && (current.known_bindings & (1u << idx)) != 0 &&
+            current.bound_buffers[static_cast<std::size_t>(idx)] == thread.regs()[1]) {
+            return true;
+        }
+        break;
+    }
+    case ZB_GL_HC_glBindTexture: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        if (!current.active_texture_known) break;
+        const std::uint32_t unit = current.active_texture - 0x84C0u;
+        const int slot = texture_target_slot(thread.regs()[0]);
+        if (unit < GlThreadState::kCachedTextureUnits && slot >= 0 &&
+            (current.bound_texture_known[unit] & (1u << slot)) != 0 &&
+            current.bound_textures[unit][static_cast<std::size_t>(slot)] == thread.regs()[1]) {
+            return true;
+        }
+        break;
+    }
+    case ZB_GL_HC_glEnable:
+    case ZB_GL_HC_glDisable: {
+        const int bit = gl_cap_bit(thread.regs()[0]);
+        if (bit < 0) break;
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const std::uint32_t mask = 1u << static_cast<unsigned>(bit);
+        const bool want = (index == ZB_GL_HC_glEnable);
+        if ((current.cap_known & mask) != 0 && ((current.cap_value & mask) != 0) == want) {
+            return true;
+        }
+        break;
+    }
+    default: {
+        int slot = -1;
+        std::array<std::uint32_t, 4> norm{};
+        const std::uint32_t args[4] = {thread.regs()[0], thread.regs()[1], thread.regs()[2],
+                                       thread.regs()[3]};
+        if (normalize_scalar_state(index, args, slot, norm)) {
+            GlThreadState& current = state(*this);
+            ensure_filter_epoch(current, egl_generation);
+            const auto& entry = current.scalar_states[static_cast<std::size_t>(slot)];
+            if (entry.known && entry.words == norm) return true;
+        }
+        break;
+    }
+    }
+    return false;
+}
+
+void HostGl::note_after_dispatch(std::uint32_t index, Call& call, std::uint64_t egl_generation) {
+    if (!call.valid()) return;
+    switch (index) {
+    case ZB_GL_HC_glActiveTexture: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const GLenum tex = call.scalar<GLenum>(0);
+        if (tex >= 0x84C0u && tex < 0x84C0u + GlThreadState::kCachedTextureUnits) {
+            current.active_texture = tex;
+            current.active_texture_known = true;
+        } else {
+            current.active_texture_known = false;
+        }
+        break;
+    }
+    case ZB_GL_HC_glUseProgram: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        current.current_program = call.scalar<GLuint>(0);
+        current.current_program_known = true;
+        break;
+    }
+    case ZB_GL_HC_glDeleteProgram: {
+        GlThreadState& current = state(*this);
+        if (current.current_program_known && current.current_program == call.scalar<GLuint>(0)) {
+            current.current_program_known = false;
+        }
+        if (multi_thread_gl_active()) runtime_.bump_gl_delete_epoch();
+        break;
+    }
+    case ZB_GL_HC_glBindVertexArray:
+    case ZB_GL_HC_glBindVertexArrayOES: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        current.current_vao_known = true;
+        break;
+    }
+    case ZB_GL_HC_glBindTexture: {
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        if (!current.active_texture_known) break;
+        const std::uint32_t unit = current.active_texture - 0x84C0u;
+        const int slot = texture_target_slot(call.scalar<GLenum>(0));
+        if (unit < GlThreadState::kCachedTextureUnits && slot >= 0) {
+            current.bound_textures[unit][static_cast<std::size_t>(slot)] = call.scalar<GLuint>(1);
+            current.bound_texture_known[unit] |= static_cast<std::uint8_t>(1u << slot);
+        }
+        break;
+    }
+    case ZB_GL_HC_glDeleteTextures: {
+        const GLsizei n = call.scalar<GLsizei>(0);
+        if (n <= 0) break;
+        const GLuint* textures = call.pointer<const GLuint>(1, call.length(n, 1u), kPageRead);
+        if (textures == nullptr) break;
+        GlThreadState& current = state(*this);
+        for (GLsizei i = 0; i < n; ++i) {
+            const GLuint id = textures[i];
+            if (id == 0) continue;
+            for (std::size_t unit = 0; unit < GlThreadState::kCachedTextureUnits; ++unit) {
+                std::uint8_t mask = current.bound_texture_known[unit];
+                if (mask == 0) continue;
+                for (std::size_t slot = 0; slot < GlThreadState::kCachedTextureTargets; ++slot) {
+                    if ((mask & (1u << slot)) != 0 && current.bound_textures[unit][slot] == id) {
+                        mask &= static_cast<std::uint8_t>(~(1u << slot));
+                    }
+                }
+                current.bound_texture_known[unit] = mask;
+            }
+        }
+        if (multi_thread_gl_active()) runtime_.bump_gl_delete_epoch();
+        break;
+    }
+    case ZB_GL_HC_glEnable:
+    case ZB_GL_HC_glDisable: {
+        const int bit = gl_cap_bit(call.arg(0));
+        if (bit < 0) break;
+        GlThreadState& current = state(*this);
+        ensure_filter_epoch(current, egl_generation);
+        const std::uint32_t mask = 1u << static_cast<unsigned>(bit);
+        current.cap_known |= mask;
+        if (index == ZB_GL_HC_glEnable) {
+            current.cap_value |= mask;
+        } else {
+            current.cap_value &= ~mask;
+        }
+        break;
+    }
+    default: {
+        int slot = -1;
+        std::array<std::uint32_t, 4> norm{};
+        const std::uint32_t args[4] = {call.arg(0), call.arg(1), call.arg(2), call.arg(3)};
+        if (normalize_scalar_state(index, args, slot, norm)) {
+            GlThreadState& current = state(*this);
+            ensure_filter_epoch(current, egl_generation);
+            auto& entry = current.scalar_states[static_cast<std::size_t>(slot)];
+            entry.words = norm;
+            entry.known = true;
+        }
+        break;
+    }
+    }
+}
+
 std::optional<std::uint32_t> HostGl::allocate_guest(std::size_t size) {
     if (size == 0 || size > UINT32_MAX) return std::nullopt;
     if (allocator_) return allocator_(size);
@@ -523,6 +1210,140 @@ std::optional<std::uint32_t> HostGl::allocate_guest(std::size_t size) {
     const auto result = runtime_.call_on_current(runtime_.service_api().malloc_fn, args);
     if (!result || result->r0 == 0) return std::nullopt;
     return result->r0;
+}
+
+namespace {
+
+constexpr std::size_t kMaxPooledMirrorBlock = 4u << 20;
+
+void compute_mirror_window(std::size_t size, std::size_t& request_size, std::size_t& max_acceptable) {
+    request_size = size;
+    if (size <= (1u << 20)) {
+        request_size = std::bit_ceil(std::max<std::size_t>(size, 256));
+    }
+    max_acceptable = std::max<std::size_t>(request_size * 2, 4096);
+}
+
+std::size_t find_local_mirror_index(const GlThreadState& current, std::size_t size,
+                                    std::size_t max_acceptable) {
+    std::size_t best_idx = current.local_mirror_pool.size();
+    for (std::size_t i = 0; i < current.local_mirror_pool.size(); ++i) {
+        const auto& b = current.local_mirror_pool[i];
+        if (b.capacity >= size && b.capacity <= max_acceptable) {
+            if (best_idx == current.local_mirror_pool.size() ||
+                b.capacity < current.local_mirror_pool[best_idx].capacity) {
+                best_idx = i;
+            }
+        }
+    }
+    return best_idx;
+}
+
+bool can_push_local_mirror(const GlThreadState& current, std::size_t capacity) {
+    return capacity > 0 && capacity <= kMaxPooledMirrorBlock &&
+           current.local_mirror_pool.size() < HostGl::kMaxMirrorPoolEntries &&
+           current.local_mirror_pool_bytes + capacity <= HostGl::kMaxMirrorPoolBytes;
+}
+
+}  // namespace
+
+std::optional<std::uint32_t> HostGl::acquire_mirror(std::size_t size, std::size_t& capacity_out) {
+    capacity_out = size;
+    if (size == 0 || size > UINT32_MAX) return std::nullopt;
+    if (allocator_) return allocator_(size);
+
+    // Bucket allocations <= 1 MiB to power-of-two sizes so repeated map/unmap cycles
+    // reuse pooled guest allocations without re-entering guest malloc/free.
+    std::size_t request_size = 0;
+    std::size_t max_acceptable = 0;
+    compute_mirror_window(size, request_size, max_acceptable);
+    {
+        GlThreadState& current = state(*this);
+        const std::size_t best_idx = find_local_mirror_index(current, size, max_acceptable);
+        if (best_idx < current.local_mirror_pool.size()) {
+            const auto chosen = current.local_mirror_pool[best_idx];
+            current.local_mirror_pool[best_idx] = current.local_mirror_pool.back();
+            current.local_mirror_pool.pop_back();
+            current.local_mirror_pool_bytes -= chosen.capacity;
+            capacity_out = chosen.capacity;
+            return chosen.address;
+        }
+    }
+    const auto& pool = mirror_pool_state_;
+    if (pool->bytes_approx.load(std::memory_order_relaxed) > 0) {
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        std::size_t best_idx = pool->blocks.size();
+        for (std::size_t i = 0; i < pool->blocks.size(); ++i) {
+            const MirrorBlock& b = pool->blocks[i];
+            if (b.capacity >= size && b.capacity <= max_acceptable) {
+                if (best_idx == pool->blocks.size() || b.capacity < pool->blocks[best_idx].capacity) {
+                    best_idx = i;
+                }
+            }
+        }
+        if (best_idx < pool->blocks.size()) {
+            const MirrorBlock chosen = pool->blocks[best_idx];
+            pool->blocks[best_idx] = pool->blocks.back();
+            pool->blocks.pop_back();
+            pool->bytes -= chosen.capacity;
+            pool->bytes_approx.store(pool->bytes, std::memory_order_relaxed);
+            capacity_out = chosen.capacity;
+            return chosen.address;
+        }
+    }
+    capacity_out = request_size;
+    return allocate_guest(request_size);
+}
+
+void HostGl::release_mirror(std::uint32_t address, std::size_t capacity) {
+    if (address == 0 || allocator_) return;
+    if (capacity > 0 && capacity <= kMaxPooledMirrorBlock) {
+        GlThreadState& current = state(*this);
+        if (can_push_local_mirror(current, capacity)) {
+            current.local_mirror_pool.push_back(GlThreadState::ThreadMirrorBlock{address, capacity});
+            current.local_mirror_pool_bytes += capacity;
+            return;
+        }
+        const auto& pool = mirror_pool_state_;
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        if (pool->blocks.size() < kMaxMirrorPoolEntries && pool->bytes + capacity <= kMaxMirrorPoolBytes) {
+            pool->blocks.push_back(MirrorBlock{address, capacity});
+            pool->bytes += capacity;
+            pool->bytes_approx.store(pool->bytes, std::memory_order_relaxed);
+            return;
+        }
+    }
+    free_guest(address);
+}
+
+bool HostGl::can_fast_map_buffer_range(GuestThread& thread) const {
+    if (allocator_) return false;
+    const auto offset = static_cast<GLintptr>(static_cast<std::int32_t>(thread.regs()[1]));
+    const auto length = static_cast<GLsizeiptr>(static_cast<std::int32_t>(thread.regs()[2]));
+    if (offset < 0 || length <= 0) return false;
+    const auto size = static_cast<std::size_t>(length);
+    std::size_t request_size = 0;
+    std::size_t max_acceptable = 0;
+    compute_mirror_window(size, request_size, max_acceptable);
+    const GlThreadState& current = state(*this);
+    return find_local_mirror_index(current, size, max_acceptable) < current.local_mirror_pool.size();
+}
+
+bool HostGl::can_fast_unmap_buffer(GuestThread& thread) const {
+    if (allocator_) return false;
+    const GLenum target = static_cast<GLenum>(thread.regs()[0]);
+    GLuint bound = 0;
+    if (!buffer_binding(target, bound)) return false;
+    const std::uint64_t key =
+        bound > 0 ? ((std::uint64_t{1} << 32) | static_cast<std::uint64_t>(bound))
+                  : static_cast<std::uint64_t>(target);
+    const GlThreadState& current = state(*this);
+    for (std::size_t i = 0; i < current.local_mapping_count; ++i) {
+        if (current.local_mappings[i].key == key) {
+            return can_push_local_mirror(current, current.local_mappings[i].mapping.capacity);
+        }
+    }
+    return false;
 }
 
 void HostGl::free_guest(std::uint32_t address) {
@@ -556,7 +1377,16 @@ std::optional<std::uint64_t> HostGl::uniform_elements(GLuint program, GLint loca
             if (uniform.ends_with("[0]")) uniform.resize(uniform.size() - 3);
             const GLint uniform_location = backend_.glGetUniformLocation(program, uniform.c_str());
             const std::uint64_t elements = uniform_components(type);
-            if (uniform_location >= 0 && elements != 0) locations[uniform_location] = elements;
+            if (uniform_location >= 0 && elements != 0) {
+                locations[uniform_location] = elements;
+                if (size > 1 && size <= 256) {
+                    for (GLint elem = 1; elem < size; ++elem) {
+                        const std::string indexed = uniform + "[" + std::to_string(elem) + "]";
+                        const GLint elem_loc = backend_.glGetUniformLocation(program, indexed.c_str());
+                        if (elem_loc >= 0) locations[elem_loc] = elements;
+                    }
+                }
+            }
         }
         cached = current.uniforms.emplace(program, std::move(locations)).first;
     }
@@ -574,13 +1404,6 @@ bool zbgl_manual_glGetFloatv(HostGl& host, HostGl::Call& call) {
 }
 
 bool zbgl_manual_glGetIntegerv(HostGl& host, HostGl::Call& call) {
-    if (call.scalar<GLenum>(0) == kGlNumExtensions) {
-        // Must match what glGetStringi hands out, or the guest reads past the filtered list.
-        GLint* data = call.pointer<GLint>(1, 1, kPageRead | kPageWrite);
-        if (!call.valid()) return true;
-        *data = static_cast<GLint>(served_extensions(host).size());
-        return true;
-    }
     return serve_pname(host, call, &GlBackend::glGetIntegerv);
 }
 
@@ -683,6 +1506,8 @@ bool zbgl_manual_glGetUniformLocation(HostGl& host, HostGl::Call& call) {
 bool zbgl_manual_glGetString(HostGl& host, HostGl::Call& call) {
     const GLenum name = call.scalar<GLenum>(0);
     GlThreadState& current = state(host);
+    const std::uint64_t egl_gen = runtime_report().egl_current_generation();
+    current.ensure_strings_epoch(egl_gen);
     const auto cached = current.strings.find(name);
     if (cached != current.strings.end()) {
         call.set_result(cached->second);
@@ -705,20 +1530,11 @@ bool zbgl_manual_glGetString(HostGl& host, HostGl::Call& call) {
         host.reject(call, kGlInvalidOperation, "driver string exceeds 64 MiB");
         return true;
     }
-    const auto address = host.allocate_guest(length + 1);
-    if (!address) {
-        host.reject(call, kGlOutOfMemory, "guest allocation for driver string failed");
-        return true;
+    const std::string_view raw(reinterpret_cast<const char*>(source), length);
+    const std::optional<std::string> clamped = clamp_gl_version_string(name, raw);
+    if (const std::uint32_t address = answer_with_string(host, call, clamped ? *clamped : raw)) {
+        current.strings[name] = address;
     }
-    std::uint8_t* destination = host.runtime().memory().host_ptr(
-        *address, length + 1, kPageRead | kPageWrite);
-    if (destination == nullptr) {
-        host.reject(call, kGlInvalidOperation, "guest allocator returned an unreadable buffer");
-        return true;
-    }
-    std::memcpy(destination, source, length + 1);
-    current.strings[name] = *address;
-    call.set_result(*address);
     return true;
 }
 
@@ -760,7 +1576,8 @@ bool zbgl_manual_glShaderSource(HostGl& host, HostGl::Call& call) {
 
 bool zbgl_manual_glVertexAttribPointer(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(0);
-    GlThreadState::Attribute& attribute = state(host).attributes[index];
+    GlThreadState& current = state(host);
+    GlThreadState::Attribute& attribute = current.attribute_mut(index);
     attribute.defined = true;
     attribute.size = call.scalar<GLint>(1);
     attribute.type = call.scalar<GLenum>(2);
@@ -768,7 +1585,8 @@ bool zbgl_manual_glVertexAttribPointer(HostGl& host, HostGl::Call& call) {
     attribute.stride = call.scalar<GLsizei>(4);
     attribute.guest_pointer = call.arg(5);
     attribute.integer = false;
-    attribute.buffer = state(host).array_buffer;
+    attribute.buffer = current.array_buffer;
+    current.refresh_client_flag(index, attribute);
     if (!call.valid()) return true;
     if (attribute.buffer != 0) {
         host.backend().glVertexAttribPointer(
@@ -776,6 +1594,27 @@ bool zbgl_manual_glVertexAttribPointer(HostGl& host, HostGl::Call& call) {
             reinterpret_cast<const void*>(static_cast<std::uintptr_t>(attribute.guest_pointer)));
     }
     return true;
+}
+
+void HostGl::apply_batched_vertex_attrib_pointer(GLuint index, GLint size, GLenum type,
+                                                 GLboolean normalized, GLsizei stride,
+                                                 std::uint32_t pointer) {
+    GlThreadState& current = state(*this);
+    GlThreadState::Attribute& attribute = current.attribute_mut(index);
+    attribute.defined = true;
+    attribute.size = size;
+    attribute.type = type;
+    attribute.normalized = normalized;
+    attribute.stride = stride;
+    attribute.guest_pointer = pointer;
+    attribute.integer = false;
+    attribute.buffer = current.array_buffer;
+    current.refresh_client_flag(index, attribute);
+    if (attribute.buffer != 0) {
+        backend_.glVertexAttribPointer(
+            index, size, type, normalized, stride,
+            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pointer)));
+    }
 }
 
 bool zbgl_manual_glDrawArrays(HostGl& host, HostGl::Call& call) {
@@ -805,6 +1644,8 @@ bool prepare_elements(HostGl& host, HostGl::Call& call, GLsizei count, GLenum ty
         return false;
     }
     GlThreadState& current = state(host);
+    const bool has_client_arrays =
+        current.fast_client_mask != 0 || current.overflow_client_count != 0;
     driver_indices = nullptr;
     std::uint64_t max_index = 0;
     if (current.element_array_buffer == 0) {
@@ -821,22 +1662,32 @@ bool prepare_elements(HostGl& host, HostGl::Call& call, GLsizei count, GLenum ty
             call.fail(kGlInvalidOperation, "client element indices are unreadable");
             return false;
         }
-        for (GLsizei i = 0; i < count; ++i) {
-            std::uint64_t value = indices[i];
-            if (index_size == 2) {
+        driver_indices = indices;
+        if (!has_client_arrays) return true;
+        if (index_size == 1) {
+            std::uint8_t max8 = 0;
+            for (GLsizei i = 0; i < count; ++i) max8 = std::max(max8, indices[i]);
+            max_index = max8;
+        } else if (index_size == 2) {
+            std::uint16_t max16 = 0;
+            for (GLsizei i = 0; i < count; ++i) {
                 std::uint16_t value16;
                 std::memcpy(&value16, indices + static_cast<std::size_t>(i) * 2, sizeof(value16));
-                value = value16;
-            } else if (index_size == 4) {
+                max16 = std::max(max16, value16);
+            }
+            max_index = max16;
+        } else {
+            std::uint32_t max32 = 0;
+            for (GLsizei i = 0; i < count; ++i) {
                 std::uint32_t value32;
                 std::memcpy(&value32, indices + static_cast<std::size_t>(i) * 4, sizeof(value32));
-                value = value32;
+                max32 = std::max(max32, value32);
             }
-            max_index = std::max(max_index, value);
+            max_index = max32;
         }
-        driver_indices = indices;
     } else {
         driver_indices = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(guest_indices));
+        if (!has_client_arrays) return true;
         if (count > 0) max_index = static_cast<std::uint64_t>(count - 1);
     }
     if (count > 0 && !materialize_client_arrays(host, call, 0, max_index)) return false;
@@ -855,6 +1706,55 @@ bool zbgl_manual_glDrawElements(HostGl& host, HostGl::Call& call) {
     return true;
 }
 
+void HostGl::apply_batched_draw_arrays(GuestThread& thread, GLenum mode, GLint first,
+                                       GLsizei count) {
+    const GlThreadState& current = state(*this);
+    if (__builtin_expect(first >= 0 && count >= 0 && current.fast_client_mask == 0 &&
+                             current.overflow_client_count == 0,
+                         1)) {
+        backend_.glDrawArrays(mode, first, count);
+        return;
+    }
+    auto& regs = thread.regs();
+    const std::uint32_t saved[4] = {regs[0], regs[1], regs[2], regs[3]};
+    regs[0] = static_cast<std::uint32_t>(mode);
+    regs[1] = static_cast<std::uint32_t>(first);
+    regs[2] = static_cast<std::uint32_t>(count);
+    regs[3] = 0;
+    Call call(*this, thread, ZB_GL_HC_glDrawArrays);
+    zbgl_manual_glDrawArrays(*this, call);
+    regs[0] = saved[0];
+    regs[1] = saved[1];
+    regs[2] = saved[2];
+    regs[3] = saved[3];
+}
+
+void HostGl::apply_batched_draw_elements(GuestThread& thread, GLenum mode, GLsizei count,
+                                         GLenum type, std::uint32_t guest_indices) {
+    const GlThreadState& current = state(*this);
+    if (__builtin_expect(count >= 0 && current.element_array_buffer != 0 &&
+                             current.fast_client_mask == 0 &&
+                             current.overflow_client_count == 0,
+                         1)) {
+        backend_.glDrawElements(
+            mode, count, type,
+            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(guest_indices)));
+        return;
+    }
+    auto& regs = thread.regs();
+    const std::uint32_t saved[4] = {regs[0], regs[1], regs[2], regs[3]};
+    regs[0] = static_cast<std::uint32_t>(mode);
+    regs[1] = static_cast<std::uint32_t>(count);
+    regs[2] = static_cast<std::uint32_t>(type);
+    regs[3] = guest_indices;
+    Call call(*this, thread, ZB_GL_HC_glDrawElements);
+    zbgl_manual_glDrawElements(*this, call);
+    regs[0] = saved[0];
+    regs[1] = saved[1];
+    regs[2] = saved[2];
+    regs[3] = saved[3];
+}
+
 bool zbgl_manual_glGetVertexAttribPointerv(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(0);
     (void)call.scalar<GLenum>(1);
@@ -864,8 +1764,8 @@ bool zbgl_manual_glGetVertexAttribPointerv(HostGl& host, HostGl::Call& call) {
         call.fail(kGlInvalidValue, "vertex attribute pointer output is null");
         return true;
     }
-    const auto found = state(host).attributes.find(index);
-    *pointer = found == state(host).attributes.end() ? 0 : found->second.guest_pointer;
+    const GlThreadState::Attribute* found = state(host).find_attribute(index);
+    *pointer = found == nullptr ? 0 : found->guest_pointer;
     return true;
 }
 
@@ -926,26 +1826,116 @@ std::uint64_t argument64(HostGl::Call& call, unsigned low) {
 
 // A guest mirror of a host-mapped buffer range: the driver's mapped memory lives outside the
 // guest address space, so glMapBufferRange hands the guest a copy of the range and
-// glUnmapBuffer writes it back. Keyed by the target the buffer was mapped through, which is how
-// glUnmapBuffer, glFlushMappedBufferRange and glGetBufferPointerv name it again. Process-wide,
-// like the buffer objects themselves.
-struct BufferMapping {
-    std::uint32_t guest = 0;
-    std::uint8_t* data = nullptr;
-    std::uint64_t length = 0;
-    GLbitfield access = 0;
-    GlMapDiagnostic diagnostic;
-};
-
+// glUnmapBuffer writes it back. Keyed by the bound GL buffer object ID when non-zero (so two
+// buffers bound in turn to e.g. GL_COPY_WRITE_BUFFER or unmapped via another target do not
+// collide), falling back to the target enum only when no binding ID is reported.
 std::mutex mapping_mutex;
-std::unordered_map<GLenum, BufferMapping> mappings;
+std::unordered_map<std::uint64_t, BufferMapping> mappings;
+std::atomic<std::size_t> global_mapping_count{0};
 
-bool find_mapping(GLenum target, BufferMapping& mapping) {
+GLenum buffer_binding_enum(GLenum target) {
+    switch (target) {
+    case kGlArrayBuffer: return 0x8894;         // GL_ARRAY_BUFFER_BINDING
+    case kGlElementArrayBuffer: return 0x8895;  // GL_ELEMENT_ARRAY_BUFFER_BINDING
+    case kGlPixelPackBuffer: return 0x88ED;     // GL_PIXEL_PACK_BUFFER_BINDING
+    case kGlPixelUnpackBuffer: return 0x88EF;   // GL_PIXEL_UNPACK_BUFFER_BINDING
+    case 0x8A11: return 0x8A28;                 // GL_UNIFORM_BUFFER -> BINDING
+    case 0x8C8E: return 0x8C8F;                 // GL_TRANSFORM_FEEDBACK_BUFFER -> BINDING
+    case 0x8F36: return 0x8F36;                 // GL_COPY_READ_BUFFER (_BINDING)
+    case 0x8F37: return 0x8F37;                 // GL_COPY_WRITE_BUFFER (_BINDING)
+    default: return 0;
+    }
+}
+
+std::uint64_t mapping_key(HostGl& host, GLenum target) {
+    const std::uint64_t ctx_hash = (static_cast<std::uint64_t>(host.egl_context()) >> 4) & 0x7FFFFFFFULL;
+    GLuint bound = 0;
+    if (host.buffer_binding(target, bound)) {
+        if (bound > 0) return (1ULL << 63) | (ctx_hash << 32) | static_cast<std::uint64_t>(bound);
+        return (ctx_hash << 32) | static_cast<std::uint64_t>(target);
+    }
+    const GLenum binding = buffer_binding_enum(target);
+    if (binding != 0) {
+        GLint buffer = 0;
+        frame_probe_add_driver_query();
+        host.backend().glGetIntegerv(binding, &buffer);
+        if (buffer > 0) {
+            return (1ULL << 63) | (ctx_hash << 32) | static_cast<std::uint64_t>(static_cast<GLuint>(buffer));
+        }
+    }
+    return (ctx_hash << 32) | static_cast<std::uint64_t>(target);
+}
+
+bool find_mapping(HostGl& host, std::uint64_t key, BufferMapping& mapping) {
+    GlThreadState& current = state(host);
+    for (std::size_t i = 0; i < current.local_mapping_count; ++i) {
+        if (current.local_mappings[i].key == key) {
+            mapping = current.local_mappings[i].mapping;
+            return true;
+        }
+    }
+    if (global_mapping_count.load(std::memory_order_relaxed) == 0) return false;
     std::lock_guard<std::mutex> lock(mapping_mutex);
-    const auto found = mappings.find(target);
+    const auto found = mappings.find(key);
     if (found == mappings.end()) return false;
     mapping = found->second;
     return true;
+}
+
+void insert_mapping(HostGl& host, std::uint64_t key, const BufferMapping& mapping) {
+    GlThreadState& current = state(host);
+    if (!host.multi_thread_gl_active()) {
+        for (std::size_t i = 0; i < current.local_mapping_count; ++i) {
+            if (current.local_mappings[i].key == key) {
+                current.local_mappings[i].mapping = mapping;
+                return;
+            }
+        }
+        if (current.local_mapping_count < current.local_mappings.size()) {
+            current.local_mappings[current.local_mapping_count++] =
+                GlThreadState::LocalMapping{key, mapping};
+            return;
+        }
+    } else {
+        for (std::size_t i = 0; i < current.local_mapping_count; ++i) {
+            if (current.local_mappings[i].key == key) {
+                current.local_mappings[i] = current.local_mappings[--current.local_mapping_count];
+                break;
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(mapping_mutex);
+    mappings[key] = mapping;
+    global_mapping_count.store(mappings.size(), std::memory_order_relaxed);
+}
+
+bool take_mapping(HostGl& host, std::uint64_t key, BufferMapping& mapping) {
+    GlThreadState& current = state(host);
+    for (std::size_t i = 0; i < current.local_mapping_count; ++i) {
+        if (current.local_mappings[i].key == key) {
+            mapping = current.local_mappings[i].mapping;
+            current.local_mappings[i] = current.local_mappings[--current.local_mapping_count];
+            return true;
+        }
+    }
+    if (global_mapping_count.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lock(mapping_mutex);
+    const auto found = mappings.find(key);
+    if (found == mappings.end()) return false;
+    mapping = found->second;
+    mappings.erase(found);
+    global_mapping_count.store(mappings.size(), std::memory_order_relaxed);
+    return true;
+}
+
+void evict_buffer_mapping(HostGl& host, GLuint id) {
+    if (id == 0) return;
+    const std::uint64_t ctx_hash = (static_cast<std::uint64_t>(host.egl_context()) >> 4) & 0x7FFFFFFFULL;
+    const std::uint64_t key = (1ULL << 63) | (ctx_hash << 32) | static_cast<std::uint64_t>(id);
+    BufferMapping orphaned;
+    if (take_mapping(host, key, orphaned)) {
+        host.release_mirror(orphaned.guest, orphaned.capacity);
+    }
 }
 
 template <typename T>
@@ -975,30 +1965,47 @@ constexpr GLenum kGlReadWriteOes = 0x88BA;
 bool unmap_mirrored(HostGl& host, HostGl::Call& call, bool oes) {
     const GLenum target = call.scalar<GLenum>(0);
     if (!call.valid()) return true;
+    const std::uint64_t key = mapping_key(host, target);
     BufferMapping mapping;
-    bool mirrored = false;
-    {
-        std::lock_guard<std::mutex> lock(mapping_mutex);
-        const auto found = mappings.find(target);
-        if (found != mappings.end()) {
-            mapping = found->second;
-            mappings.erase(found);
-            mirrored = true;
+    const bool mirrored = take_mapping(host, key, mapping);
+    if (mirrored && mapping.shadow_only) {
+        const bool flush_explicit = (mapping.access & kGlMapFlushExplicit) != 0;
+        GLboolean result = 1;
+        if ((mapping.access & kGlMapWrite) != 0 && !flush_explicit && mapping.length > 0) {
+            const std::uint8_t* mirror =
+                host.runtime().memory().host_ptr(mapping.guest, mapping.length, kPageRead);
+            if (mirror == nullptr) {
+                host.reject(call, kGlInvalidOperation, "mapped buffer mirror is unreadable");
+                result = 0;
+            } else {
+                frame_probe_add_map_copy(mapping.length);
+                host.backend().glBufferSubData(
+                    target, mapping.offset, static_cast<GLsizeiptr>(mapping.length), mirror);
+            }
         }
+        host.release_mirror(mapping.guest, mapping.capacity);
+        call.set_result(result);
+        return true;
     }
     if (mirrored && (mapping.access & kGlMapWrite) != 0) {
+        const bool flush_explicit = (mapping.access & kGlMapFlushExplicit) != 0;
         const std::uint8_t* mirror =
             host.runtime().memory().host_ptr(mapping.guest, mapping.length, kPageRead);
         if (mirror == nullptr) {
             host.reject(call, kGlInvalidOperation, "mapped buffer mirror is unreadable");
         } else {
-            std::memcpy(mapping.data, mirror, static_cast<std::size_t>(mapping.length));
+            // With GL_MAP_FLUSH_EXPLICIT_BIT, glFlushMappedBufferRange already copied every
+            // written subrange to the driver pointer; avoid copying the entire range again on unmap.
+            if (!flush_explicit) {
+                std::memcpy(mapping.data, mirror, static_cast<std::size_t>(mapping.length));
+                frame_probe_add_map_copy(mapping.length);
+            }
             gl_diagnose_map_unmap(mapping.diagnostic, mapping.length, mirror, mapping.data);
         }
     }
     const GLboolean result =
         oes ? host.backend().glUnmapBufferOES(target) : host.backend().glUnmapBuffer(target);
-    if (mirrored) host.free_guest(mapping.guest);
+    if (mirrored) host.release_mirror(mapping.guest, mapping.capacity);
     call.set_result(result);
     return true;
 }
@@ -1019,7 +2026,7 @@ bool report_buffer_pointer(HostGl& host, HostGl::Call& call) {
         return true;
     }
     BufferMapping mapping;
-    *params = find_mapping(target, mapping) ? mapping.guest : 0;
+    *params = find_mapping(host, mapping_key(host, target), mapping) ? mapping.guest : 0;
     return true;
 }
 
@@ -1048,6 +2055,8 @@ bool zbgl_manual_glGetStringi(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(1);
     if (!call.valid()) return true;
     GlThreadState& current = state(host);
+    const std::uint64_t egl_gen = runtime_report().egl_current_generation();
+    current.ensure_strings_epoch(egl_gen);
     const std::uint64_t key = (static_cast<std::uint64_t>(name) << 32) | index;
     const auto cached = current.indexed_strings.find(key);
     if (cached != current.indexed_strings.end()) {
@@ -1097,21 +2106,52 @@ bool zbgl_manual_glMapBufferRange(HostGl& host, HostGl::Call& call) {
         host.reject(call, kGlInvalidValue, "mapped range offset or length is invalid");
         return true;
     }
+    const std::uint64_t key = mapping_key(host, target);
     BufferMapping existing;
-    if (find_mapping(target, existing)) {
+    if (find_mapping(host, key, existing)) {
         gl_diagnose_map_collision(host, target, existing.diagnostic);
         host.reject(call, kGlInvalidOperation, "buffer target is already mapped");
         return true;
     }
+    constexpr GLbitfield kGlMapUnsynchronized = 0x0020;
+    const GLbitfield kFastShadowAllowedBits = kGlMapWrite | kGlMapInvalidateRange |
+                                              kGlMapInvalidateBuffer | kGlMapFlushExplicit |
+                                              kGlMapUnsynchronized;
+    GLuint bound_buffer = 0;
+    const bool can_shadow =
+        !gl_diagnostics_enabled() &&
+        host.buffer_binding(target, bound_buffer) && bound_buffer != 0 &&
+        (access & kGlMapRead) == 0 && (access & kGlMapWrite) != 0 &&
+        (access & (kGlMapInvalidateRange | kGlMapInvalidateBuffer)) != 0 &&
+        (access & ~kFastShadowAllowedBits) == 0;
+    if (can_shadow) {
+        std::size_t mirror_capacity = 0;
+        const auto address = host.acquire_mirror(static_cast<std::size_t>(length), mirror_capacity);
+        std::uint8_t* mirror =
+            address ? host.runtime().memory().host_ptr(*address, static_cast<std::uint64_t>(length),
+                                                       kPageRead | kPageWrite)
+                    : nullptr;
+        if (mirror == nullptr) {
+            if (address) host.release_mirror(*address, mirror_capacity);
+            host.reject(call, kGlOutOfMemory, "guest mirror for the mapped buffer range failed");
+            return true;
+        }
+        insert_mapping(host, key,
+                       BufferMapping{*address, nullptr, static_cast<std::uint64_t>(length),
+                                     mirror_capacity, access, offset, true, {}});
+        call.set_result(*address);
+        return true;
+    }
     void* mapped = host.backend().glMapBufferRange(target, offset, length, access);
     if (mapped == nullptr) return true;  // The driver queued its own error; the guest gets NULL.
-    const auto address = host.allocate_guest(static_cast<std::size_t>(length));
+    std::size_t mirror_capacity = 0;
+    const auto address = host.acquire_mirror(static_cast<std::size_t>(length), mirror_capacity);
     std::uint8_t* mirror =
         address ? host.runtime().memory().host_ptr(*address, static_cast<std::uint64_t>(length),
                                                    kPageRead | kPageWrite)
                 : nullptr;
     if (mirror == nullptr) {
-        if (address) host.free_guest(*address);
+        if (address) host.release_mirror(*address, mirror_capacity);
         host.backend().glUnmapBuffer(target);
         host.reject(call, kGlOutOfMemory, "guest mirror for the mapped buffer range failed");
         return true;
@@ -1126,12 +2166,10 @@ bool zbgl_manual_glMapBufferRange(HostGl& host, HostGl::Call& call) {
     const GlMapDiagnostic diagnostic =
         gl_diagnose_map(host, target, offset, length, access, *address, mirror,
                         static_cast<const std::uint8_t*>(mapped));
-    {
-        std::lock_guard<std::mutex> lock(mapping_mutex);
-        mappings[target] = BufferMapping{
-            *address, static_cast<std::uint8_t*>(mapped), static_cast<std::uint64_t>(length),
-            access, diagnostic};
-    }
+    insert_mapping(host, key,
+                   BufferMapping{*address, static_cast<std::uint8_t*>(mapped),
+                                 static_cast<std::uint64_t>(length), mirror_capacity, access,
+                                 offset, false, diagnostic});
     call.set_result(*address);
     return true;
 }
@@ -1146,7 +2184,7 @@ bool zbgl_manual_glFlushMappedBufferRange(HostGl& host, HostGl::Call& call) {
     const GLsizeiptr length = call.scalar<GLsizeiptr>(2);
     if (!call.valid()) return true;
     BufferMapping mapping;
-    if (find_mapping(target, mapping) && (mapping.access & kGlMapWrite) != 0) {
+    if (find_mapping(host, mapping_key(host, target), mapping) && (mapping.access & kGlMapWrite) != 0) {
         // The flushed range is relative to the start of the mapped range.
         if (offset < 0 || length < 0 ||
             static_cast<std::uint64_t>(offset) + static_cast<std::uint64_t>(length) >
@@ -1161,7 +2199,15 @@ bool zbgl_manual_glFlushMappedBufferRange(HostGl& host, HostGl::Call& call) {
             host.reject(call, kGlInvalidOperation, "mapped buffer mirror is unreadable");
             return true;
         }
+        if (mapping.shadow_only) {
+            if (length > 0) {
+                frame_probe_add_map_copy(static_cast<std::uint64_t>(length));
+                host.backend().glBufferSubData(target, mapping.offset + offset, length, mirror);
+            }
+            return true;
+        }
         std::memcpy(mapping.data + offset, mirror, static_cast<std::size_t>(length));
+        frame_probe_add_map_copy(static_cast<std::uint64_t>(length));
         gl_diagnose_map_flush(mapping.diagnostic, offset, length, mirror,
                               mapping.data + offset);
     }
@@ -1188,8 +2234,9 @@ bool zbgl_manual_glMapBufferOES(HostGl& host, HostGl::Call& call) {
         host.reject(call, kGlInvalidEnum, "glMapBufferOES access is not a GL_*_ONLY enum");
         return true;
     }
+    const std::uint64_t key = mapping_key(host, target);
     BufferMapping existing;
-    if (find_mapping(target, existing)) {
+    if (find_mapping(host, key, existing)) {
         host.reject(call, kGlInvalidOperation, "buffer target is already mapped");
         return true;
     }
@@ -1201,13 +2248,14 @@ bool zbgl_manual_glMapBufferOES(HostGl& host, HostGl::Call& call) {
     }
     void* mapped = host.backend().glMapBufferOES(target, access);
     if (mapped == nullptr) return true;  // The driver queued its own error; the guest gets NULL.
-    const auto address = host.allocate_guest(static_cast<std::size_t>(size));
+    std::size_t mirror_capacity = 0;
+    const auto address = host.acquire_mirror(static_cast<std::size_t>(size), mirror_capacity);
     std::uint8_t* mirror =
         address ? host.runtime().memory().host_ptr(*address, static_cast<std::uint64_t>(size),
                                                    kPageRead | kPageWrite)
                 : nullptr;
     if (mirror == nullptr) {
-        if (address) host.free_guest(*address);
+        if (address) host.release_mirror(*address, mirror_capacity);
         host.backend().glUnmapBufferOES(target);
         host.reject(call, kGlOutOfMemory, "guest mirror for the mapped buffer failed");
         return true;
@@ -1218,12 +2266,10 @@ bool zbgl_manual_glMapBufferOES(HostGl& host, HostGl::Call& call) {
     const GlMapDiagnostic diagnostic =
         gl_diagnose_map(host, target, 0, size, bits, *address, mirror,
                         static_cast<const std::uint8_t*>(mapped));
-    {
-        std::lock_guard<std::mutex> lock(mapping_mutex);
-        mappings[target] = BufferMapping{
-            *address, static_cast<std::uint8_t*>(mapped), static_cast<std::uint64_t>(size), bits,
-            diagnostic};
-    }
+    insert_mapping(host, key,
+                   BufferMapping{*address, static_cast<std::uint8_t*>(mapped),
+                                 static_cast<std::uint64_t>(size), mirror_capacity, bits, 0,
+                                 false, diagnostic});
     call.set_result(*address);
     return true;
 }
@@ -1273,6 +2319,101 @@ bool zbgl_manual_glTexSubImage3D(HostGl& host, HostGl::Call& call) {
     return true;
 }
 
+namespace {
+
+bool compressed_pixel_pointer(HostGl& host, HostGl::Call& call, GLsizei imageSize,
+                              unsigned position, const void*& out) {
+    if (!call.valid()) return false;
+    if (imageSize < 0) {
+        host.reject(call, kGlInvalidValue, "compressed image size is negative");
+        return false;
+    }
+    const std::uint32_t guest_address = call.arg(position);
+    if (host.pixel_buffer(false) != 0) {
+        out = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(guest_address));
+        return true;
+    }
+    if (guest_address == 0) {
+        out = nullptr;
+        return true;
+    }
+    const std::uint8_t* ptr = host.runtime().memory().host_ptr(
+        guest_address, static_cast<std::uint64_t>(imageSize), kPageRead);
+    if (imageSize != 0 && ptr == nullptr) {
+        call.fail(kGlInvalidValue, "compressed texture data is unreadable");
+        return false;
+    }
+    out = ptr;
+    return true;
+}
+
+}  // namespace
+
+bool zbgl_manual_glCompressedTexImage2D(HostGl& host, HostGl::Call& call) {
+    const GLenum target = call.scalar<GLenum>(0);
+    const GLint level = call.scalar<GLint>(1);
+    const GLenum internalformat = call.scalar<GLenum>(2);
+    const GLsizei width = call.scalar<GLsizei>(3);
+    const GLsizei height = call.scalar<GLsizei>(4);
+    const GLint border = call.scalar<GLint>(5);
+    const GLsizei imageSize = call.scalar<GLsizei>(6);
+    const void* data = nullptr;
+    if (!compressed_pixel_pointer(host, call, imageSize, 7, data)) return true;
+    host.backend().glCompressedTexImage2D(target, level, internalformat, width, height, border,
+                                          imageSize, data);
+    return true;
+}
+
+bool zbgl_manual_glCompressedTexSubImage2D(HostGl& host, HostGl::Call& call) {
+    const GLenum target = call.scalar<GLenum>(0);
+    const GLint level = call.scalar<GLint>(1);
+    const GLint xoffset = call.scalar<GLint>(2);
+    const GLint yoffset = call.scalar<GLint>(3);
+    const GLsizei width = call.scalar<GLsizei>(4);
+    const GLsizei height = call.scalar<GLsizei>(5);
+    const GLenum format = call.scalar<GLenum>(6);
+    const GLsizei imageSize = call.scalar<GLsizei>(7);
+    const void* data = nullptr;
+    if (!compressed_pixel_pointer(host, call, imageSize, 8, data)) return true;
+    host.backend().glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                                             imageSize, data);
+    return true;
+}
+
+bool zbgl_manual_glCompressedTexImage3D(HostGl& host, HostGl::Call& call) {
+    const GLenum target = call.scalar<GLenum>(0);
+    const GLint level = call.scalar<GLint>(1);
+    const GLenum internalformat = call.scalar<GLenum>(2);
+    const GLsizei width = call.scalar<GLsizei>(3);
+    const GLsizei height = call.scalar<GLsizei>(4);
+    const GLsizei depth = call.scalar<GLsizei>(5);
+    const GLint border = call.scalar<GLint>(6);
+    const GLsizei imageSize = call.scalar<GLsizei>(7);
+    const void* data = nullptr;
+    if (!compressed_pixel_pointer(host, call, imageSize, 8, data)) return true;
+    host.backend().glCompressedTexImage3D(target, level, internalformat, width, height, depth,
+                                          border, imageSize, data);
+    return true;
+}
+
+bool zbgl_manual_glCompressedTexSubImage3D(HostGl& host, HostGl::Call& call) {
+    const GLenum target = call.scalar<GLenum>(0);
+    const GLint level = call.scalar<GLint>(1);
+    const GLint xoffset = call.scalar<GLint>(2);
+    const GLint yoffset = call.scalar<GLint>(3);
+    const GLint zoffset = call.scalar<GLint>(4);
+    const GLsizei width = call.scalar<GLsizei>(5);
+    const GLsizei height = call.scalar<GLsizei>(6);
+    const GLsizei depth = call.scalar<GLsizei>(7);
+    const GLenum format = call.scalar<GLenum>(8);
+    const GLsizei imageSize = call.scalar<GLsizei>(9);
+    const void* data = nullptr;
+    if (!compressed_pixel_pointer(host, call, imageSize, 10, data)) return true;
+    host.backend().glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width,
+                                             height, depth, format, imageSize, data);
+    return true;
+}
+
 bool zbgl_manual_glDrawArraysInstanced(HostGl& host, HostGl::Call& call) {
     const GLenum mode = call.scalar<GLenum>(0);
     const GLint first = call.scalar<GLint>(1);
@@ -1319,7 +2460,8 @@ bool zbgl_manual_glDrawRangeElements(HostGl& host, HostGl::Call& call) {
 
 bool zbgl_manual_glVertexAttribIPointer(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(0);
-    GlThreadState::Attribute& attribute = state(host).attributes[index];
+    GlThreadState& current = state(host);
+    GlThreadState::Attribute& attribute = current.attribute_mut(index);
     attribute.defined = true;
     attribute.size = call.scalar<GLint>(1);
     attribute.type = call.scalar<GLenum>(2);
@@ -1327,7 +2469,8 @@ bool zbgl_manual_glVertexAttribIPointer(HostGl& host, HostGl::Call& call) {
     attribute.stride = call.scalar<GLsizei>(3);
     attribute.guest_pointer = call.arg(4);
     attribute.integer = true;
-    attribute.buffer = state(host).array_buffer;
+    attribute.buffer = current.array_buffer;
+    current.refresh_client_flag(index, attribute);
     if (!call.valid()) return true;
     if (attribute.buffer != 0) {
         host.backend().glVertexAttribIPointer(

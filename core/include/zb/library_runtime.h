@@ -41,6 +41,9 @@ public:
 
     // Receives every host call outside the runtime range 0xFE00-0xFEFF. Call before start().
     void set_host_call_handler(Process::HostCallHandler handler);
+    // Optional synchronous fast path inside GuestThread::CallSVC; must never re-enter guest code
+    // or block. Call before start().
+    void set_fast_host_call_handler(Process::FastHostCallHandler handler, void* ctx);
     bool start(const LibraryRuntimeOptions& options, std::string& error);
 
     // Guest dlopen/dlsym/dlerror on the service thread. Flags are ZB_GUEST_RTLD_* values.
@@ -58,6 +61,9 @@ public:
     std::unique_ptr<Carrier> borrow(std::string& error);
 
     GuestMemory& memory();
+    // Diagnostics only: the guest thread registry, so the hang watchdog can read the registers and
+    // stacks of live guest threads (Process::sample_thread_state).
+    Process& process();
     // Redirects guest file operations under one directory to another (Process::add_path_alias):
     // the launcher's arm64 proxy directory stands for the plugin's arm32 libraries.
     void add_path_alias(std::string guest_prefix, std::string host_prefix);
@@ -65,6 +71,10 @@ public:
     std::vector<std::string> mapped_file_paths() const;
     // Valid after a successful start().
     const zb_service_api& service_api() const;
+    // Bumps the host-side EGL generation mirrored to guest libGLESv2.so (if registered).
+    void bump_gl_epoch();
+    // Bumps the object-deletion generation mirrored to guest libGLESv2.so (if registered).
+    void bump_gl_delete_epoch();
     // Real guest pthreads (service, carriers, guest-created threads); borrowers are not counted.
     std::size_t guest_thread_count() const;
     // True when this guest thread is a borrower: a host thread that entered the guest on a leased

@@ -46,17 +46,26 @@ POINTER_TYPES = HANDLE_TYPES | {
 # getters and the config/window/surface handle chores that need more than a marshaled call).
 HANDWRITTEN = {
     "eglChooseConfig",
+    "eglClientWaitSync",
+    "eglCopyBuffers",
     "eglCreateWindowSurface",
+    "eglDestroyContext",
+    "eglDestroyImage",
+    "eglDestroySurface",
+    "eglDestroySync",
     "eglGetConfigAttrib",
     "eglGetConfigs",
     "eglGetCurrentContext",
     "eglGetCurrentDisplay",
     "eglGetCurrentSurface",
     "eglGetProcAddress",
+    "eglGetSyncAttrib",
     "eglQueryString",
     "eglQuerySurface",
     "eglQueryContext",
     "eglSwapBuffers",
+    "eglTerminate",
+    "eglWaitSync",
 }
 
 # EGLint*/EGLAttrib* out-parameters that write exactly one element (eglInitialize's major and

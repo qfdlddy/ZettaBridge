@@ -4,6 +4,7 @@
 // resolution and native calls; the flat host calls are served in groups, one source file per group
 // (core/src/jni/host_jni_<group>.cpp).
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -74,14 +75,41 @@ struct HostJni::Impl {
     std::atomic<bool> ready{false};
     zb_jni_guest_api api{};
 
+    enum class AudioMethodHook : std::uint8_t {
+        None = 0,
+        IsBluetoothOn,
+        GetDevices,
+        DeviceCallbackNoop,
+        GetProperty,
+    };
+    struct MethodRecord {
+        JniBackend::Id id = 0;
+        std::string shorty;
+        // The Java method name and its full descriptor as the guest looked them up, for diagnostics
+        // only. Empty for a method id that came from reflection, where neither is ever sent to us.
+        std::string name;
+        std::string signature;
+        AudioMethodHook audio_hook = AudioMethodHook::None;
+    };
+    static constexpr std::size_t kMethodPageBits = 10;
+    static constexpr std::size_t kMethodPageSize = 1u << kMethodPageBits;
+    static constexpr std::size_t kMethodPages = 256;
+    struct MethodPage {
+        std::array<std::atomic<const MethodRecord*>, kMethodPageSize> entries{};
+    };
+
     GlobalHandles globals{HandleKind::Global};
     GlobalHandles weaks{HandleKind::WeakGlobal};
     IdTable methods;
     IdTable fields;
     std::mutex shorty_mutex;
-    std::vector<std::string> shorties;  // index: guest method id - 1
+    std::array<std::atomic<MethodPage*>, kMethodPages> method_pages_{};
+    std::vector<std::unique_ptr<MethodPage>> owned_method_pages_;
+    std::vector<std::unique_ptr<MethodRecord>> owned_methods_;
+    std::vector<MethodRecord> method_overflow_;  // index >= kMethodPages * kMethodPageSize
     NativeSlots slots;
     std::atomic<bool> logged_foreign_buffer{false};
+    std::atomic<bool> audio_bt_shield_noted{false};
 
     // Mirrors of direct buffers whose memory Java owns, which lies outside the guest's 4 GiB
     // space and so has no guest address of its own (host_jni_data.cpp). One mirror per host
@@ -98,6 +126,7 @@ struct HostJni::Impl {
     };
     // Total mirrored bytes are capped so a runaway guest cannot exhaust guest memory.
     static constexpr std::uint64_t kMirrorCapBytes = 64u * 1024u * 1024u;
+    std::atomic<bool> has_mirrors{false};
     std::mutex mirror_mutex;
     std::unordered_map<const void*, BufferMirror> mirrors;
     std::uint64_t mirrored_bytes = 0;
@@ -113,10 +142,17 @@ struct HostJni::Impl {
     // A host local reference as a handle of the calling thread's top frame.
     std::uint32_t local(JniThread& state, JniBackend::Ref ref) { return state.locals.add(ref); }
 
-    // Guest method ids and their shorties.
-    std::uint32_t intern_method(JniBackend::Id id, const std::string& shorty);
+    // Guest method ids and their metadata/shorties. `java_name`/`java_signature` are recorded for
+    // diagnostics only (see MethodRecord) and may be empty.
+    std::uint32_t intern_method(JniBackend::Id id, const std::string& shorty,
+                                AudioMethodHook audio_hook = AudioMethodHook::None,
+                                const std::string& java_name = std::string(),
+                                const std::string& java_signature = std::string());
+    // Fast lock-free lookup for the common dense method id range; nullptr triggers fallback/fatal.
+    const MethodRecord* method_record_fast(std::uint32_t id) const;
     // The shorty of a guest method id; nullopt for an unknown id.
     std::optional<std::string> method_shorty(std::uint32_t id);
+    std::optional<MethodRecord> method_record(std::uint32_t id);
     JniBackend::Id method_id(JniBackend::Env env, std::uint32_t id, const char* function);
     JniBackend::Id field_id(JniBackend::Env env, std::uint32_t id, const char* function);
 
@@ -139,6 +175,17 @@ struct HostJni::Impl {
     // Copies every mirror back into its Java buffer. The one guest -> host sync point.
     void flush_buffer_mirrors(JniBackend::Env env);
 
+    // JNI results that were null/0 where the guest expected an object. A guest that then
+    // dereferences the missing value crashes far away from the call that produced it, so the
+    // name of the Java method has to be recorded where it is still known.
+    std::atomic<std::uint64_t> null_result_total_{0};
+    std::mutex null_result_mutex_;
+    // Distinct null-producing methods already written to the report, bounded by kMaxNullResults
+    // so a guest that calls a broken getter in a loop cannot grow the report.
+    static constexpr std::size_t kMaxNullResults = 24;
+    std::vector<std::string> null_results_;
+    void note_null_result(const std::string& what);
+
     // Host-call groups; each returns false for indices it does not serve.
     bool serve_objects(JniCall& call);
     bool serve_values(JniCall& call);
@@ -147,7 +194,7 @@ struct HostJni::Impl {
     bool serve_vm(JniCall& call);
 };
 
-const char* jni_host_call_name(std::uint32_t index);
+std::string jni_recent_calls();
 // Makes jni the target of the process-wide native thunk dispatcher (host_jni_natives.cpp).
 void install_native_dispatcher(HostJni::Impl* jni);
 

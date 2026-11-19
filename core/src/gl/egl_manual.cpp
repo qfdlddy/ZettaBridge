@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -10,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "cpu_tuning.h"
+#include "gl/frame_probe.h"
 #include "gl/gl_diagnostics.h"
 #include "zb/egl_hostcalls.h"
 #include "zb/host_egl.h"
@@ -17,6 +20,279 @@
 #include "zb/runtime_report.h"
 
 namespace zb {
+
+#if !defined(ZB_NO_TELEMETRY)
+// Frame-cost probe (gl/frame_probe.h). One window is long enough to average out a single slow
+// frame and short enough that a phase change appears in the report within a few seconds.
+namespace {
+
+constexpr std::uint64_t kFrameProbeWindow = 120;
+
+struct FrameProbe {
+    std::atomic<std::uint64_t> host_ns{0};
+    std::atomic<std::uint64_t> host_ticks{0};
+    std::atomic<std::uint64_t> map_copy_bytes{0};
+    std::atomic<std::uint64_t> driver_queries{0};
+    // Slowest single host GL call since the last swap: its duration and entry-point name. The
+    // name is a string literal in the generated dispatch table, so the pointer never dangles.
+    std::atomic<std::uint64_t> worst_call_ns{0};
+    std::atomic<std::uint64_t> worst_call_ticks{0};
+    std::atomic<const char*> worst_call_name{nullptr};
+    std::atomic<const char*> worst_tick_call_name{nullptr};
+    std::atomic<std::uint64_t> last_swap_ns{0};
+    std::atomic<std::uint64_t> total_swaps{0};
+
+    // Render-thread only.
+    std::uint64_t swaps = 0;
+    std::uint64_t slow_33 = 0;   // frames over 33 ms (missed a 30 Hz deadline)
+    std::uint64_t slow_50 = 0;   // frames over 50 ms (visible stutter)
+    std::uint64_t slow_100 = 0;  // frames over 100 ms (a freeze)
+    std::uint64_t last_swap_end = 0;
+    std::uint64_t interval_sum = 0;
+    std::uint64_t interval_max = 0;
+    std::uint64_t swap_sum = 0;
+    std::uint64_t swap_max = 0;
+    std::uint64_t host_sum = 0;
+    std::uint64_t host_max = 0;
+    std::uint64_t map_copy_sum = 0;
+    std::uint64_t query_sum = 0;
+    std::uint64_t window_frames = 0;
+};
+
+FrameProbe& frame_probe() {
+    static FrameProbe probe;
+    return probe;
+}
+
+void publish_frame_probe(FrameProbe& probe) {
+    const std::uint64_t frames = probe.window_frames;
+    if (frames == 0) return;
+    const auto average_ms = [frames](std::uint64_t sum) {
+        return static_cast<double>(sum) / static_cast<double>(frames) / 1e6;
+    };
+    const auto max_ms = [](std::uint64_t value) { return static_cast<double>(value) / 1e6; };
+    const double interval_ms = average_ms(probe.interval_sum);
+    const double swap_ms = average_ms(probe.swap_sum);
+    const double host_ms = average_ms(probe.host_sum);
+    // "guest" is what is left of the frame once the driver swap and the bridge's own GL work are
+    // subtracted: Unity's rendering logic under translation, syscalls and waits.
+    const double guest_ms =
+        interval_ms > swap_ms + host_ms ? interval_ms - swap_ms - host_ms : 0.0;
+
+    char text[256];
+    std::snprintf(text, sizeof text, "fps=%.1f interval=%.1f/%.1f swap=%.1f/%.1f host-gl=%.1f/%.1f",
+                  interval_ms > 0.0 ? 1000.0 / interval_ms : 0.0, interval_ms,
+                  max_ms(probe.interval_max), swap_ms, max_ms(probe.swap_max), host_ms,
+                  max_ms(probe.host_max));
+    // avg/max milliseconds; the second line is the same split as a share of the frame.
+    runtime_report().note_gl_detail("perf-frame", text, true);
+    std::snprintf(text, sizeof text, "guest=%.1f (%.0f%% of frame) swap=%.0f%% host-gl=%.0f%%",
+                  guest_ms, interval_ms > 0.0 ? guest_ms * 100.0 / interval_ms : 0.0,
+                  interval_ms > 0.0 ? swap_ms * 100.0 / interval_ms : 0.0,
+                  interval_ms > 0.0 ? host_ms * 100.0 / interval_ms : 0.0);
+    runtime_report().note_gl_detail("perf-split", text, true);
+    std::snprintf(text, sizeof text, "frames=%llu kib-per-frame=%.1f driver-queries-per-frame=%.1f",
+                  static_cast<unsigned long long>(frames),
+                  static_cast<double>(probe.map_copy_sum) / static_cast<double>(frames) / 1024.0,
+                  static_cast<double>(probe.query_sum) / static_cast<double>(frames));
+    runtime_report().note_gl_detail("perf-mirror", text, true);
+    const char* worst_name = probe.worst_call_name.load(std::memory_order_relaxed);
+    std::snprintf(text, sizeof text, "over33=%llu over50=%llu over100=%llu worst-call=%s %.1fms",
+                  static_cast<unsigned long long>(probe.slow_33),
+                  static_cast<unsigned long long>(probe.slow_50),
+                  static_cast<unsigned long long>(probe.slow_100),
+                  worst_name != nullptr ? worst_name : "-",
+                  static_cast<double>(probe.worst_call_ns.load(std::memory_order_relaxed)) / 1e6);
+    runtime_report().note_gl_detail("perf-jank", text, true);
+
+    probe.interval_sum = probe.interval_max = 0;
+    probe.swap_sum = probe.swap_max = 0;
+    probe.host_sum = probe.host_max = 0;
+    probe.map_copy_sum = probe.query_sum = 0;
+    probe.slow_33 = probe.slow_50 = probe.slow_100 = 0;
+    probe.worst_call_ns.store(0, std::memory_order_relaxed);
+    probe.worst_call_name.store(nullptr, std::memory_order_relaxed);
+    probe.window_frames = 0;
+}
+
+}  // namespace
+
+std::uint64_t frame_probe_now_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+#if defined(__aarch64__)
+namespace {
+
+inline std::uint64_t frame_probe_counter_freq_hz() {
+    static const std::uint64_t freq = [] {
+        std::uint64_t val = 0;
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+        return val;
+    }();
+    return freq;
+}
+
+inline std::uint64_t frame_probe_ticks_to_ns(std::uint64_t ticks) {
+    const std::uint64_t freq = frame_probe_counter_freq_hz();
+    if (freq == 0) return ticks;
+    return static_cast<std::uint64_t>((static_cast<unsigned __int128>(ticks) * 1'000'000'000ULL) /
+                                      freq);
+}
+
+}  // namespace
+#endif
+
+std::uint64_t frame_probe_call_now_ticks() {
+#if defined(__aarch64__)
+    if (frame_probe_counter_freq_hz() != 0) {
+        std::uint64_t val = 0;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+        return val;
+    }
+#endif
+    return frame_probe_now_ns();
+}
+
+void frame_probe_host_call(const char* name, std::uint64_t ns) {
+    FrameProbe& probe = frame_probe();
+    probe.host_ns.fetch_add(ns, std::memory_order_relaxed);
+    std::uint64_t worst = probe.worst_call_ns.load(std::memory_order_relaxed);
+    while (ns > worst) {
+        if (probe.worst_call_ns.compare_exchange_weak(worst, ns, std::memory_order_relaxed)) {
+            probe.worst_call_name.store(name, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+struct ThreadFrameTicks {
+    std::uint64_t host_ticks = 0;
+    std::uint64_t worst_ticks = 0;
+    const char* worst_name = nullptr;
+    std::uint32_t pending_calls = 0;
+
+    void flush() {
+        if (pending_calls == 0 && host_ticks == 0 && worst_ticks == 0) return;
+        FrameProbe& probe = frame_probe();
+        if (host_ticks != 0) {
+            probe.host_ticks.fetch_add(host_ticks, std::memory_order_relaxed);
+        }
+        if (worst_ticks != 0) {
+            std::uint64_t worst = probe.worst_call_ticks.load(std::memory_order_relaxed);
+            while (worst_ticks > worst) {
+                if (probe.worst_call_ticks.compare_exchange_weak(worst, worst_ticks,
+                                                                  std::memory_order_relaxed)) {
+                    probe.worst_tick_call_name.store(worst_name, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+        host_ticks = 0;
+        worst_ticks = 0;
+        worst_name = nullptr;
+        pending_calls = 0;
+    }
+
+    ~ThreadFrameTicks() { flush(); }
+};
+
+ThreadFrameTicks& thread_frame_ticks() {
+    thread_local ThreadFrameTicks tls;
+    return tls;
+}
+
+void frame_probe_host_call_ticks(const char* name, std::uint64_t ticks) {
+    ThreadFrameTicks& tls = thread_frame_ticks();
+    tls.host_ticks += ticks;
+    if (ticks > tls.worst_ticks) {
+        tls.worst_ticks = ticks;
+        tls.worst_name = name;
+    }
+    if (++tls.pending_calls >= 256) {
+        tls.flush();
+    }
+}
+
+void frame_probe_add_map_copy(std::uint64_t bytes) {
+    frame_probe().map_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void frame_probe_add_driver_query() {
+    frame_probe().driver_queries.fetch_add(1, std::memory_order_relaxed);
+}
+
+void frame_probe_swap(std::uint64_t before_ns, std::uint64_t after_ns) {
+    thread_frame_ticks().flush();
+    FrameProbe& probe = frame_probe();
+    probe.last_swap_ns.store(after_ns, std::memory_order_relaxed);
+    probe.total_swaps.fetch_add(1, std::memory_order_relaxed);
+
+    const std::uint64_t swap_ns = after_ns > before_ns ? after_ns - before_ns : 0;
+    const std::uint64_t raw_host_ns = probe.host_ns.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t raw_host_ticks = probe.host_ticks.exchange(0, std::memory_order_relaxed);
+#if defined(__aarch64__)
+    const std::uint64_t tick_host_ns = frame_probe_ticks_to_ns(raw_host_ticks);
+#else
+    const std::uint64_t tick_host_ns = raw_host_ticks;
+#endif
+    const std::uint64_t host_ns = raw_host_ns + tick_host_ns;
+    const std::uint64_t worst_ticks = probe.worst_call_ticks.exchange(0, std::memory_order_relaxed);
+    if (worst_ticks > 0) {
+#if defined(__aarch64__)
+        const std::uint64_t worst_tick_ns = frame_probe_ticks_to_ns(worst_ticks);
+#else
+        const std::uint64_t worst_tick_ns = worst_ticks;
+#endif
+        const char* worst_tick_name = probe.worst_tick_call_name.exchange(nullptr, std::memory_order_relaxed);
+        std::uint64_t cur_worst = probe.worst_call_ns.load(std::memory_order_relaxed);
+        while (worst_tick_ns > cur_worst) {
+            if (probe.worst_call_ns.compare_exchange_weak(cur_worst, worst_tick_ns,
+                                                          std::memory_order_relaxed)) {
+                if (worst_tick_name != nullptr) {
+                    probe.worst_call_name.store(worst_tick_name, std::memory_order_relaxed);
+                }
+                break;
+            }
+        }
+    }
+    const std::uint64_t map_copy = probe.map_copy_bytes.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t queries = probe.driver_queries.exchange(0, std::memory_order_relaxed);
+
+    if (probe.last_swap_end == 0) {
+        // No interval exists before the first swap; start the window here.
+        probe.last_swap_end = after_ns;
+        return;
+    }
+    const std::uint64_t interval_ns =
+        before_ns > probe.last_swap_end ? before_ns - probe.last_swap_end : 0;
+    probe.interval_sum += interval_ns;
+    if (interval_ns > probe.interval_max) probe.interval_max = interval_ns;
+    if (interval_ns > 33'000'000) ++probe.slow_33;
+    if (interval_ns > 50'000'000) ++probe.slow_50;
+    if (interval_ns > 100'000'000) ++probe.slow_100;
+    probe.swap_sum += swap_ns;
+    if (swap_ns > probe.swap_max) probe.swap_max = swap_ns;
+    probe.host_sum += host_ns;
+    if (host_ns > probe.host_max) probe.host_max = host_ns;
+    probe.map_copy_sum += map_copy;
+    probe.query_sum += queries;
+    probe.last_swap_end = after_ns;
+    ++probe.swaps;
+    if (++probe.window_frames >= kFrameProbeWindow) publish_frame_probe(probe);
+}
+
+std::uint64_t frame_probe_last_swap_ns() {
+    return frame_probe().last_swap_ns.load(std::memory_order_relaxed);
+}
+
+std::uint64_t frame_probe_total_swaps() {
+    return frame_probe().total_swaps.load(std::memory_order_relaxed);
+}
+#endif  // !ZB_NO_TELEMETRY
 
 namespace {
 
@@ -441,7 +717,11 @@ bool zbegl_manual_eglSwapBuffers(HostEgl& host, HostEgl::Call& call) {
     if (!call.valid()) return true;
     runtime_report().note_egl_swap();
     if (gl_diagnostics_enabled()) gl_diagnose_swap();
-    call.set_result(host.backend().eglSwapBuffers(dpy, surface));
+    const std::uint64_t before_ns = frame_probe_now_ns();
+    const EGLBoolean swapped = host.backend().eglSwapBuffers(dpy, surface);
+    const std::uint64_t after_ns = frame_probe_now_ns();
+    frame_probe_swap(before_ns, after_ns);
+    call.set_result(swapped);
     return true;
 }
 
@@ -462,6 +742,59 @@ bool zbegl_manual_eglCreatePixmapSurface(HostEgl&, HostEgl::Call& call) {
 }
 
 bool zbegl_manual_eglCreatePlatformPixmapSurface(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "native pixmaps are not supported");
+}
+
+bool zbegl_manual_eglDestroyContext(HostEgl& host, HostEgl::Call& call) {
+    EGLDisplay dpy = as_pointer(call.handle_of(0, EglObject::Display));
+    EGLContext ctx = as_pointer(call.handle_of(1, EglObject::Context));
+    if (!call.valid()) return true;
+    const EGLBoolean ok = host.backend().eglDestroyContext(dpy, ctx);
+    if (ok) host.forget_handle(call.arg(1));
+    call.set_result(ok);
+    return true;
+}
+
+bool zbegl_manual_eglDestroySurface(HostEgl& host, HostEgl::Call& call) {
+    EGLDisplay dpy = as_pointer(call.handle_of(0, EglObject::Display));
+    EGLSurface surface = as_pointer(call.handle_of(1, EglObject::Surface));
+    if (!call.valid()) return true;
+    const EGLBoolean ok = host.backend().eglDestroySurface(dpy, surface);
+    if (ok) host.forget_handle(call.arg(1));
+    call.set_result(ok);
+    return true;
+}
+
+bool zbegl_manual_eglTerminate(HostEgl& host, HostEgl::Call& call) {
+    EGLDisplay dpy = as_pointer(call.handle_of(0, EglObject::Display));
+    if (!call.valid()) return true;
+    const EGLBoolean ok = host.backend().eglTerminate(dpy);
+    if (ok) host.forget_handle(call.arg(0));
+    call.set_result(ok);
+    return true;
+}
+
+bool zbegl_manual_eglDestroyImage(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "EGLImage objects cannot cross to a 32-bit guest");
+}
+
+bool zbegl_manual_eglDestroySync(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "EGLSync objects cannot cross to a 32-bit guest");
+}
+
+bool zbegl_manual_eglClientWaitSync(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "EGLSync objects cannot cross to a 32-bit guest");
+}
+
+bool zbegl_manual_eglWaitSync(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "EGLSync objects cannot cross to a 32-bit guest");
+}
+
+bool zbegl_manual_eglGetSyncAttrib(HostEgl&, HostEgl::Call& call) {
+    return unsupported(call, "EGLSync objects cannot cross to a 32-bit guest");
+}
+
+bool zbegl_manual_eglCopyBuffers(HostEgl&, HostEgl::Call& call) {
     return unsupported(call, "native pixmaps are not supported");
 }
 

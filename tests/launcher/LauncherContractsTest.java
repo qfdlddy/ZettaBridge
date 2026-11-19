@@ -145,6 +145,13 @@ public final class LauncherContractsTest {
         check("save".equals(read(new File(target, "data/save.dat"))), "reimport preserves plugin data");
         check(!new File(target, "lib/stale.so").exists(), "reimport drops stale runtime files");
         check("new".equals(read(new File(target, "lib/current.so"))), "reimport publishes staged files");
+
+        File stagedApk = new File(root, "staging.apk");
+        File publishedApk = new File(root, "published/base.apk");
+        write(stagedApk, "apk-bytes");
+        PluginFiles.moveOrCopy(stagedApk, publishedApk);
+        check(!stagedApk.exists(), "moveOrCopy removes staging file");
+        check("apk-bytes".equals(read(publishedApk)), "moveOrCopy publishes contents");
     }
 
     public static void main(String[] args) throws Exception {

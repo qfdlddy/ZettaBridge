@@ -531,7 +531,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
         Compat,
         OpenSl,
     };
-    static constexpr std::size_t kDispatchTableSize = ZB_OPENSL_HC_last + 64u;
+    static constexpr std::size_t kDispatchTableSize = ZB_COMPAT_HC_UnsupportedEntryPoint + 1u;
     static_assert(kGlHostCallLast < kDispatchTableSize);
     static_assert(kEglHostCallLast < kDispatchTableSize);
     static_assert(ZB_COMPAT_HC_AndroidBitmap_unlockPixels < kDispatchTableSize);
@@ -543,6 +543,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     static_assert(ZB_CONFIG_HC_LAST < kDispatchTableSize);
     static_assert(ZB_COMPAT_HC_ALooper_pollAll < kDispatchTableSize);
     static_assert(ZB_OPENSL_HC_last < kDispatchTableSize);
+    static_assert(ZB_COMPAT_HC_UnsupportedEntryPoint < kDispatchTableSize);
     static_assert(kDispatchTableSize <= ZB_JNI_SLOT_STUB_FIRST);
     static const std::array<HostCallTarget, kDispatchTableSize> kDispatchTable = [] {
         std::array<HostCallTarget, kDispatchTableSize> t{};
@@ -563,6 +564,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
         fill_range(ZB_INPUT_HC_FIRST, ZB_INPUT_HC_LAST, HostCallTarget::Input);
         fill_range(ZB_CONFIG_HC_FIRST, ZB_CONFIG_HC_LAST, HostCallTarget::Config);
         t[ZB_COMPAT_HC_ALooper_pollAll] = HostCallTarget::Looper;
+        t[ZB_COMPAT_HC_UnsupportedEntryPoint] = HostCallTarget::Compat;
         fill_range(ZB_OPENSL_HC_slCreateEngine, ZB_OPENSL_HC_last, HostCallTarget::OpenSl);
         return t;
     }();

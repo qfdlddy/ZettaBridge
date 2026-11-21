@@ -367,6 +367,18 @@ def configuration_names():
     return sorted(names)
 
 
+def unsupported_entry_names():
+    """The stub eglGetProcAddress hands out for a GL or EGL name this bridge does not implement.
+
+    An engine that resolves every entry point once and calls through the table without a null
+    check jumps to address zero when the answer is null: Unity 4.5 stored the pointer and died
+    much later, after mono turned the illegal instruction into an exception. A stub that does
+    nothing and answers zero is what a driver without that extension behaves like, and the calls
+    stay visible in the report (`unsupported-entry-calls`).
+    """
+    return ["zb_unsupported_entry_point"]
+
+
 LIBRARIES = [
     ("libGLESv2", gles2_names),
     ("libandroid", android_names),
@@ -402,6 +414,9 @@ LIBRARIES = [
     # opensl_hostcalls.h holds the OpenSL indices by hand, and every earlier block above is
     # referenced by number somewhere. Exported by libGLESv2 so the guest state cache sees them.
     ("libGLESv2", gles1_extension_names),
+    # What eglGetProcAddress answers for a name this bridge does not implement, appended after
+    # every established index (714). See unsupported_entry_names().
+    ("libEGL", unsupported_entry_names),
 ]
 
 

@@ -1,6 +1,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 #include <dynarmic/interface/exclusive_monitor.h>
 
@@ -45,6 +46,12 @@ int main() {
     CHECK(call(compat, thread, zb::ZB_COMPAT_HC_AndroidBitmap_unlockPixels) ==
           static_cast<std::uint32_t>(-1));
     CHECK(!compat.handle_host_call(zb::ZB_COMPAT_HC_ALooper_prepare, thread));
+
+    // An entry point this bridge does not implement answers zero, and is not counted as a missing
+    // host call: the guest called the stub it was handed, not a function we failed to serve.
+    CHECK(call(compat, thread, zb::ZB_COMPAT_HC_UnsupportedEntryPoint) == 0);
+    CHECK(call(compat, thread, zb::ZB_COMPAT_HC_UnsupportedEntryPoint) == 0);
+    CHECK(zb::runtime_report().text().find("gl-unsupported-entry-calls: 2") != std::string::npos);
 
     CHECK(zb::runtime_report().unimplemented_host_calls() == 8);
     CHECK(zb::runtime_report().first_unimplemented_host_call() ==

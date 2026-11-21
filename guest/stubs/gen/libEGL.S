@@ -370,3 +370,11 @@ eglDestroyImageKHR:
     svc #0x5a00d7
     bx lr
 .size eglDestroyImageKHR, . - eglDestroyImageKHR
+
+.global zb_unsupported_entry_point
+.type zb_unsupported_entry_point, %function
+.p2align 2
+zb_unsupported_entry_point:
+    svc #0x5a02ca
+    bx lr
+.size zb_unsupported_entry_point, . - zb_unsupported_entry_point

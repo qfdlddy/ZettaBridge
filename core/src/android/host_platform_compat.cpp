@@ -1,6 +1,8 @@
 #include "zb/host_platform_compat.h"
 
+#include <atomic>
 #include <cerrno>
+#include <string>
 
 #include "zb/platform_compat_hostcalls.h"
 #include "zb/runtime_report.h"
@@ -32,6 +34,17 @@ constexpr Fallback kFallbacks[] = {
 }  // namespace
 
 bool HostPlatformCompat::handle_host_call(std::uint32_t index, GuestThread& thread) {
+    if (index == ZB_COMPAT_HC_UnsupportedEntryPoint) {
+        // The guest called an entry point this bridge does not implement, through the address
+        // eglGetProcAddress handed it. It answers zero, as a driver without that extension would,
+        // instead of the guest jumping to address zero.
+        static std::atomic<std::uint64_t> calls{0};
+        runtime_report().note_gl_detail("unsupported-entry-calls",
+                                        std::to_string(calls.fetch_add(1) + 1), true);
+        thread.regs()[0] = 0;
+        thread.regs()[1] = 0;
+        return true;
+    }
     for (const Fallback& fallback : kFallbacks) {
         if (fallback.index != index) continue;
         runtime_report().note_unimplemented_host_call(index, fallback.library, fallback.function);

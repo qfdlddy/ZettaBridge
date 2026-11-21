@@ -713,3 +713,4 @@
 {711, "libGLESv2.so", "glTranslatexOES"},
 {712, "libGLESv2.so", "glWaitSyncAPPLE"},
 {713, "libGLESv2.so", "glWeightPointerOES"},
+{714, "libEGL.so", "zb_unsupported_entry_point"},

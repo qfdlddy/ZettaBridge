@@ -2152,3 +2152,49 @@ Road Trip rendered its garage menu, confirmed by screenshot, with `proxy-loads: 
 `unimplemented-host-calls: 0`, `guest-exit: (none)` and `gl-calls` 463 -> 197,897. `egl-swaps`
 stayed 0 on that GLES 1.1 title while frames were clearly presented, so it is not a frame counter
 on the legacy-context path and the screenshot, not that line, is the acceptance evidence.
+
+## 2026-11-21: the three diagnostics the 0.1.1 line had and this one did not
+
+`upstream/main` (`8094379`) and this line diverged at `e1ccf05`. Three of its 28 commits are
+diagnostic or compatibility work this line lacked; they are ported here, adapted to the code that
+already exists rather than copied.
+
+- **Undefined instructions** (`9142dd0`, from `22c9e7f`). `Process::deliver_fault` now records the
+  first four SIGILL faults with the instruction word at the program counter, whether the guest was
+  in Thumb state, and the calling address, plus an `undefined-instructions` count. A guest that
+  handles the signal itself - Mono turns it into an `ExecutionEngineException` and aborts much
+  later - is exactly the case that used to leave nothing behind. The caller-naming half of the
+  upstream pair (`a05821d`) was already covered here: `note_fault_details` writes
+  `crash-fault-lr-<signo>` for every fault, symbolized, before the signal is delivered.
+- **Unsupported GL entry points** (this commit, from `d480b63`). `eglGetProcAddress` used to answer
+  zero for a `gl*`/`egl*` name this bridge does not implement. An engine that stores every
+  resolved pointer and calls through the table without a null check (Unity 4.5, Impeller) then
+  jumps to address zero, and the illegal instruction surfaces far from the probe. The answer is now
+  the guest address of `zb_unsupported_entry_point`, a generated stub that does nothing and
+  answers zero, and each call is counted as `gl-unsupported-entry-calls`. The misses themselves
+  are still named by `egl-procaddress-miss-*` as before.
+- **Index 714, not 492.** The stable line inserted its stub at 492 and shifted the GLES 1.1 block
+  up by one. That is impossible here: 492-578 are the GLES 1.1 rows. `tools/gen_stubs.py` gained
+  `unsupported_entry_names()` as its last `LIBRARIES` entry, so the stub lands after everything
+  else; regenerating changed exactly one row in `core/src/gen/hostcalls.inc` (714) and added one
+  symbol to `guest/stubs/gen/libEGL.S`, which is the append-only rule this repository keeps.
+  `ZB_COMPAT_HC_UnsupportedEntryPoint` names the index and `proxy_runtime.cpp`'s dispatch table now
+  covers it (its size is derived from that constant), so the call reaches `HostPlatformCompat`.
+
+Verification: GLES/EGL/JNI generator checks and `check_gles1_hostcalls.py` (87 names, 492-578) pass;
+`tools/build_guest.sh` passes and `libEGL.so` exports `zb_unsupported_entry_point` at 0xbb0;
+Android arm64 `zbridge`/`zbproxy` link; launcher bundle 8.2 MiB; Gradle `assembleLauncherRelease`
+passes; the APK's `libzbridge.so` and `assets/zb/guest/lib/libEGL.so` hashes match the build. On the
+MuMu emulator Zombie Road Trip renders its garage menu again (`gl-calls` 28,265,
+`unimplemented-host-calls: 0`, `guest-exit: (none)`, screenshot) and Topsoil runs
+(`gl-calls` 1,024, `egl-swaps` 13, no error).
+
+Still unproven on a device: nothing imported here probes a GL name this bridge lacks, so neither
+guest produced an `egl-procaddress-miss` and the miss -> stub -> `svc 0x5a02ca` -> zero path has
+only been exercised by `egl_marshal_test` and `platform_compat_test` (see below). The line to look
+for in a Flutter or Unity run is `gl-unsupported-entry-calls`.
+
+`tests/host/egl_marshal_test.cpp` and `tests/host/platform_compat_test.cpp` are updated for the new
+answer and the new counter, but this checkout has no host C++ toolchain, so they were
+syntax-checked with the NDK compiler and not executed here. The full host suite still has to run
+where clang++ exists.

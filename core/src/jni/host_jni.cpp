@@ -755,7 +755,18 @@ std::optional<HostJni::NativeResult> HostJni::call_native(JniBackend::Env env, c
     // The single funnel for every Java -> guest native invocation: one relaxed atomic add per
     // call, no lock, no string work. call_counter is null for calls that are not dispatching a
     // bound native method (the loader's own JNI_OnLoad call), which are not counted.
-    if (call_counter != nullptr) call_counter->count.fetch_add(1, std::memory_order_relaxed);
+    if (call_counter != nullptr) {
+        call_counter->count.fetch_add(1, std::memory_order_relaxed);
+        call_counter->pending.fetch_add(1, std::memory_order_relaxed);
+    }
+    // A call that has entered a native method and not returned is what a watchdog has to name
+    // when a caller looks stuck. Every ordinary exit path decrements through this guard.
+    struct PendingCall {
+        NativeCallCounter* counter;
+        ~PendingCall() {
+            if (counter != nullptr) counter->pending.fetch_sub(1, std::memory_order_relaxed);
+        }
+    } pending_call{call_counter};
     Impl& jni = *impl_;
     JniThread& state = jni.thread();
     const JniBackend::Env outer_env = state.env;

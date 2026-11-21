@@ -49,6 +49,10 @@ struct Slot {
 
 Slot g_slots[kMaxSlots];
 
+// The thread that presents frames. Zero until the guest first swaps, which is why the report
+// says "(none)" instead of naming an unrelated thread before the first frame.
+std::atomic<std::int32_t> g_render_thread{0};
+
 struct AtomicGuestVmCounters {
     std::atomic<std::uint64_t> mmap_calls{0};
     std::atomic<std::uint64_t> mmap_bytes{0};
@@ -178,6 +182,10 @@ void record_thread_activity_done(std::int32_t tid) {
             return;
         }
     }
+}
+
+void record_render_thread(std::int32_t host_tid) {
+    if (host_tid != 0) g_render_thread.store(host_tid, std::memory_order_relaxed);
 }
 
 void release_thread_activity(std::int32_t tid) {
@@ -798,7 +806,8 @@ private:
 
 }  // namespace
 
-HangWatchdog::HangWatchdog(SnapshotFn snapshot) : snapshot_(std::move(snapshot)) {}
+HangWatchdog::HangWatchdog(SnapshotFn snapshot, DetailFn pending_signals)
+    : snapshot_(std::move(snapshot)), pending_signals_(std::move(pending_signals)) {}
 
 bool HangWatchdog::sample(Clock::time_point now) {
     const std::vector<ThreadActivitySample> current = snapshot_();
@@ -867,6 +876,38 @@ bool HangWatchdog::sample(Clock::time_point now) {
         if (a_rank != b_rank) return a_rank < b_rank;
         return a->tid < b->tid;
     });
+
+    // A frozen screen has two candidates that look identical in the thread list: the guest stopped
+    // drawing, or it is drawing and nothing reaches the display. The presenting thread answers
+    // that, and it is listed separately because a busy worker pool can crowd it out.
+    const std::int32_t render_tid = g_render_thread.load(std::memory_order_relaxed);
+    for (const State* state : stuck) {
+        if (render_tid == 0 || state->tid != render_tid) continue;
+        ThreadActivitySample activity;
+        activity.tid = state->tid;
+        activity.kind = state->kind;
+        activity.id = state->id;
+        activity.counter = state->counter;
+        activity.in_progress = state->in_progress;
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now - state->since).count();
+        char detail[192];
+        std::snprintf(detail, sizeof detail,
+                      "host-tid=%d %s x%llu unchanged=%llds pc=0x%08x", state->tid,
+                      describe_thread_activity(activity).c_str(),
+                      static_cast<unsigned long long>(state->counter),
+                      static_cast<long long>(seconds), state->pc);
+        runtime_report().note_watch_detail("render", detail);
+        break;
+    }
+
+    // A guest waiting for a signal that never arrives stops drawing exactly like a deadlock, and
+    // the two need different answers. Only asked when something is stuck: the summary takes the
+    // thread registry, and on a healthy guest it would say "(none)" forever.
+    if (pending_signals_ != nullptr && !stuck.empty()) {
+        const std::string summary = pending_signals_();
+        if (!summary.empty()) runtime_report().note_watch_detail("pending-signals", summary);
+    }
 
     // One line per shown thread, built once: the current line and the history notes describe the
     // same list. `identity` is the same information without the elapsed seconds that tick every
@@ -958,7 +999,11 @@ void start_hang_watchdog(Process* process) {
         // Lightweight activity snapshots on normal ticks avoid taking Process mutexes and walking
         // 8KB guest stacks every 3s during smooth rendering; full stack inspection only runs
         // when a frame stall or new stuck thread is actually detected.
-        HangWatchdog watchdog{HangWatchdog::SnapshotFn(snapshot_thread_activity)};
+        HangWatchdog watchdog{
+            HangWatchdog::SnapshotFn(snapshot_thread_activity),
+            process != nullptr
+                ? HangWatchdog::DetailFn([process]() { return process->pending_signal_summary(); })
+                : HangWatchdog::DetailFn{}};
         FrameStallSampler stall_sampler;
         unsigned tick = 0;
         for (;;) {

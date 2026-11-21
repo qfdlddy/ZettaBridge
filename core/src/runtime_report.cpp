@@ -889,6 +889,15 @@ std::string RuntimeReport::text() const {
         }
         if (shown == 0) out += " (none)";
         out += " total=" + std::to_string(total) + '\n';
+
+        std::string pending;
+        for (const NativeCallEntry& entry : native_calls_) {
+            const std::uint64_t n = entry.counter->pending.load(std::memory_order_relaxed);
+            if (n != 0) pending += " " + entry.name + "=" + std::to_string(n);
+        }
+        const std::uint64_t overflow_pending = native_calls_overflow_.pending.load(std::memory_order_relaxed);
+        if (overflow_pending != 0) pending += " (other)=" + std::to_string(overflow_pending);
+        out += "native-pending:" + (pending.empty() ? std::string(" (none)") : pending) + '\n';
     }
 
     if (opened_paths_.empty()) {

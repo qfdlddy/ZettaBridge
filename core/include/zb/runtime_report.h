@@ -18,6 +18,9 @@ namespace zb {
 // lock. RuntimeReport owns the counters so they outlive the HostJni slot table in reports.
 struct NativeCallCounter {
     std::atomic<std::uint64_t> count{0};
+    // Calls that have entered the native method and not returned yet. A watchdog reads this to
+    // name the native call a caller is stuck in.
+    std::atomic<std::uint64_t> pending{0};
 };
 
 // Diagnostics that must survive a silent :guest death. OxygenOS drops third-party logcat

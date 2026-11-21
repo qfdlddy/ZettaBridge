@@ -29,7 +29,12 @@ enum class ThreadActivityKind : std::uint8_t {
 inline void record_thread_activity(std::int32_t, ThreadActivityKind, std::uint32_t) {}
 inline void record_thread_activity_done(std::int32_t) {}
 inline void release_thread_activity(std::int32_t) {}
+inline void record_render_thread(std::int32_t) {}
 #else
+// Tracks the thread that presents frames. It is the one thread whose activity says whether the
+// guest is still drawing, and it is reported even when idle workers fill the general list.
+void record_render_thread(std::int32_t host_tid);
+
 void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id);
 
 // The host call recorded last for this thread has returned. A thread whose last recorded event is
@@ -129,6 +134,10 @@ class HangWatchdog {
 public:
     using Clock = std::chrono::steady_clock;
     using SnapshotFn = std::function<std::vector<ThreadActivitySample>()>;
+    // A one-line summary of guest threads that hold undelivered signals, or "" when the runtime
+    // cannot answer. A guest that never gets a signal it is waiting for looks exactly like a
+    // guest that stopped drawing, so the report needs to say which threads are holding one.
+    using DetailFn = std::function<std::string()>;
 
     static constexpr std::chrono::seconds kInterval{3};
     static constexpr int kStuckThreshold = 2;      // consecutive unchanged samples
@@ -137,7 +146,8 @@ public:
     // not the whole process. Ordering is what keeps the interesting entry inside it.
     static constexpr std::size_t kMaxThreadsShown = 12;
 
-    explicit HangWatchdog(SnapshotFn snapshot = snapshot_thread_activity);
+    explicit HangWatchdog(SnapshotFn snapshot = snapshot_thread_activity,
+                          DetailFn pending_signals = {});
 
     // One sampling pass at `now`. Returns true if it wrote a new watch-<n> note from the bounded
     // history; the watch-current line is kept up to date on every pass regardless of that budget.
@@ -163,6 +173,7 @@ private:
     };
 
     SnapshotFn snapshot_;
+    DetailFn pending_signals_;
     std::vector<State> previous_;
     // The tids of the previous note, in the order they were shown. A note is written only when
     // this set changes: idle waiters are stuck from the first sample, and counting them again every

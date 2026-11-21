@@ -94,6 +94,11 @@ public:
     // True when this guest thread is a borrower created by create_borrower, i.e. a host thread
     // that entered the guest on a leased carrier, and false for a real guest pthread.
     bool is_borrower(const GuestThread& thread) const;
+    // One line naming the guest threads that hold undelivered signals, or "(none)". A guest
+    // waiting for a signal that never arrives stops drawing exactly like a deadlock, and the two
+    // need different answers: this is what the hang report uses to tell them apart. Takes the
+    // thread registry with try_to_lock, so it never blocks a caller.
+    std::string pending_signal_summary() const;
     // Borrowers first, so tkill/tgkill aimed at a borrowed carrier's tid reach the borrower.
     // The pointer is only safe to dereference while the thread cannot exit; to signal a thread
     // use post_signal_to.

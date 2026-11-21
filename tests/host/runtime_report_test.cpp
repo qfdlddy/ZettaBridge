@@ -359,6 +359,17 @@ void check_native_calls_and_opens() {
     report.clear();
     CHECK(!contains(report.text(), "org/haxe/lime/Lime.onTouch"));
     CHECK(contains(report.text(), "native-calls: (none) total=0"));
+    // Every native call has returned by the time this runs, so nothing is in flight. A watchdog
+    // reads this line to name the native call a Java caller is currently stuck inside.
+    CHECK(contains(report.text(), "native-pending: (none)"));
+
+    zb::RuntimeReport inflight;
+    zb::NativeCallCounter& stuck = inflight.native_call_counter("org/example/Native.render");
+    stuck.count.fetch_add(1, std::memory_order_relaxed);
+    stuck.pending.fetch_add(1, std::memory_order_relaxed);
+    CHECK(contains(inflight.text(), "native-pending: org/example/Native.render=1"));
+    stuck.pending.fetch_sub(1, std::memory_order_relaxed);
+    CHECK(contains(inflight.text(), "native-pending: (none)"));
 
     zb::RuntimeReport opens;
     opens.note_guest_open("/data/app/com.example/lib/arm/libapp.so");

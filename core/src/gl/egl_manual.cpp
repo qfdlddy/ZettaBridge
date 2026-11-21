@@ -15,8 +15,10 @@
 #include "gl/frame_probe.h"
 #include "gl/gl_diagnostics.h"
 #include "zb/egl_hostcalls.h"
+#include "zb/hang_watchdog.h"
 #include "zb/host_egl.h"
 #include "zb/log.h"
+#include "zb/process.h"
 #include "zb/runtime_report.h"
 
 namespace zb {
@@ -716,6 +718,11 @@ bool zbegl_manual_eglSwapBuffers(HostEgl& host, HostEgl::Call& call) {
     EGLSurface surface = as_pointer(call.handle_of(1, EglObject::Surface));
     if (!call.valid()) return true;
     runtime_report().note_egl_swap();
+    // The thread that presents frames is the one whose activity says whether the guest is still
+    // drawing at all; the hang report names it explicitly.
+    if (const GuestThread* thread = Process::current_thread()) {
+        record_render_thread(thread->diagnostic_tid());
+    }
     if (gl_diagnostics_enabled()) gl_diagnose_swap();
     const std::uint64_t before_ns = frame_probe_now_ns();
     const EGLBoolean swapped = host.backend().eglSwapBuffers(dpy, surface);

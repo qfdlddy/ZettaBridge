@@ -997,6 +997,33 @@ bool Process::is_borrower(const GuestThread& thread) const {
     return false;
 }
 
+std::string Process::pending_signal_summary() const {
+    std::unique_lock lock(threads_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return "(thread registry busy)";
+
+    std::string result;
+    std::size_t count = 0;
+    const auto append = [&](const GuestThread& thread) {
+        const auto pending = thread.pending_signals();
+        if (pending == 0 || ++count > 5) return;
+        // host_tid is the borrowing Java thread while it runs guest code and zero in between,
+        // so it names the host thread a signal has to reach, when there is one.
+        const std::int32_t owner = thread.host_tid.load(std::memory_order_relaxed);
+        const char* state = thread.blocking() ? "syscall" : owner != 0 ? "active" : "idle";
+        char entry[96];
+        std::snprintf(entry, sizeof entry, "guest=%d host=%d %s mask=0x%016llx", thread.tid,
+                      owner != 0 ? owner : thread.tid, state,
+                      static_cast<unsigned long long>(pending));
+        if (!result.empty()) result += " | ";
+        result += entry;
+    };
+    // Borrowers first: a Java thread keeps its guest identity between native calls.
+    for (const GuestThread* thread : borrowers_) append(*thread);
+    for (const GuestThread* thread : threads_) append(*thread);
+    if (count > 5) result += " | more=" + std::to_string(count - 5);
+    return result.empty() ? "(none)" : result;
+}
+
 int Process::allocate_processor_id() {
     std::lock_guard<std::mutex> lock(threads_mutex_);
     for (std::size_t i = 0; i < processor_ids_.size(); ++i) {

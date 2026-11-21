@@ -2035,3 +2035,31 @@ build, and `aapt2 dump xmltree` on the **installed** `base.apk` lists all four s
 uses `System.mapLibraryName`, which answers `lime.dll` on the desktop JVM where the test expects
 `liblime.so`. That failure predates this change; the launcher's own Java is compiled by the Gradle
 build instead.
+
+## 2026-11-21: the report names the native call a stuck caller is inside
+
+A guest that freezes leaves the report saying which guest thread stopped advancing, but not what
+a Java caller was waiting on. Two additions to `RuntimeReport` and the watchdog, both diagnostics
+only - no guest semantics change:
+
+- `NativeCallCounter` grew an atomic `pending` next to `count`. `HostJni::call_native` increments
+  it on entry and an RAII guard decrements it on every return path, so a call that never comes
+  back stays visible; the report renders it as one bounded `native-pending:` line after
+  `native-calls:`, with any overflow still reported as `(other)`.
+- `Process::pending_signal_summary()` lists up to five guest threads holding undelivered signals
+  with their guest tid, host tid, whether they are blocked in a syscall, and their mask. It takes
+  the thread registry with `try_to_lock` and answers `(thread registry busy)` rather than
+  blocking. The watchdog writes it as `watch-pending-signals:` when something is stuck, because a
+  guest waiting forever for a signal looks exactly like a deadlock.
+- `record_render_thread()` records the thread that presents frames. `eglSwapBuffers` feeds it
+  `GuestThread::diagnostic_tid()`, and the watchdog writes `watch-render:` when that thread is
+  the stuck one, which separates "the guest stopped drawing" from "it is drawing and nothing
+  reaches the display".
+
+Device evidence (Zombie Road Trip, `com.noodlecake.zombieroadtrip`):
+`native-pending: org/cocos2dx/lib/Cocos2dxRenderer.nativeRender=1` while the render loop runs,
+staying at exactly 1 across samples rather than climbing, which is the guard pairing correctly.
+`watch-pending-signals: (none)` appears in the same report, `guest-exit: (none)`,
+`unimplemented-host-calls: 0`, and `gl-calls` rose 166,401 -> 222,790 during the sampling.
+
+`watch-render:` is not exercised by a healthy run and stays unproven until a real freeze.

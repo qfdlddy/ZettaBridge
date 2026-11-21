@@ -2123,3 +2123,32 @@ refused foreign package, existing file untouched). On this Windows checkout that
 before them in `testNamesAndDelegation`, because `PluginFiles.libraryFileName` only accepts `.so`
 names and a desktop JVM maps `lime` to `lime.dll`; the new block was exercised through a patched
 copy of the same file, and the same calls were also driven directly by a throwaway probe.
+
+## 2026-11-21: the launcher contract suite runs off-device
+
+The whole of `tests/launcher/run_tests.sh` now passes on a Windows checkout, so the launcher's own
+contracts are a gate again instead of a case that had to be worked around.
+
+- `PluginFiles.libraryFileName` still answers `System.mapLibraryName(name)` first and only falls
+  back to `lib<name>.so` when that is not an Android library name. A desktop JVM answers `lime.dll`
+  and used to fail the suite's first case; on Android the first answer always wins, so the
+  launcher's behaviour is unchanged. `liblime.so` and `lime.so` are now cases of their own.
+- `PluginFiles.move` retries once after clearing the target's read-only flag when the filesystem
+  refuses the replacement. Every library this class publishes is read-only, so the "newer template
+  replaces the stale proxy" path is a replace-over-read-only, and a Windows JVM rejects that with
+  `AccessDeniedException`. A standalone probe proved the cause: the same `ATOMIC_MOVE` fails
+  before the flag is cleared and succeeds after it. A Linux `rename` never takes this branch.
+- `testProxy`'s `existing proxy is not replaced during a process` assertion contradicted the
+  behaviour `39e8c81` introduced deliberately. It now asserts reuse while the copy is current and
+  replacement once the template is newer (with an explicit mtime), which is the invariant that
+  actually matters: a launcher update must reach an already-imported plugin.
+- `run_tests.sh` picks `;` instead of `:` for the classpath and converts its paths with `cygpath`
+  when the shell is a Windows one, so one script gives one answer everywhere.
+
+Verification: `LauncherContractsTest PASS` on Windows with the whole suite, OBB and singleTask cases
+included; Android arm64 `zbridge`/`zbproxy` still link (no C++ change); launcher bundle 8.2 MiB;
+Gradle `assembleLauncherRelease` PASS; the signed APK installed over the previous build and Zombie
+Road Trip rendered its garage menu, confirmed by screenshot, with `proxy-loads: 17`,
+`unimplemented-host-calls: 0`, `guest-exit: (none)` and `gl-calls` 463 -> 197,897. `egl-swaps`
+stayed 0 on that GLES 1.1 title while frames were clearly presented, so it is not a frame counter
+on the legacy-context path and the screenshot, not that line, is the acceptance evidence.

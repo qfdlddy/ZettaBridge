@@ -51,6 +51,13 @@ final class PluginFiles {
             return null;
         }
         String mapped = System.mapLibraryName(name);
+        if (safeLibraryFileName(mapped)) return mapped;
+        // A non-Android JVM maps to its own platform's suffix (.dll, .dylib). Every library this
+        // method names is a guest's Android library, so fall back to Android's spelling and let
+        // the same contracts run off-device. On Android the branch above always wins, so the
+        // launcher's behaviour is unchanged.
+        mapped = name.endsWith(".so") ? name : name + ".so";
+        if (!mapped.startsWith("lib")) mapped = "lib" + mapped;
         return safeLibraryFileName(mapped) ? mapped : null;
     }
 
@@ -257,6 +264,19 @@ final class PluginFiles {
     }
 
     private static void move(File from, File to, boolean replace) throws IOException {
+        try {
+            moveOnce(from, to, replace);
+        } catch (java.nio.file.AccessDeniedException e) {
+            // Every library this class publishes is read-only, and a read-only target cannot be
+            // replaced on every filesystem: a Windows JVM refuses it outright. Dropping the flag
+            // first keeps a re-published proxy or OBB working there. The moved file brings its
+            // own mode, so nothing else changes.
+            if (!to.isFile() || !to.setWritable(true)) throw e;
+            moveOnce(from, to, replace);
+        }
+    }
+
+    private static void moveOnce(File from, File to, boolean replace) throws IOException {
         StandardCopyOption[] atomic = replace
                 ? new StandardCopyOption[] {StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING}
                 : new StandardCopyOption[] {StandardCopyOption.ATOMIC_MOVE};

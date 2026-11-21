@@ -54,6 +54,11 @@ public final class LauncherContractsTest {
 
     private static void testNamesAndDelegation() {
         check("liblime.so".equals(PluginFiles.libraryFileName("lime")), "mapped library name");
+        // ART may hand findLibrary either the bare name or the name it already mapped, and both
+        // have to resolve to the same file. This is also the case that used to fail outright on a
+        // desktop JVM, where mapLibraryName answers "lime.dll".
+        check("liblime.so".equals(PluginFiles.libraryFileName("liblime.so")), "already-mapped name");
+        check("liblime.so".equals(PluginFiles.libraryFileName("lime.so")), "name with a suffix");
         for (String bad : new String[] {"", ".", "..", "a/b", "a\\b", "bad\0name"}) {
             check(PluginFiles.libraryFileName(bad) == null, "unsafe library name: " + bad);
         }
@@ -124,10 +129,17 @@ public final class LauncherContractsTest {
         File proxy = PluginFiles.resolveLibrary(new File(root, "plugin/lib"), proxyDir, template, true, "lime");
         check(proxy != null && proxy.getName().equals("liblime.so"), "proxy path");
         check("proxy-v1".equals(read(proxy)), "proxy copied atomically");
+        check(proxy.equals(PluginFiles.resolveLibrary(new File(root, "plugin/lib"), proxyDir, template, true, "lime"))
+                      && "proxy-v1".equals(read(proxy)),
+                "an up-to-date proxy is reused without a rewrite");
+        // A newer template replaces the per-plugin copy, so a launcher update that fixes the
+        // proxy reaches a plugin that was imported by an earlier version. The copy is read-only,
+        // which is why replacing it has to survive a filesystem that refuses that.
         write(template, "proxy-v2");
+        check(template.setLastModified(proxy.lastModified() + 2000), "template is newer than the proxy");
         check(proxy.equals(PluginFiles.resolveLibrary(new File(root, "plugin/lib"), proxyDir, template, true, "lime")),
                 "same proxy path reused");
-        check("proxy-v1".equals(read(proxy)), "existing proxy is not replaced during a process");
+        check("proxy-v2".equals(read(proxy)), "a stale proxy is replaced by the newer template");
         check(PluginFiles.resolveLibrary(new File(root, "plugin/lib"), proxyDir, template, true, "missing") == null,
                 "missing guest library falls back");
         check(PluginFiles.resolveLibrary(new File(root, "plugin/lib"), proxyDir, template, false, "lime").equals(guest),

@@ -8,6 +8,7 @@
 
 #include "guest_jni_runtime.h"
 #include "zb/elf_fixups.h"
+#include "zb/guest_symbols.h"
 #include "zb/guest_thread.h"
 #include "zb/log.h"
 #include "zb/process.h"
@@ -300,6 +301,35 @@ JNIEXPORT jstring JNICALL Java_com_zettabridge_core_ZBridge_fixGuestLibrary(JNIE
         return nullptr;
     }
     return new_safe_string(env, summary);
+}
+
+// static native String[] missingGuestSymbols(String libDir, String guestLibDir, String sysrootLibDir)
+// Import-time precheck: strong undefined names of the plugin's own arm32 libraries that neither
+// those libraries nor the bundled runtime resolve. See zb/guest_symbols.h.
+JNIEXPORT jobjectArray JNICALL Java_com_zettabridge_core_ZBridge_missingGuestSymbols(
+        JNIEnv* env, jclass, jstring lib_dir, jstring guest_lib_dir, jstring sysroot_lib_dir) {
+    const std::optional<std::string> libs = to_string(env, lib_dir);
+    if (!libs) {
+        throw_new(env, "java/lang/NullPointerException", "libDir");
+        return nullptr;
+    }
+    std::vector<std::string> providers;
+    if (const auto guest = to_string(env, guest_lib_dir)) providers.push_back(*guest);
+    if (const auto sysroot = to_string(env, sysroot_lib_dir)) providers.push_back(*sysroot);
+
+    const zb::GuestSymbolPrecheck check = zb::precheck_guest_libraries(*libs, providers);
+    jclass string_class = env->FindClass("java/lang/String");
+    if (string_class == nullptr) return nullptr;
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(check.missing.size()), string_class, nullptr);
+    env->DeleteLocalRef(string_class);
+    if (result == nullptr) return nullptr;
+    for (jsize i = 0; i < static_cast<jsize>(check.missing.size()); ++i) {
+        jstring item = new_safe_string(env, zb::format_guest_symbol_problem(check.missing[i]));
+        if (item == nullptr) return nullptr;
+        env->SetObjectArrayElement(result, i, item);
+        env->DeleteLocalRef(item);
+    }
+    return result;
 }
 
 // static native void setPreciseFaults(boolean enabled)

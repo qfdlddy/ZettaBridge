@@ -9,6 +9,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
@@ -41,6 +43,12 @@ final class PluginRecord {
     boolean unityMt = false;
     /** Every ABI directory found under lib/ in the APK. */
     final Set<String> abis = new TreeSet<>();
+    /**
+     * Import-time symbol precheck: "libgame.so: symbol" for strong undefined names the guest
+     * cannot resolve. A guest library is linked with BIND_NOW, so each of these stops the whole
+     * library from loading. Empty when the precheck found nothing.
+     */
+    final List<String> symbolProblems = new ArrayList<>();
 
     private Bitmap icon;
     private boolean iconLoaded;
@@ -94,6 +102,24 @@ final class PluginRecord {
         return "unsupported ABIs: " + abis;
     }
 
+    /**
+     * One line for the library list describing the import-time symbol precheck, or null when it
+     * found nothing. Only the first few names are shown; the full list stays in the record.
+     */
+    String symbolWarning() {
+        if (symbolProblems.isEmpty()) return null;
+        StringBuilder text = new StringBuilder();
+        text.append(symbolProblems.size()).append(symbolProblems.size() == 1
+                ? " unresolved native symbol: " : " unresolved native symbols: ");
+        final int shown = Math.min(3, symbolProblems.size());
+        for (int i = 0; i < shown; ++i) {
+            if (i != 0) text.append(", ");
+            text.append(symbolProblems.get(i));
+        }
+        if (symbolProblems.size() > shown) text.append(", ...");
+        return text.toString();
+    }
+
     synchronized Bitmap icon() {
         if (!iconLoaded) {
             iconLoaded = true;
@@ -117,6 +143,7 @@ final class PluginRecord {
         p.setProperty("diagnostics", Boolean.toString(diagnostics));
         p.setProperty("unsafeFp", Boolean.toString(unsafeFp));
         p.setProperty("unityMt", Boolean.toString(unityMt));
+        if (!symbolProblems.isEmpty()) p.setProperty("symbolProblems", String.join("\n", symbolProblems));
         java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
         p.store(buffer, "ZettaBridge plugin");
         PluginFiles.copyAtomic(new java.io.ByteArrayInputStream(buffer.toByteArray()), new File(dir, "meta.properties"));
@@ -152,6 +179,12 @@ final class PluginRecord {
         r.diagnostics = "true".equals(p.getProperty("diagnostics"));
         r.unsafeFp = "true".equals(p.getProperty("unsafeFp"));
         r.unityMt = "true".equals(p.getProperty("unityMt"));
+        final String problems = p.getProperty("symbolProblems");
+        if (problems != null && !problems.isEmpty()) {
+            for (String problem : problems.split("\n")) {
+                if (!problem.isEmpty()) r.symbolProblems.add(problem);
+            }
+        }
         // Phase 0 arm64 imports are already complete. Old 32-bit records must be reimported so
         // every library passes through the non-atomic ELF fixer before metadata says ready.
         if (r.selectedAbi == null && r.abis.contains(ABI_ARM64)) r.selectedAbi = ABI_ARM64;

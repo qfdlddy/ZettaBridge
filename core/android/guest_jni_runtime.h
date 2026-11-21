@@ -12,6 +12,7 @@
 #include "native_activity_glue.h"
 #include "egl_driver_backend.h"
 #include "gl_driver_backend.h"
+#include "gl1_driver_backend.h"
 #include "jni_env_backend.h"
 #include "looper_driver_backend.h"
 #include "native_window_driver_backend.h"
@@ -40,13 +41,14 @@ private:
 
     class Engine final : public GuestJniEngine {
     public:
-        Engine(JniEnvBackend& backend, GlBackend& gl_backend, AssetBackend& asset_backend,
+        Engine(JniEnvBackend& backend, GlBackend& gl_backend, Gl1Backend& gl1_backend,
+               AssetBackend& asset_backend,
                EglBackend& egl_backend, NativeWindowBackend& window_backend,
                AndroidLooperBackend& looper_backend, InputBackend& input_backend,
                ConfigurationBackend& configuration_backend, OpenSlBackend& opensl_backend)
             : GuestJniEngine(backend, &gl_backend, gl_egl_context, &asset_backend,
                              &egl_backend, &window_backend, &looper_backend, &input_backend,
-                             &configuration_backend, &opensl_backend),
+                             &configuration_backend, &opensl_backend, &gl1_backend),
               jni_backend_(backend) {
             // Opt-in only: the GL instrumentation reads back whole framebuffers and diffs pixels
             // per draw, which is far too expensive for a release run.
@@ -71,6 +73,7 @@ private:
 
     JniEnvBackend backend_;
     GlDriverBackend gl_backend_;
+    Gl1DriverBackend gl1_backend_;
     AndroidAssetBackend asset_backend_;
     EglDriverBackend egl_backend_;
     AndroidNativeWindowBackend window_backend_;

@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- A translated guest's notification is posted by the launcher package, so this one grant
+         covers every plugin. Requested at runtime on Android 13+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -77,6 +80,18 @@
             android:process=":guest"
             android:taskAffinity="${applicationId}.guest"
             android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- Delivers a rewritten PendingIntent broadcast to the plugin receiver it names. Runs in
+             :guest so the plugin is loaded in the process that translates it. -->
+        <receiver
+            android:name=".PluginRelayReceiver"
+            android:exported="false"
+            android:process=":guest" />
+
+        <!-- Posts a guest's notification when its alarm fires. Main process: needs no plugin. -->
+        <receiver
+            android:name=".NotificationRelayReceiver"
+            android:exported="false" />
 
         <!-- Stub pool. GuestInstrumentation replaces each with the plugin activity named in the intent. -->
         <activity

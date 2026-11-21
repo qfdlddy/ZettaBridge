@@ -89,7 +89,10 @@ def main() -> None:
     expected_list = sorted(path[len("assets/") :] for path in RUNTIME if path.startswith("assets/zb/"))
     if listed != expected_list:
         raise SystemExit("zb-files.txt does not match the runtime assets")
-    limit = 16 * 1024 * 1024 if has_standalone else 8 * 1024 * 1024
+    # A guard against accidentally bundling the wrong files (a second libzbridge, an unstripped
+    # debug build), not a size target: the runtime set plus the arm64 bridge is ~8.0 MiB and grows
+    # with each added guest library.
+    limit = 16 * 1024 * 1024 if has_standalone else 10 * 1024 * 1024
     if sum(path.stat().st_size for path in root.rglob("*") if path.is_file()) > limit:
         raise SystemExit(f"launcher bundle exceeds {limit // (1024 * 1024)} MiB")
     print("launcher bundle PASS")

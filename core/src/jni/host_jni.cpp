@@ -211,6 +211,7 @@ void HostJni::Impl::fatal(JniBackend::Env env, const char* fmt, ...) {
     log("JNI fatal error: %s", text);
     runtime_report().note_jni_detail("fatal", text, true);
     runtime_report().note_jni_detail("recent-calls", jni_recent_calls(), true);
+    runtime_report().note_jni_detail("recent-names", jni_recent_call_names(), true);
     if (env != 0) backend.fatal_error(env, text);
     std::abort();
 }
@@ -236,7 +237,7 @@ JniBackend::Ref HostJni::Impl::resolve(JniThread& state, std::uint32_t handle, c
 }
 
 std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string& shorty,
-                                           AudioMethodHook audio_hook, const std::string& java_name,
+                                           MethodHook hook, const std::string& java_name,
                                            const std::string& java_signature) {
     const std::uint32_t guest = methods.intern(id);
     if (guest == 0) return 0;
@@ -252,18 +253,18 @@ std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string&
         }
         const std::size_t slot = guest & (kMethodPageSize - 1);
         const MethodRecord* existing = page->entries[slot].load(std::memory_order_relaxed);
-        const bool hook_changed = existing != nullptr && audio_hook != AudioMethodHook::None &&
-                                  existing->audio_hook != audio_hook;
+        const bool hook_changed = existing != nullptr && hook != MethodHook::None &&
+                                  existing->hook != hook;
         const bool detail_missing = existing != nullptr &&
                                     ((existing->name.empty() && !java_name.empty()) ||
                                      (existing->signature.empty() && !java_signature.empty()));
         if (existing == nullptr || hook_changed || detail_missing) {
             // Name and signature are diagnostic only, so re-interning the same id must not lose
-            // the shorty or audio hook that were already recorded for it (and vice versa).
+            // the shorty or hook that were already recorded for it (and vice versa).
             MethodRecord record = existing != nullptr
                                       ? *existing
-                                      : MethodRecord{id, shorty, java_name, java_signature, audio_hook};
-            if (hook_changed) record.audio_hook = audio_hook;
+                                      : MethodRecord{id, shorty, java_name, java_signature, hook};
+            if (hook_changed) record.hook = hook;
             if (record.name.empty()) record.name = java_name;
             if (record.signature.empty()) record.signature = java_signature;
             auto owned_record = std::make_unique<MethodRecord>(std::move(record));
@@ -275,7 +276,7 @@ std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string&
     }
     const std::size_t overflow_idx = guest - kMethodPages * kMethodPageSize;
     if (method_overflow_.size() <= overflow_idx) method_overflow_.resize(overflow_idx + 1);
-    method_overflow_[overflow_idx] = MethodRecord{id, shorty, java_name, java_signature, audio_hook};
+    method_overflow_[overflow_idx] = MethodRecord{id, shorty, java_name, java_signature, hook};
     return guest;
 }
 
@@ -606,6 +607,20 @@ namespace {
     std::abort();
 }
 
+// The JNI calls whose whole subject is the pending exception's state. Holding the exception aside
+// for one of these would answer it wrongly, so they always run against the real state.
+bool jni_call_inspects_exception(std::uint32_t index) {
+    switch (index) {
+    case ZB_JNI_HC_ExceptionOccurred:
+    case ZB_JNI_HC_ExceptionDescribe:
+    case ZB_JNI_HC_ExceptionClear:
+    case ZB_JNI_HC_ExceptionCheck:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool jni_call_is_fast_leaf(std::uint32_t index, GuestThread& thread) {
     // Strict allowlist of genuinely leaf JNI calls that never invoke Java bytecode, class
     // initializers (<clinit>), constructors, or guest code re-entry.
@@ -662,6 +677,11 @@ bool HostJni::handle_fast_host_call(std::uint32_t index, GuestThread& thread) {
     if (!jni_call_is_fast_leaf(index, thread)) return false;
     Impl& jni = *impl_;
     if (__builtin_expect(!jni.ready.load(std::memory_order_acquire), 0)) return false;
+    // A pending Java exception has to go through the slow path, which holds it aside around this
+    // call (see handle_host_call). CheckJNI aborts on a JNI call made while one is pending, and
+    // guests built for releases without CheckJNI do exactly that all the time.
+    const JniBackend::Env fast_env = jni.thread().env;
+    if (fast_env != 0 && jni.backend.exception_check(fast_env)) return false;
     JniCall call(jni, thread, jni.thread(), index);
     return jni.serve_vm(call) || jni.serve_objects(call) || jni.serve_values(call) || jni.serve_data(call);
 }
@@ -691,10 +711,39 @@ bool HostJni::handle_host_call(std::uint32_t index, GuestThread& thread) {
         abort_jni(std::string("host call ") + name + " before libzbjni.so registered");
     }
     JniCall call(jni, thread, jni.thread(), index);
-    if (jni.serve_vm(call) || jni.serve_objects(call) || jni.serve_values(call) || jni.serve_data(call) ||
-        jni.serve_natives(call)) {
-        return true;
+    // A Java exception raised inside one guest call stays pending for the guest afterwards, exactly
+    // as on a device: ART only delivers it back to managed code. Calling into ART while one is
+    // pending is what CheckJNI aborts on - "JNI NewStringUTF called with pending exception" ended
+    // Topsoil's run - while release ART quietly tolerates it. So the bridge holds the exception
+    // aside for the duration of this call and puts it back afterwards: the guest still observes it
+    // and one Java exception in an old game can no longer kill the process.
+    const JniBackend::Env env = jni.thread().env;
+    JniBackend::Ref held = 0;
+    if (env != 0 && !jni_call_inspects_exception(index) && jni.backend.exception_check(env)) {
+        held = jni.backend.exception_occurred(env);
+        if (held != 0) {
+            jni.backend.exception_clear(env);
+            static std::atomic<unsigned> deferred{0};
+            if (deferred.fetch_add(1) + 1 == 1) {
+                std::string pending_class;
+                if (!jni.backend.object_class_name(env, held, pending_class)) pending_class.clear();
+                runtime_report().note_jni_detail(
+                    "exception-deferred",
+                    std::string(jni_host_call_name(index)) +
+                        (pending_class.empty() ? " with an exception pending"
+                                               : " while " + pending_class + " was pending"),
+                    true);
+            }
+        }
     }
+    const bool served = jni.serve_vm(call) || jni.serve_objects(call) || jni.serve_values(call) ||
+                        jni.serve_data(call) || jni.serve_natives(call);
+    if (held != 0) {
+        // A call that throws its own exception wins: the guest is meant to see that one.
+        if (!jni.backend.exception_check(env)) jni.backend.throw_exception(env, held);
+        jni.backend.delete_local_ref(env, held);
+    }
+    if (served) return true;
     const char* name = jni_host_call_name(index);
     log("JNI host call 0x%x (%s) is not implemented", index, name);
     abort_jni(std::string("unimplemented JNI host call ") + name);

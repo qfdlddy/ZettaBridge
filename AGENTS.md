@@ -1860,3 +1860,110 @@ Report lines that localize this area: `jni-input-attach` (ident, looper, owner a
 reproducible one: whichever control is pressed first keeps working, and the other one ends the
 process - the shape of something initialized once, for one path only. The abort message in the
 native dump is the next piece of evidence; the report does not carry it.
+
+## Phase 8: the GLES 1.1 fixed-function pipeline (2026-11-21)
+
+Android arm32 games built on the fixed-function pipeline (Zombie Road Trip, Punch Quest) now
+render and play. Host-call indices **492-578** are the 87 `libGLESv1_CM.so` rows and are
+forwarded to the device's real driver; nothing is emulated on GLES 2.0.
+
+- **Host-call index ranges:** GLES 0-141, AAsset 142-159, ANativeWindow 160-167, EGL 168-211,
+  platform compatibility 212-227 (plus the GLES 3.x and extension blocks used by
+  `host_gl.cpp`), **GLES 1.1 492-578**, OpenSLES 579-594, JNI `0xFB00+`. Append, never merge.
+- `core/include/zb/gles1_hostcalls.h` is the hand-written GLES 1.1 table;
+  `tools/check_gles1_hostcalls.py` (ctest `gles1_hostcalls_check`) verifies it against
+  `core/src/gen/hostcalls.inc` and the NDK headers.
+- `Gl1Backend` (`core/include/zb/gl1_backend.h`, 87 virtuals, no `set_error`) is the seam;
+  `HostGl::dispatch_gl1` in `core/src/gl/host_gl1.cpp` is every handler; the only file pair that
+  includes `<GLES/gl.h>` is `core/android/gl1_driver_backend.*`, generated bodies included, and
+  it must never be in the same TU as `GLES2/gl2.h`/`GLES3/gl3.h`.
+- `glGetPointerv` is answered by the bridge from the remembered 32-bit guest address and never
+  reaches the driver.
+- `gl_pname_count` in `core/src/gl/gl_manual.cpp` now also knows the ES1 result sizes, so
+  `glGetFloatv(GL_MODELVIEW_MATRIX)` validates 64 bytes.
+- The census covers 492-578 (slot limit 640) and names entries through the two-range helper, so
+  GL1 calls are reported as `glPushMatrix=133`, not `?=133`.
+- **The GL visibility diagnostics run only on OpenGL ES 2.0+ contexts.** They were the Punch
+  Quest crash: `glCheckFramebufferStatus(GL_FRAMEBUFFER)` on an ES 1.1 context faults at address
+  0 inside the driver. The profile is decided once per `GlBackend` from
+  `glGetString(GL_VERSION)` and cached; a legacy context records
+  `gl-diagnostics: <GL_VERSION> profile skip` and skips `gl_diagnose`,
+  `gl_diagnose_before`, `gl_diagnose_swap` and the map diagnostics entirely.
+- Acceptance: `docs/phase8-acceptance.md`. Zombie Road Trip renders its menu and its RIDE
+  loading screen (`gl-calls` 373k, `guest-exit: (none)`); Punch Quest renders its title screen
+  with `diagnostics=true`, the configuration that used to crash.
+- **Open:** 133 OES/QCOM/IMG GLES1 names remain unimplemented; a guest `dlopen` failure is
+  still not in the runtime report.
+
+## 2026-11-21: Topsoil runs and takes touch
+
+`com.kneeko.topsoil` 1.2.9 (Haxe luxe on SDL2, armeabi-v7a, GLES 3.0) renders its tutorial
+screen and plants a seed on tap. Three separate blockers fell, each proven from the device
+report or a disassembly before any code changed:
+
+1. **`dlopen("/system/lib/libOpenSLES.so")` reached the device's host-architecture library.**
+   `libtopsoil.so`'s OpenAL probe stat()s that literal path, `dlopen`s it with `RTLD_NOW` and
+   dereferences a null engine at `0x5ab848`. `Process::translate_path` now falls back to
+   `Process::add_library_dir` directories (`LibraryRuntimeOptions::guest_library_dirs`, filled by
+   `guest_runtime_options()` with `<files>/zb/guest/lib` and the plugin's `lib/`) for a missing
+   system library path, so `opened-N:` now shows the arm32 stand-in. Only `.so` names in a
+   `lib`/`lib64` directory take this path; fonts and configuration keep the old fallback.
+2. **`CallMethodA` with a mismatched result type was fatal.** Lime calls the `void`
+   `setNotification(...)` through `CallIntMethodA`; release ART does not check. `host_jni_values.cpp`
+   now calls with the method's real shorty and returns a neutral zero, recording one
+   `jni-result-mismatch:` line instead of aborting.
+3. **A pending Java exception aborted the process.** That `setNotification` really throws on
+   API 31+ (the guest runs with the launcher's `targetSdk`, so `PendingIntent` demands a
+   mutability flag), and the next guest JNI call tripped CheckJNI with `JNI NewStringUTF called
+   with pending exception`. `HostJni::handle_host_call` now holds the exception aside for the
+   duration of a call and re-throws it afterwards (`jni-exception-deferred:` names the call and
+   the exception class); `ExceptionOccurred/Check/Clear/Describe` are exempt and the fast path
+   sends anything with a pending exception through the slow path.
+
+Device state after the fixes: `guest-exit: (none)`, `unimplemented-host-calls: 0`, `gl-calls`
+254k, `egl-swaps` 595, `gl-shaders: ok=6 failed=0`, `gl-first-error: (none)`, audio engine,
+mixer and player all `ok` with buffers streaming. Punch Quest (title screen, 62k GL calls) and
+Zombie Road Trip (menu, 123k GL calls) still render with the same APK. Details and the exact
+report lines are in `docs/phase8-acceptance.md`.
+
+## 2026-11-21: Topsoil's own notification is delivered
+
+The notification the game itself schedules (the store's "notify me" bonus plays) now appears. The
+guest helper runs as plugin Java on ART, so hooking `PendingIntent`/`Notification.Builder` in C++
+could never see it: `AppActivity.setNotification(String,String,String,I)V` calls
+`PendingIntent.getActivity(..., 0x08000000)` without `FLAG_IMMUTABLE` and throws on API 31+ before it
+ever reaches a builder. The call is therefore answered at the JNI boundary:
+
+- `MethodHook::LegacyNotification` (`core/src/jni/host_jni_internal.h`,
+  `host_jni_objects.cpp`) marks the one signature `setNotification:(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V`;
+  `host_jni_values.cpp` intercepts it in `CallMethodA` before the mismatch handling;
+  `post_legacy_notification` (`host_jni_compat.cpp`) verifies the receiver is an
+  `android.app.Activity` and calls `com.zettabridge.core.ZBridge.notifyGuest(activity, id, title,
+  text, seconds)`. Any failure clears the exception and falls back to the guest's own method.
+- `ZBridge.notifyGuest`/`postGuestNotification` (`android/launcher/.../core/ZBridge.java`) own the
+  channel (`zb.plugin`, `IMPORTANCE_HIGH`), the icon (`android.R.drawable.ic_popup_reminder`) and
+  the content intent; a delay above zero goes through `AlarmManager` to the new
+  `NotificationRelayReceiver` (main process, no plugin code), a delay of zero or less posts at once.
+- `POST_NOTIFICATIONS` is declared and requested once on API 33+ from `LibraryActivity`.
+
+Device evidence (MuMu, `am start ... zbplugin://com.kneeko.topsoil`, pause menu -> store -> bonus
+plays -> "notify me"):
+
+```text
+jni-notification-relay: id 1 delay 80772s
+dumpsys alarm: tag=*walarm*:com.zettabridge.launcher/.NotificationRelayReceiver, origWhen=+22h26m
+dumpsys notification: pkg=com.zettabridge.launcher id=1 channel=zb.plugin importance=4 flags=AUTO_CANCEL
+```
+
+The shade shows "Bonus plays refilled! / Your plays can now be claimed." A diagnostic build clamped
+the delay to 15 s to observe the relay firing (`origWhen=-10s`); the shipped build keeps the guest's
+own delay. Regressions on the same APK: Punch Quest title screen (`gl-calls` 53,313,
+`guest-exit: (none)`, `unimplemented-host-calls: 0`) and Zombie Road Trip garage menu
+(`gl-calls` 244,273, `guest-exit: (none)`).
+
+**Still open:** nothing maps a *different* old notification shape onto the current API; only this
+guarded `setNotification` signature is answered, and anything else keeps ART's behaviour.
+
+This checkout has no host C++ toolchain (no `clang++`/`cmake`/`ninja`/WSL), so the host suite
+cannot run here. The compile gate is the Android arm64 build plus the generators; the functional
+gate is the emulator.

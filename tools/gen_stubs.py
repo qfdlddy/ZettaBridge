@@ -74,6 +74,57 @@ def gles_ext_names():
     return names
 
 
+# GLES 1.x extension entry points, taken from the NDK's GLES/glext.h rather than from what one
+# game happens to import: Android links guests with BIND_NOW, so one unresolved name stops the
+# whole library from loading (Punch Quest and Topsoil both died on the framebuffer-object (OES)
+# family before it was here).
+#
+# They are exported by libGLESv2, not by libGLESv1_CM, for one reason: many of them change state
+# the guest-side cache in guest/stubs/libGLESv2_cache.c tracks. A stub in libGLESv1_CM would
+# bypass that cache, which can then skip a later core call and leave the driver in the wrong
+# state. libGLESv2 is also the library every one of these guests already lists in DT_NEEDED.
+#
+# The residue is deliberate: a guest that links only libGLESv1_CM (a pure ES1 title) still does
+# not resolve the names below. tools/check_platform_exports.py reports that gap instead of
+# hiding it.
+def gles1_extension_names():
+    text = open(os.path.join(INCLUDE, "GLES", "glext.h")).read()
+    names = set(re.findall(r"^GL_API\w*\s+\w[\w \*]*\bGL_APIENTRY\s+(gl\w+)\s*\(", text, re.M))
+    already = set(gles2_names()) | set(gles3_names()) | set(gles_ext_names()) | set(
+        gles2_compat_names())
+    return sorted(names - already)
+
+
+# Extensions whose ES1 spelling is the same operation as an ES2 core entry point. The thunk
+# below reuses the core host-call index, so the driver sees exactly the call the core name makes.
+#
+# Only names with identical enums and signatures belong here. The cache wrappers in
+# guest/stubs/libGLESv2_cache.c take precedence: a name that is a CACHED_GLES_WRAPPERS entry is
+# also written by hand there (glBindFramebufferOES and friends), because the cache has to see it.
+GLES1_OES_ALIASES = {
+    # GL_OES_framebuffer_object
+    "glBindFramebufferOES": "glBindFramebuffer",
+    "glCheckFramebufferStatusOES": "glCheckFramebufferStatus",
+    "glDeleteFramebuffersOES": "glDeleteFramebuffers",
+    "glFramebufferRenderbufferOES": "glFramebufferRenderbuffer",
+    "glFramebufferTexture2DOES": "glFramebufferTexture2D",
+    "glGenFramebuffersOES": "glGenFramebuffers",
+    "glGenerateMipmapOES": "glGenerateMipmap",
+    "glGetFramebufferAttachmentParameterivOES": "glGetFramebufferAttachmentParameteriv",
+    "glIsFramebufferOES": "glIsFramebuffer",
+    "glBindRenderbufferOES": "glBindRenderbuffer",
+    "glDeleteRenderbuffersOES": "glDeleteRenderbuffers",
+    "glGenRenderbuffersOES": "glGenRenderbuffers",
+    "glGetRenderbufferParameterivOES": "glGetRenderbufferParameteriv",
+    "glIsRenderbufferOES": "glIsRenderbuffer",
+    "glRenderbufferStorageOES": "glRenderbufferStorage",
+    # Separate blend state, the same three functions GLES 2 has in core.
+    "glBlendEquationOES": "glBlendEquation",
+    "glBlendEquationSeparateOES": "glBlendEquationSeparate",
+    "glBlendFuncSeparateOES": "glBlendFuncSeparate",
+}
+
+
 def android_asset_names():
     names = set()
     decl = re.compile(r"^[A-Za-z_][\w \*]*\b(AAsset\w*)\(")
@@ -228,6 +279,13 @@ CACHED_GLES_WRAPPERS = frozenset({
     "glBindVertexArrayOES",
     "glDeleteBuffers",
     "glDeleteFramebuffers",
+    # GLES 1 spellings of cached state changes: guest/stubs/libGLESv2_cache.c writes these by
+    # hand so the ES1 name cannot bypass the cache (see GLES1_OES_ALIASES).
+    "glBindFramebufferOES",
+    "glDeleteFramebuffersOES",
+    "glBlendEquationOES",
+    "glBlendEquationSeparateOES",
+    "glBlendFuncSeparateOES",
     "glDeleteTextures",
     "glDeleteProgram",
     "glDeleteVertexArrays",
@@ -340,6 +398,10 @@ LIBRARIES = [
     # OpenSL ES: arm32 guests dlopen it themselves (FMOD in Unity does), and the device
     # ships no arm32 copy. Appended last so no established index moves.
     ("libOpenSLES", opensl_names),
+    # GLES 1.x extension entry points (gles1_extension_names). Truly last: core/include/zb/
+    # opensl_hostcalls.h holds the OpenSL indices by hand, and every earlier block above is
+    # referenced by number somewhere. Exported by libGLESv2 so the guest state cache sees them.
+    ("libGLESv2", gles1_extension_names),
 ]
 
 
@@ -373,7 +435,12 @@ def main():
             ],
         )
         for name in names:
-            shared = assigned.get(name)
+            # An ES1 extension name that is the same operation as an ES2 core call reuses that
+            # call's host index instead of adding an empty stub of its own.
+            target = GLES1_OES_ALIASES.get(name, name)
+            shared = assigned.get(target)
+            if target != name and shared is None:
+                sys.exit("%s aliases %s, which no earlier library exports" % (name, target))
             if shared is None and index >= RESERVED_HOST_CALL_FIRST:
                 sys.exit("too many host calls: index 0x%x reaches the reserved range" % index)
             entry = shared if shared is not None else index

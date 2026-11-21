@@ -11,6 +11,7 @@ import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Parcel;
+import android.util.Log;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -125,6 +126,21 @@ final class PluginStore {
                         throw new IOException("cannot prepare " + library.getName() + ": " + result);
                     }
                 });
+                if (translated) {
+                    // BIND_NOW makes one unresolved strong name fatal, and the device would only
+                    // report "JNI_ERR returned from JNI_OnLoad". Record the names now so the
+                    // library list says which library cannot load and why.
+                    try {
+                        File guestLib = new File(c.getFilesDir(), "zb/guest/lib");
+                        File sysrootLib = new File(c.getFilesDir(), "zb/sysroot/system/lib");
+                        String[] missing = ZBridge.missingGuestSymbols(
+                                r.libDir().getPath(), guestLib.getPath(), sysrootLib.getPath());
+                        if (missing != null) r.symbolProblems.addAll(java.util.Arrays.asList(missing));
+                    } catch (Throwable t) {
+                        // Diagnostic only: a precheck failure must not fail a good import.
+                        Log.w("zb-launcher", "symbol precheck failed for " + info.packageName, t);
+                    }
+                }
             } else if (!r.libDir().mkdirs()) {
                 throw new IOException("cannot create " + r.libDir());
             }

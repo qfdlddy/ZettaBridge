@@ -156,6 +156,13 @@ public:
     // it cannot load. Aliases win over the sysroot mappings, and the longest prefix wins.
     void add_path_alias(std::string guest_prefix, std::string host_prefix);
 
+    // Directories holding the arm32 libraries the bridge provides itself (libEGL.so, libGLESv2.so,
+    // libOpenSLES.so, libandroid.so): the runtime's guest library directory, then the plugin's.
+    // translate_path consults them when the sysroot lacks a file the guest names by an absolute
+    // system library path, so a guest that dlopen()s "/system/lib/libOpenSLES.so" reaches the arm32
+    // stand-in instead of the device's own library of that name, which is host architecture.
+    void add_library_dir(std::string dir);
+
     // Distinct paths of the files the guest currently has mapped, newest first. A library the
     // guest loaded by itself (a JNI shim whose JNI_OnLoad dlopens the real library, which Unity
     // plugins do) appears here and nowhere else.
@@ -323,6 +330,7 @@ private:
     std::vector<std::pair<std::uint32_t, std::uint32_t>> textrel_ranges_;
     mutable std::mutex path_aliases_mutex_;
     std::vector<std::pair<std::string, std::string>> path_aliases_;
+    std::vector<std::string> library_dirs_;
     static Process* reporter_process;  // for the terminate handler, which has no other way in
     std::string sysroot_;
     std::string exe_path_;

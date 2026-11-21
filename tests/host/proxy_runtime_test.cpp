@@ -206,6 +206,9 @@ void test_paths(const Tree& tree) {
     CHECK(options.preload == "libzbjni.so");
     CHECK(options.guest_environment.size() == 1);
     CHECK(options.guest_environment[0] == "LD_LIBRARY_PATH=" + files + "/zb/guest/lib:" + root + "/lib");
+    CHECK(options.guest_library_dirs.size() == 2);
+    CHECK(options.guest_library_dirs[0] == files + "/zb/guest/lib");
+    CHECK(options.guest_library_dirs[1] == root + "/lib");
 }
 
 void test_bad_runtime_layout(const fs::path& base) {

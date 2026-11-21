@@ -61,10 +61,24 @@ tools/build_guest.sh; ctest --test-dir build/host --output-on-failure; tools/run
   `com.zettabridge.core.ZBridge`). Boost headers only, via a directory holding just the
   `boost/` link:
   ```
-  N=$HOME/android-ndk-r29; mkdir -p build/boost-headers; ln -sfn /usr/include/boost build/boost-headers/boost; cmake -S . -B build/android-arm64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=$N/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release -DZB_BUILD_TESTS=OFF -DBoost_INCLUDE_DIR=$PWD/build/boost-headers; ninja -C build/android-arm64 zbridge
+  N=$HOME/android-ndk-r29; mkdir -p build/boost-headers; ln -sfn /usr/include/boost build/boost-headers/boost; cmake -S . -B build/android-arm64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=$N/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release -DZB_BUILD_TESTS=OFF -DZB_DISABLE_TELEMETRY=OFF -DBoost_INCLUDE_DIR=$PWD/build/boost-headers; ninja -C build/android-arm64 zbridge zbproxy
   ```
+  `ZB_DISABLE_TELEMETRY` defaults to **ON** in a Release build, which compiles out the
+  runtime report, the watchdog, the GL census and the frame probe. Pass
+  `-DZB_DISABLE_TELEMETRY=OFF` for any build that will be tested on a device, otherwise a
+  guest failure leaves no `zb-runtime-report.txt` to read.
   Running it on the device (T6) is described in `docs/phase3-device-test.md`. Android
   binaries cannot run on this machine: the chroot has no `/system`.
+- **Launcher APK**: the Gradle project consumes only the generated tree, never `core/`
+  directly.
+  ```
+  ninja -C build/android-arm64 zbridge zbproxy; tools/build_guest.sh; tools/make_launcher_bundle.sh; cd android/launcher && ANDROID_HOME=$ANDROID_SDK_ROOT ./gradlew assembleLauncherDebug; cd -
+  ```
+  `tools/make_launcher_bundle.sh` fails with the exact missing input if the arm64 build or
+  `build/guest` is stale, and `tools/check_launcher_bundle.py build/launcher` re-checks the
+  file list afterwards. A release APK is signed only when `~/.zettabridge/signing.properties`
+  names a keystore; without it `assembleRelease` produces an unsigned APK and the installable
+  one is `assembleLauncherDebug`.
 - **Single host test:** `ctest --test-dir build/host -R t1_blob_test --output-on-failure`.
   `elf_loader_test` needs `tools/build_guest.sh` first.
 - **Any arm32 binary:** `build/host/cli/zbrun/zbrun <elf> [args]`. Diagnostics go to
@@ -318,16 +332,57 @@ functions. Accept: the game is playable start to finish.
   PI futex commands for every thread.
 - **Host-call indices `0xFE00-0xFEFF` are reserved for the library runtime**
   (`READY` = `0xFE00`, carrier `PARK` = `0xFE01`). Generated stub indices
-  (`tools/gen_stubs.py`) stay below `0xFB00`.
+  (`tools/gen_stubs.py`) stay below `0xFB00`. GLES 1.1 owns 492-578 and is dispatched by
+  `HostGl::dispatch_gl1` through `Gl1Backend`, not by a generated stub library.
+- **The GL visibility diagnostics only run on an OpenGL ES 2.0+ context.** They query ES 2.0
+  entry points, and `glCheckFramebufferStatus` inside a guest GLES 1.1 context crashes the
+  driver at address 0. `gl_diagnostics.cpp` decides the profile once per `GlBackend` from
+  `glGetString(GL_VERSION)`, caches it, and records `gl-diagnostics: <version> profile skip`
+  (or ` profile on`) once.
 - **Host-call indices `0xFB00-0xFCFF` belong to the JNI bridge** (`jni_protocol.h`): flat
   JNI calls at `0xFC00+`, host-stub slots at `0xFB00 + slot`.
 - **Never delete the argument references of a JNI native call.** ART logs "failed to find
   entry" and dumps the stack on `DeleteLocalRef` of a transition reference. `HostJni` brackets
   native calls with `PushLocalFrame`/`PopLocalFrame` instead; the mock JVM reports such
   deletions as errors.
+- **A pending Java exception is held aside around every JNI host call.** ART's CheckJNI aborts
+  the process on a call made while one is pending ("JNI NewStringUTF called with pending
+  exception"), and release ART quietly tolerates it, which is what a guest built for old
+  releases expects. `HostJni::handle_host_call` saves the exception, clears it, runs the call,
+  and re-throws it unless the call raised its own (`jni-exception-deferred` records the first
+  one). The exception-inspection calls (`ExceptionOccurred/Check/Clear/Describe`) are exempt and
+  the fast path sends everything with a pending exception through the slow path.
+- **A guest may call a method through the wrong result type.** Topsoil's lime layer calls the
+  `void setNotification(...)` through `CallIntMethodA`; release ART does not check and returns
+  whatever the register holds. `CallMethodA` runs the method with its real shorty and hands the
+  guest a neutral zero, recording one `jni-result-mismatch` line. Never make this fatal again.
+- **A Java API that changed cannot be fixed by hooking the framework calls inside plugin Java.**
+  A guest's own helper method (`AppActivity.setNotification`) runs as plugin Java on ART, so the
+  `PendingIntent.getActivity(...)`/`Notification.Builder.build()` it calls are Java -> Java frames
+  the bridge never sees; a C++ hook on those framework methods is useless there. Take the whole
+  call over at the JNI boundary instead: `MethodHook::LegacyNotification`
+  (`host_jni_objects.cpp`, `host_jni_values.cpp`, `host_jni_compat.cpp`
+  `post_legacy_notification`) answers a non-static
+  `setNotification(String,String,String,I)V` on an `Activity` by calling
+  `com.zettabridge.core.ZBridge.notifyGuest` in the launcher, and falls back to the guest method
+  when anything fails. `ZBridge` owns the channel (`zb.plugin`), the icon and the alarm; the
+  launcher declares `POST_NOTIFICATIONS` and asks for it once on API 33+.
+- **An absolute system library path the sysroot lacks resolves in the guest library
+  directories.** `Process::add_library_dir` (`LibraryRuntimeOptions::guest_library_dirs`, filled
+  from the runtime's lib dir plus the plugin's `lib/`) is consulted for `/system/lib/...`,
+  `/vendor/lib64/...` and similar paths that name a `.so`. Topsoil's OpenAL probe stat()s and
+  `dlopen()`s `/system/lib/libOpenSLES.so` directly; without this it loaded the device's
+  host-architecture library and dereferenced a null engine. Non-library paths (fonts,
+  configuration) keep the old sysroot-then-device fallback.
 - **JNI tables and host-call lists are generated.** `tools/gen_jni.py` writes
   `core/include/zb/jni_hostcalls.h`, `core/src/gen/jni_hostcalls.inc` and `guest/zbjni/gen/*`;
   never edit them by hand. `gen_jni_check` (ctest) fails when they are stale.
+  The generators read the NDK headers and default to `~/android-ndk-r29` with
+  `linux-arm64` host tools; on a machine with the SDK's NDK, set both variables:
+  `NDK=$ANDROID_SDK_ROOT/ndk/29.0.14206865 NDK_HOST=windows-x86_64 python tools/gen_gles.py --check`
+  (the same pair for `gen_jni.py`, `gen_egl.py`, `gen_stubs.py`, `gen_gl1_driver.py`).
+  `tools/check_platform_exports.py` needs `llvm-nm` from that NDK on `PATH`;
+  `tools/build_guest.sh` sets it itself.
 
 ## First test case (not the end goal)
 

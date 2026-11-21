@@ -165,6 +165,19 @@ void RuntimeReport::note_jni_onload(const std::string& library, bool ok, std::in
     notify_observers(observers, true, true);
 }
 
+void RuntimeReport::note_guest_dlopen_failed(const std::string& library, const std::string& error) {
+    Observers observers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++dlopen_failure_total_;
+        if (dlopen_failures_.size() < kMaxDlopenFailures) {
+            dlopen_failures_.push_back(Load{one_line(library, kMaxDetail), false, 0, one_line(error, kMaxDetail)});
+        }
+        observers = take_observers();
+    }
+    notify_observers(observers, true, true);
+}
+
 void RuntimeReport::note_registered_native() {
     Observers observers;
     {
@@ -776,6 +789,17 @@ std::string RuntimeReport::text() const {
     if (onload_total_ > onloads_.size()) append_count(out, "jni-onload-more", onload_total_ - onloads_.size());
 
     append_count(out, "registered-natives", registered_natives_);
+    append_count(out, "guest-dlopen-failures", dlopen_failure_total_);
+    for (const Load& failure : dlopen_failures_) {
+        out += "guest-dlopen-failed: ";
+        out += failure.library;
+        out += ' ';
+        out += failure.error;
+        out += '\n';
+    }
+    if (dlopen_failure_total_ > dlopen_failures_.size()) {
+        append_count(out, "guest-dlopen-more", dlopen_failure_total_ - dlopen_failures_.size());
+    }
     append_count(out, "unimplemented-host-calls", host_call_total_);
     append_count(out, "unimplemented-distinct", distinct_host_calls_);
     out += "first-unimplemented: ";
@@ -959,6 +983,8 @@ void RuntimeReport::clear() {
     proxy_failure_total_ = 0;
     onloads_.clear();
     onload_total_ = 0;
+    dlopen_failures_.clear();
+    dlopen_failure_total_ = 0;
     registered_natives_ = 0;
     exit_reason_.clear();
     signal_eintr_total_ = 0;

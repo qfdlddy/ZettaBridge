@@ -25,7 +25,21 @@
 - **Launcher 开关与设备端独立 APK 导出（`android/launcher/`）**
   - 按插件配置运行参数（`Fast FP`、`Unity MT` / `-force-gfx-mt`、`Hide ads`、`Precise faults`、`GL diagnostics`、`Application` 类覆盖）。
   - **设备端独立 APK 导出器（`ApkExporter`、`ApkSignerHelper`、`AxmlEditor`、`ArscIconFinder`、`StandaloneLaunchActivity`）：** 使用 `apksig` 直接在手机端将已导入的 32 位插件重打包为 v1/v2/v3 签名的独立 arm64 APK（含 OBB 打包、Manifest/图标修补、预修复 `.so`，以及可选的零遥测 `assets/zb-standalone/libzbridge.so`）。
-- **新增宿主机单元测试：** 新增 `exclusive_aba_test`、`fast_svc_test`、`gl_state_cache_test`、`guest_io_apk_cache_test` 与 `opensl_chain_test`。
+- **GLES 1.1 固定管线（`Phase 8`）**
+  - 固定管线游客的每次调用现在都会到达设备驱动：`Gl1Backend`（`core/include/zb/gl1_backend.h`，87 个虚函数）、`HostGl::dispatch_gl1`（`core/src/gl/host_gl1.cpp`）与 `Gl1DriverBackend`（`core/android/gl1_driver_backend.*`，由 `tools/gen_gl1_driver.py` 生成）。Host-call 索引 492–578 承载 GLES1 专属行；游客桩库导出的 145 个名字全部可解析，重名入口复用同一个 host call。
+  - `glGetPointerv` 直接返回记忆中的 32 位游客地址，`glGet*` 的结果长度覆盖 ES1 枚举，状态查询不再需要驱动往返。
+  - GL 可见性诊断只在 OpenGL ES 2.0+ 上下文运行：每个 backend 通过一次 `glGetString(GL_VERSION)` 决定 profile，旧式上下文记录 `gl-diagnostics: <version> profile skip`，因为 ES 1.1 上下文中的 `glCheckFramebufferStatus` 曾导致驱动崩溃。
+- **GLES 2 扩展入口与 OpenSL ES 接口**
+  - Host-call 索引 595–713 补齐 arm32 游客会导入的 OES/QCOM/EXT/APPLE/NV 名称（`glAlphaFuncxOES`、`glTexGenfvOES`、`glWeightPointerOES` 等），并同步重新生成游客桩库。缓存状态的 ES1 拼写（`glBindFramebufferOES`、`glDeleteFramebuffersOES`、`glBlendEquationOES` 等）走状态缓存，确保只有驱动状态确实一致时后续核心调用才被省略。
+  - `guest/stubs/libOpenSLES.S` 导出全部 `SL_IID_*`；位于保留区 `0x7B01xxxx` 而桥接未实现的接口返回 `SL_RESULT_FEATURE_UNSUPPORTED`，而不是 `SL_RESULT_PARAMETER_INVALID`。
+- **平台导出基线与导入期符号预检**
+  - `tools/check_platform_exports.py` 与 `tools/platform_exports/*` 在游客桩库相对 Android 15 基线（`libGLESv1_CM`、`libGLESv2`、`libOpenSLES`）的缺口扩大时使构建失败，并标记已经过时的缺口条目。
+  - `precheck_guest_libraries`（`core/src/guest_symbols.cpp`）在导入时读取插件的 `lib/*.so`，列出插件自身与随附运行时都无法提供的强未定义符号，把干巴巴的 `JNI_ERR returned from JNI_OnLoad` 变成符号清单。
+- **JNI 与加载器边界上的旧游客兼容修复**
+  - 缺失的绝对系统库路径（`/system/lib/libOpenSLES.so`）现在会回退到游客库目录（`Process::add_library_dir`、`LibraryRuntimeOptions::guest_library_dirs`），而不是加载设备上宿主机架构的文件。
+  - `CallMethodA` 遇到结果类型不匹配时按方法真实 shorty 调用并返回中性 0（`jni-result-mismatch`）；待处理 Java 异常在 host call 期间被暂存（`jni-exception-deferred`），不再触发 CheckJNI。
+  - 游客自己的 `setNotification(String,String,String,I)V` 由 JNI 边界的 `ZBridge.notifyGuest` 接管：channel `zb.plugin`、启动器图标、`FLAG_IMMUTABLE` 的 `PendingIntent` 与 `POST_NOTIFICATIONS`；延时提醒通过 `AlarmManager` 交给 `NotificationRelayReceiver`。
+- **新增宿主机单元测试：** 新增 `exclusive_aba_test`、`fast_svc_test`、`gl_state_cache_test`、`guest_io_apk_cache_test` 与 `opensl_chain_test`，以及用于 GLES 1.1 分发与符号预检的 `gles1_marshal_test`、`guest_symbols_test`。
 - **新增 Dynarmic 补丁：** 新增 `third_party/patches/dynarmic-0003-zbridge-all.patch`（初始化子模块后需与 `dynarmic-0001-thumb32-armv8.patch`、`dynarmic-0002-asimd-narrowing.patch` 一并 `git apply`）。
 
 > **声明：** 以上所有修改与文档均由 Gemini 4、GLM 5.3 Flash 与 DeepSeek Flash 1017 完成与编写，不保证可用性与稳定性。

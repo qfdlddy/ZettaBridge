@@ -216,6 +216,9 @@ JniLoadReport JniLoader::load(JniBackend::Env env, const std::string& path,
             std::lock_guard<std::mutex> lock(missing_mutex_);
             swept_libraries_.erase(path);
         }
+        // The launcher only ever sees "JNI_ERR returned from JNI_OnLoad"; the linker's own text
+        // names the missing dependency or symbol, so keep it in the report as well.
+        runtime_report().note_guest_dlopen_failed(base_name(path), report.error);
         report.error = "guest dlopen failed: " + report.error;
         return report;
     }

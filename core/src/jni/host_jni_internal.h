@@ -75,12 +75,33 @@ struct HostJni::Impl {
     std::atomic<bool> ready{false};
     zb_jni_guest_api api{};
 
-    enum class AudioMethodHook : std::uint8_t {
+    // Per-method compatibility hooks, decided once when the guest looks the method up. Each one
+    // maps a Java API that changed after the guest was built onto the platform it runs on now.
+    enum class MethodHook : std::uint8_t {
         None = 0,
+        // AudioManager: hide Bluetooth audio devices, which a guest that predates
+        // AudioDeviceInfo cannot use.
         IsBluetoothOn,
         GetDevices,
         DeviceCallbackNoop,
         GetProperty,
+        // PendingIntent.getActivity/getBroadcast/getService/getForegroundService/getActivities:
+        // API 31 rejects a PendingIntent with no mutability flag. Old guests never set one.
+        PendingIntentFlags,
+        // PendingIntent.getBroadcast: the broadcast targets a plugin receiver class in a package
+        // that is not installed, so it is routed through the launcher's relay receiver.
+        PendingIntentRelay,
+        // Notification.Builder.build(): API 26+ drops a notification with no channel. Old guests
+        // never set one.
+        NotificationChannel,
+        // NotificationManager.notify(): creates the channel NotificationChannel names.
+        NotificationNotify,
+        // A guest's own notification helper - setNotification(String, String, String, int) - which
+        // runs as plugin Java code on ART and cannot work there any more: it builds a PendingIntent
+        // with no mutability flag (rejected by API 31+), posts with no channel (dropped by API 26+)
+        // and names a plugin drawable for its icon. Nothing in C++ can reach the Java -> Java calls
+        // inside it, so the whole method is answered by the launcher instead.
+        LegacyNotification,
     };
     struct MethodRecord {
         JniBackend::Id id = 0;
@@ -89,7 +110,7 @@ struct HostJni::Impl {
         // only. Empty for a method id that came from reflection, where neither is ever sent to us.
         std::string name;
         std::string signature;
-        AudioMethodHook audio_hook = AudioMethodHook::None;
+        MethodHook hook = MethodHook::None;
     };
     static constexpr std::size_t kMethodPageBits = 10;
     static constexpr std::size_t kMethodPageSize = 1u << kMethodPageBits;
@@ -145,7 +166,7 @@ struct HostJni::Impl {
     // Guest method ids and their metadata/shorties. `java_name`/`java_signature` are recorded for
     // diagnostics only (see MethodRecord) and may be empty.
     std::uint32_t intern_method(JniBackend::Id id, const std::string& shorty,
-                                AudioMethodHook audio_hook = AudioMethodHook::None,
+                                MethodHook hook = MethodHook::None,
                                 const std::string& java_name = std::string(),
                                 const std::string& java_signature = std::string());
     // Fast lock-free lookup for the common dense method id range; nullptr triggers fallback/fatal.
@@ -192,6 +213,25 @@ struct HostJni::Impl {
     bool serve_data(JniCall& call);
     bool serve_natives(JniCall& call);
     bool serve_vm(JniCall& call);
+
+    // Compatibility hooks of host_jni_compat.cpp. All of them only ever make an old guest work on
+    // a current platform; every failure leaves a pending exception cleared and the original call
+    // unchanged, so a missing platform API can never break a call the guest could make before.
+    //
+    // API 31+: a PendingIntent without FLAG_IMMUTABLE or FLAG_MUTABLE is rejected. Adds
+    // FLAG_IMMUTABLE to values[3] and notes the rewrite in the runtime report.
+    void fix_pending_intent_flags(JniBackend::Env env, const MethodRecord& record, JValue* values);
+    // Points a PendingIntent.getBroadcast intent at the launcher's relay receiver, which runs the
+    // plugin receiver the guest named. Returns `intent` itself when the rewrite does not apply.
+    JniBackend::Ref relay_broadcast_intent(JniBackend::Env env, JniBackend::Ref intent);
+    // API 26+: a notification with no channel is dropped. Gives the builder our channel.
+    void prepare_notification(JniBackend::Env env, JniBackend::Ref builder);
+    // API 26+: creates the channel prepare_notification names, on the manager that will post.
+    void ensure_notification_channel(JniBackend::Env env, JniBackend::Ref manager);
+    // Builds and posts a guest's legacy notification from the launcher itself, through
+    // com.zettabridge.core.ZBridge.notifyGuest (see MethodHook::LegacyNotification). `values` holds
+    // the four setNotification arguments: id, title, text, seconds. False leaves the call to ART.
+    bool post_legacy_notification(JniBackend::Env env, JniBackend::Ref activity, const JValue* values);
 };
 
 std::string jni_recent_calls();

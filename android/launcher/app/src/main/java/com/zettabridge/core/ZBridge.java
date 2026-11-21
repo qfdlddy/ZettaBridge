@@ -1,5 +1,15 @@
 package com.zettabridge.core;
 
+import android.app.Activity;
+import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Context;
+import android.content.Intent;
+import android.os.SystemClock;
+
 import java.io.IOException;
 
 /**
@@ -114,6 +124,24 @@ public final class ZBridge {
     public static native String fixGuestLibrary(String path) throws IOException;
 
     /**
+     * Strong undefined symbols of an imported plugin's arm32 libraries that neither the plugin
+     * itself nor the bundled guest runtime provides.
+     *
+     * <p>The guest links a library with {@code BIND_NOW}, so a single unresolved strong name stops
+     * the whole library from loading and the only error the launcher sees is
+     * {@code JNI_ERR returned from JNI_OnLoad}. Running this at import turns that into a list of
+     * names before the plugin is launched. The result is conservative: every plugin library and
+     * every bundled runtime library counts as a provider, so a reported name is a real gap while an
+     * empty result is not a promise that the load will succeed.
+     *
+     * @param libDir the plugin's extracted lib directory
+     * @param guestLibDir filesDir/zb/guest/lib
+     * @param sysrootLibDir filesDir/zb/sysroot/system/lib
+     * @return {@code "libgame.so: symbol"} entries, at most 32, sorted; empty when nothing is missing
+     */
+    public static native String[] missingGuestSymbols(String libDir, String guestLibDir, String sysrootLibDir);
+
+    /**
      * Sets ZB_PRECISE_FAULTS in this process's environment (setenv), so a memory fault stops at
      * the exact faulting instruction with registers committed instead of at the end of the
      * translated block. Diagnostic only: roughly 2x slower on integer code. Must be called before
@@ -136,4 +164,85 @@ public final class ZBridge {
      * before the guest runtime/Process is constructed.
      */
     public static native void setUnsafeFp(boolean enabled);
+
+    /** The channel every translated guest posts into. One channel serves every plugin. */
+    public static final String CHANNEL_ID = "zb.plugin";
+    private static final String CHANNEL_NAME = "ZettaBridge";
+    /** Posts a guest notification when the alarm it was given fires (main process). */
+    private static final String NOTIFICATION_RELAY = "com.zettabridge.launcher.NotificationRelayReceiver";
+    /** Extras of an alarm this class schedules; the receiver reads them back. */
+    public static final String EXTRA_ID = "zb.relay.id";
+    public static final String EXTRA_TITLE = "zb.relay.title";
+    public static final String EXTRA_TEXT = "zb.relay.text";
+
+    /**
+     * Posts a notification for a translated guest.
+     *
+     * <p>Called by libzbridge.so in place of a guest's own notification helper
+     * ({@code setNotification(String id, String title, String text, int seconds)}), which runs as
+     * plugin Java code on the platform and cannot work there: it builds a {@link PendingIntent}
+     * with no mutability flag (rejected by API 31+), posts with no channel (dropped by API 26+) and
+     * names a plugin drawable for its icon. The guest's arguments match its own method's, so the
+     * notification appears where the guest meant it to.
+     *
+     * @param activity the guest's activity, the context the notification belongs to
+     * @param id the guest's notification id, as text; a malformed one becomes 0
+     * @param seconds delay before the notification appears, in seconds; 0 or less posts at once
+     */
+    public static void notifyGuest(Activity activity, String id, String title, String text, int seconds) {
+        if (activity == null) return;
+        final int notificationId = parseId(id);
+        if (seconds > 0) {
+            Intent relay = new Intent();
+            relay.setClassName(activity.getPackageName(), NOTIFICATION_RELAY);
+            relay.putExtra(EXTRA_ID, notificationId);
+            relay.putExtra(EXTRA_TITLE, textOf(title));
+            relay.putExtra(EXTRA_TEXT, textOf(text));
+            PendingIntent alarm = PendingIntent.getBroadcast(activity, notificationId, relay,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            AlarmManager alarms = (AlarmManager) activity.getSystemService(Context.ALARM_SERVICE);
+            if (alarms != null) {
+                alarms.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        SystemClock.elapsedRealtime() + seconds * 1000L, alarm);
+                return;
+            }
+        }
+        postGuestNotification(activity, notificationId, title, text);
+    }
+
+    /** Builds and posts a guest notification now; also the relay receiver's whole job. */
+    public static void postGuestNotification(Context context, int id, String title, String text) {
+        if (context == null) return;
+        NotificationManager manager =
+                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) return;
+        manager.createNotificationChannel(
+                new NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH));
+        Notification.Builder builder = new Notification.Builder(context, CHANNEL_ID)
+                .setContentTitle(textOf(title))
+                .setContentText(textOf(text))
+                // The guest's own icon is a drawable in its APK, which this package cannot resolve.
+                .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                .setAutoCancel(true);
+        Intent open = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+        if (open != null) {
+            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            builder.setContentIntent(PendingIntent.getActivity(context, id, open,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE));
+        }
+        manager.notify(id, builder.build());
+    }
+
+    private static int parseId(String id) {
+        if (id == null) return 0;
+        try {
+            return Integer.parseInt(id.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private static String textOf(String text) {
+        return text == null ? "" : text;
+    }
 }

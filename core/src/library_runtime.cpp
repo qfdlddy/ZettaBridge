@@ -464,6 +464,7 @@ bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& er
     }
     Impl* impl = impl_.get();
     impl->process.set_sysroot(options.sysroot);
+    for (const std::string& dir : options.guest_library_dirs) impl->process.add_library_dir(dir);
     impl->process.set_host_call_handler(
         [impl](std::uint32_t index, GuestThread& thread) { return impl->handle_host_call(index, thread); });
     if (impl->fast_chained != nullptr) {

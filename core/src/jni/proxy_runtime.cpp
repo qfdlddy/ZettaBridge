@@ -13,6 +13,7 @@
 
 #include "zb/configuration_hostcalls.h"
 #include "zb/egl_hostcalls.h"
+#include "zb/gles1_hostcalls.h"
 #include "zb/gl_hostcalls.h"
 #include "zb/hang_watchdog.h"
 #include "zb/host_jni.h"
@@ -146,6 +147,9 @@ LibraryRuntimeOptions guest_runtime_options(const GuestRuntimeLayout& layout, co
     options.target_sdk = target_sdk;
     options.preload = "libzbjni.so";
     options.guest_environment = {"LD_LIBRARY_PATH=" + layout.guest_lib_dir + ":" + plugin_root + "/lib"};
+    // Absolute system library paths are looked up in these directories before the device's own
+    // files: Topsoil's OpenAL probe stat()s and dlopen()s "/system/lib/libOpenSLES.so".
+    options.guest_library_dirs = {layout.guest_lib_dir, plugin_root + "/lib"};
     return options;
 }
 
@@ -396,7 +400,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
                                AssetBackend* asset_backend, EglBackend* egl_backend, NativeWindowBackend* window_backend,
                                AndroidLooperBackend* looper_backend, InputBackend* input_backend,
                                ConfigurationBackend* configuration_backend,
-                               OpenSlBackend* opensl_backend)
+                               OpenSlBackend* opensl_backend, Gl1Backend* gl1_backend)
     : backend_(backend),
       runtime_(new LibraryRuntime()),
       host_jni_(new HostJni(*runtime_, backend)),
@@ -479,6 +483,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     host_compat_ = new HostPlatformCompat();
     if (gl_backend != nullptr) {
         host_gl_ = new HostGl(*runtime_, *gl_backend, HostGl::GuestAllocator{}, std::move(egl_context_probe));
+        host_gl_->set_gl1_backend(gl1_backend);
     }
     if (window_backend != nullptr) {
         host_windows_ = new HostNativeWindow(*runtime_, *window_backend, *host_jni_);
@@ -528,6 +533,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     static_assert(ZB_COMPAT_HC_AndroidBitmap_unlockPixels < kDispatchTableSize);
     static_assert(ZB_COMPAT_HC_ALooper_wake < kDispatchTableSize);
     static_assert(kGlHostCallExtLast < kDispatchTableSize);
+    static_assert(kGl1HostCallLast < kDispatchTableSize);
     static_assert(ZB_SENSOR_HC_LAST < kDispatchTableSize);
     static_assert(ZB_INPUT_HC_LAST < kDispatchTableSize);
     static_assert(ZB_CONFIG_HC_LAST < kDispatchTableSize);
@@ -548,6 +554,7 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
                    HostCallTarget::Compat);
         fill_range(ZB_COMPAT_HC_ALooper_acquire, ZB_COMPAT_HC_ALooper_wake, HostCallTarget::Looper);
         fill_range(kGlHostCall3First, kGlHostCallExtLast, HostCallTarget::Gl);
+        fill_range(kGl1HostCallFirst, kGl1HostCallLast, HostCallTarget::Gl);
         fill_range(ZB_SENSOR_HC_FIRST, ZB_SENSOR_HC_LAST, HostCallTarget::Sensors);
         fill_range(ZB_INPUT_HC_FIRST, ZB_INPUT_HC_LAST, HostCallTarget::Input);
         fill_range(ZB_CONFIG_HC_FIRST, ZB_CONFIG_HC_LAST, HostCallTarget::Config);

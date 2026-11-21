@@ -316,6 +316,13 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public android.content.SharedPreferences getSharedPreferences(String name, int mode) {
+        // Pre-N plugins pass MODE_WORLD_READABLE / MODE_WORLD_WRITEABLE (and some pass
+        // MODE_MULTI_PROCESS). Since API 24 ContextImpl throws SecurityException for all three,
+        // which ends the plugin at its very first onCreate - Punch Quest does exactly this, after
+        // every one of its libraries has loaded. The flags were ignored with a warning long before
+        // they were removed, and a translated plugin cannot be shared with other processes, so
+        // dropping them reproduces the old semantics instead of failing the launch.
+        mode &= ~(MODE_WORLD_READABLE | MODE_WORLD_WRITEABLE | MODE_MULTI_PROCESS);
         return super.getSharedPreferences(plugin.packageName + "__" + name, mode);
     }
 

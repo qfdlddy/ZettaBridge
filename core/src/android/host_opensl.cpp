@@ -26,6 +26,11 @@ constexpr std::uint32_t kSlIidVolume = 0x7B010005u;
 constexpr std::uint32_t kSlIidBufferQueue = 0x7B010006u;
 constexpr std::uint32_t kSlIidAndroidSimpleBufferQueue = 0x7B010007u;
 constexpr std::uint32_t kSlIidAndroidConfiguration = 0x7B010008u;
+// The reserved space all guest SL_IID_* values live in (guest/stubs/libOpenSLES.S). Every id
+// Android exports is there, including the ones this bridge does not serve, so GetInterface can
+// tell "a real interface we do not implement" apart from "not an interface id at all".
+constexpr std::uint32_t kSlIidSpaceBase = 0x7B010000u;
+constexpr std::uint32_t kSlIidSpaceMask = 0xFFFF0000u;
 
 constexpr std::uint32_t kSlDataLocatorAndroidSimpleBufferQueue = 0x800007BDu;
 constexpr std::uint32_t kSlDataLocatorOutputMix = 4u;
@@ -507,6 +512,14 @@ bool HostOpenSl::object_slot(Call& call, std::uint32_t handle, unsigned slot) {
             interface_kind = Kind::ConfigInterface;
             break;
         default:
+            // A real SL_IID_* this bridge does not serve (an effect send, a 3D interface, ...)
+            // must answer "unsupported" rather than "invalid parameter": callers such as Punch
+            // Quest's libgame.so ask for SL_IID_EFFECTSEND and are expected to carry on without
+            // it. Anything that is not one of our own ids is still a caller bug.
+            if ((iid & kSlIidSpaceMask) == kSlIidSpaceBase) {
+                call.set_result(OpenSlBackend::kFeatureUnsupported);
+                return true;
+            }
             call.set_result(OpenSlBackend::kParameterInvalid);
             return true;
         }

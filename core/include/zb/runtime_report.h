@@ -58,6 +58,9 @@ public:
     void note_proxy_loaded(const std::string& library, std::int32_t jni_version);
     void note_proxy_failed(const std::string& library, const std::string& error);
     void note_jni_onload(const std::string& library, bool ok, std::int32_t jni_version);
+    // A guest dlopen that failed, with the guest linker's own error text ("cannot locate symbol
+    // ...", "library ... not found"). Called for every failed load; the first few are kept.
+    void note_guest_dlopen_failed(const std::string& library, const std::string& error);
     void note_registered_native();
     // The counter for a bound native method's display name ("Class.method", or just "method"
     // when the class name was not available at registration). Creates it (locked, rare) the
@@ -235,6 +238,9 @@ private:
     std::size_t proxy_failure_total_ = 0;
     std::vector<Load> onloads_;
     std::size_t onload_total_ = 0;
+    static constexpr std::size_t kMaxDlopenFailures = 8;
+    std::vector<Load> dlopen_failures_;
+    std::size_t dlopen_failure_total_ = 0;
     std::uint64_t registered_natives_ = 0;
     std::string exit_reason_;
     std::uint64_t signal_eintr_total_ = 0;

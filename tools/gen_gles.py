@@ -318,15 +318,18 @@ def checked_surface():
     # still start at 0 and keep their order.
     # A name two libraries both export is one host call with one index (GLES 1 shares most of its
     # entry points with GLES 2), so it appears once here, under the library that introduced it.
+    # An ES1 extension spelling that aliases an ES2 core call (gen_stubs.GLES1_OES_ALIASES) is the
+    # same thing one level up: it emits a thunk to the core index and adds no row of its own.
     expected_rows = []
     index = 0
     assigned = set()
     for lib, source in gen_stubs.LIBRARIES:
         for name in source():
-            if name in assigned:
+            target = gen_stubs.GLES1_OES_ALIASES.get(name, name)
+            if target in assigned:
                 continue
             expected_rows.append((index, lib + ".so", name))
-            assigned.add(name)
+            assigned.add(target)
             index += 1
     actual_rows = committed_hostcalls()
     if actual_rows != expected_rows:

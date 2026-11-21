@@ -2134,3 +2134,1104 @@ glTexStorage3DEXT:
     svc #0x5a0157
     bx lr
 .size glTexStorage3DEXT, . - glTexStorage3DEXT
+
+.global glAlphaFuncxOES
+.type glAlphaFuncxOES, %function
+.p2align 2
+glAlphaFuncxOES:
+    svc #0x5a0253
+    bx lr
+.size glAlphaFuncxOES, . - glAlphaFuncxOES
+
+.global __zb_svc_glBindFramebufferOES
+.hidden __zb_svc_glBindFramebufferOES
+.type __zb_svc_glBindFramebufferOES, %function
+.p2align 2
+__zb_svc_glBindFramebufferOES:
+    svc #0x5a0004
+    bx lr
+.size __zb_svc_glBindFramebufferOES, . - __zb_svc_glBindFramebufferOES
+
+.global glBindRenderbufferOES
+.type glBindRenderbufferOES, %function
+.p2align 2
+glBindRenderbufferOES:
+    svc #0x5a0005
+    bx lr
+.size glBindRenderbufferOES, . - glBindRenderbufferOES
+
+.global __zb_svc_glBlendEquationOES
+.hidden __zb_svc_glBlendEquationOES
+.type __zb_svc_glBlendEquationOES, %function
+.p2align 2
+__zb_svc_glBlendEquationOES:
+    svc #0x5a0008
+    bx lr
+.size __zb_svc_glBlendEquationOES, . - __zb_svc_glBlendEquationOES
+
+.global __zb_svc_glBlendEquationSeparateOES
+.hidden __zb_svc_glBlendEquationSeparateOES
+.type __zb_svc_glBlendEquationSeparateOES, %function
+.p2align 2
+__zb_svc_glBlendEquationSeparateOES:
+    svc #0x5a0009
+    bx lr
+.size __zb_svc_glBlendEquationSeparateOES, . - __zb_svc_glBlendEquationSeparateOES
+
+.global __zb_svc_glBlendFuncSeparateOES
+.hidden __zb_svc_glBlendFuncSeparateOES
+.type __zb_svc_glBlendFuncSeparateOES, %function
+.p2align 2
+__zb_svc_glBlendFuncSeparateOES:
+    svc #0x5a000b
+    bx lr
+.size __zb_svc_glBlendFuncSeparateOES, . - __zb_svc_glBlendFuncSeparateOES
+
+.global glCheckFramebufferStatusOES
+.type glCheckFramebufferStatusOES, %function
+.p2align 2
+glCheckFramebufferStatusOES:
+    svc #0x5a000e
+    bx lr
+.size glCheckFramebufferStatusOES, . - glCheckFramebufferStatusOES
+
+.global glClearColorxOES
+.type glClearColorxOES, %function
+.p2align 2
+glClearColorxOES:
+    svc #0x5a0254
+    bx lr
+.size glClearColorxOES, . - glClearColorxOES
+
+.global glClearDepthfOES
+.type glClearDepthfOES, %function
+.p2align 2
+glClearDepthfOES:
+    svc #0x5a0255
+    bx lr
+.size glClearDepthfOES, . - glClearDepthfOES
+
+.global glClearDepthxOES
+.type glClearDepthxOES, %function
+.p2align 2
+glClearDepthxOES:
+    svc #0x5a0256
+    bx lr
+.size glClearDepthxOES, . - glClearDepthxOES
+
+.global glClientWaitSyncAPPLE
+.type glClientWaitSyncAPPLE, %function
+.p2align 2
+glClientWaitSyncAPPLE:
+    svc #0x5a0257
+    bx lr
+.size glClientWaitSyncAPPLE, . - glClientWaitSyncAPPLE
+
+.global glClipPlanefIMG
+.type glClipPlanefIMG, %function
+.p2align 2
+glClipPlanefIMG:
+    svc #0x5a0258
+    bx lr
+.size glClipPlanefIMG, . - glClipPlanefIMG
+
+.global glClipPlanefOES
+.type glClipPlanefOES, %function
+.p2align 2
+glClipPlanefOES:
+    svc #0x5a0259
+    bx lr
+.size glClipPlanefOES, . - glClipPlanefOES
+
+.global glClipPlanexIMG
+.type glClipPlanexIMG, %function
+.p2align 2
+glClipPlanexIMG:
+    svc #0x5a025a
+    bx lr
+.size glClipPlanexIMG, . - glClipPlanexIMG
+
+.global glClipPlanexOES
+.type glClipPlanexOES, %function
+.p2align 2
+glClipPlanexOES:
+    svc #0x5a025b
+    bx lr
+.size glClipPlanexOES, . - glClipPlanexOES
+
+.global glColor4xOES
+.type glColor4xOES, %function
+.p2align 2
+glColor4xOES:
+    svc #0x5a025c
+    bx lr
+.size glColor4xOES, . - glColor4xOES
+
+.global glCopyTextureLevelsAPPLE
+.type glCopyTextureLevelsAPPLE, %function
+.p2align 2
+glCopyTextureLevelsAPPLE:
+    svc #0x5a025d
+    bx lr
+.size glCopyTextureLevelsAPPLE, . - glCopyTextureLevelsAPPLE
+
+.global glCurrentPaletteMatrixOES
+.type glCurrentPaletteMatrixOES, %function
+.p2align 2
+glCurrentPaletteMatrixOES:
+    svc #0x5a025e
+    bx lr
+.size glCurrentPaletteMatrixOES, . - glCurrentPaletteMatrixOES
+
+.global glDeleteFencesNV
+.type glDeleteFencesNV, %function
+.p2align 2
+glDeleteFencesNV:
+    svc #0x5a025f
+    bx lr
+.size glDeleteFencesNV, . - glDeleteFencesNV
+
+.global __zb_svc_glDeleteFramebuffersOES
+.hidden __zb_svc_glDeleteFramebuffersOES
+.type __zb_svc_glDeleteFramebuffersOES, %function
+.p2align 2
+__zb_svc_glDeleteFramebuffersOES:
+    svc #0x5a001d
+    bx lr
+.size __zb_svc_glDeleteFramebuffersOES, . - __zb_svc_glDeleteFramebuffersOES
+
+.global glDeleteRenderbuffersOES
+.type glDeleteRenderbuffersOES, %function
+.p2align 2
+glDeleteRenderbuffersOES:
+    svc #0x5a001f
+    bx lr
+.size glDeleteRenderbuffersOES, . - glDeleteRenderbuffersOES
+
+.global glDeleteSyncAPPLE
+.type glDeleteSyncAPPLE, %function
+.p2align 2
+glDeleteSyncAPPLE:
+    svc #0x5a0260
+    bx lr
+.size glDeleteSyncAPPLE, . - glDeleteSyncAPPLE
+
+.global glDepthRangefOES
+.type glDepthRangefOES, %function
+.p2align 2
+glDepthRangefOES:
+    svc #0x5a0261
+    bx lr
+.size glDepthRangefOES, . - glDepthRangefOES
+
+.global glDepthRangexOES
+.type glDepthRangexOES, %function
+.p2align 2
+glDepthRangexOES:
+    svc #0x5a0262
+    bx lr
+.size glDepthRangexOES, . - glDepthRangexOES
+
+.global glDisableDriverControlQCOM
+.type glDisableDriverControlQCOM, %function
+.p2align 2
+glDisableDriverControlQCOM:
+    svc #0x5a0263
+    bx lr
+.size glDisableDriverControlQCOM, . - glDisableDriverControlQCOM
+
+.global glDrawTexfOES
+.type glDrawTexfOES, %function
+.p2align 2
+glDrawTexfOES:
+    svc #0x5a0264
+    bx lr
+.size glDrawTexfOES, . - glDrawTexfOES
+
+.global glDrawTexfvOES
+.type glDrawTexfvOES, %function
+.p2align 2
+glDrawTexfvOES:
+    svc #0x5a0265
+    bx lr
+.size glDrawTexfvOES, . - glDrawTexfvOES
+
+.global glDrawTexiOES
+.type glDrawTexiOES, %function
+.p2align 2
+glDrawTexiOES:
+    svc #0x5a0266
+    bx lr
+.size glDrawTexiOES, . - glDrawTexiOES
+
+.global glDrawTexivOES
+.type glDrawTexivOES, %function
+.p2align 2
+glDrawTexivOES:
+    svc #0x5a0267
+    bx lr
+.size glDrawTexivOES, . - glDrawTexivOES
+
+.global glDrawTexsOES
+.type glDrawTexsOES, %function
+.p2align 2
+glDrawTexsOES:
+    svc #0x5a0268
+    bx lr
+.size glDrawTexsOES, . - glDrawTexsOES
+
+.global glDrawTexsvOES
+.type glDrawTexsvOES, %function
+.p2align 2
+glDrawTexsvOES:
+    svc #0x5a0269
+    bx lr
+.size glDrawTexsvOES, . - glDrawTexsvOES
+
+.global glDrawTexxOES
+.type glDrawTexxOES, %function
+.p2align 2
+glDrawTexxOES:
+    svc #0x5a026a
+    bx lr
+.size glDrawTexxOES, . - glDrawTexxOES
+
+.global glDrawTexxvOES
+.type glDrawTexxvOES, %function
+.p2align 2
+glDrawTexxvOES:
+    svc #0x5a026b
+    bx lr
+.size glDrawTexxvOES, . - glDrawTexxvOES
+
+.global glEGLImageTargetRenderbufferStorageOES
+.type glEGLImageTargetRenderbufferStorageOES, %function
+.p2align 2
+glEGLImageTargetRenderbufferStorageOES:
+    svc #0x5a026c
+    bx lr
+.size glEGLImageTargetRenderbufferStorageOES, . - glEGLImageTargetRenderbufferStorageOES
+
+.global glEnableDriverControlQCOM
+.type glEnableDriverControlQCOM, %function
+.p2align 2
+glEnableDriverControlQCOM:
+    svc #0x5a026d
+    bx lr
+.size glEnableDriverControlQCOM, . - glEnableDriverControlQCOM
+
+.global glEndTilingQCOM
+.type glEndTilingQCOM, %function
+.p2align 2
+glEndTilingQCOM:
+    svc #0x5a026e
+    bx lr
+.size glEndTilingQCOM, . - glEndTilingQCOM
+
+.global glExtGetBufferPointervQCOM
+.type glExtGetBufferPointervQCOM, %function
+.p2align 2
+glExtGetBufferPointervQCOM:
+    svc #0x5a026f
+    bx lr
+.size glExtGetBufferPointervQCOM, . - glExtGetBufferPointervQCOM
+
+.global glExtGetBuffersQCOM
+.type glExtGetBuffersQCOM, %function
+.p2align 2
+glExtGetBuffersQCOM:
+    svc #0x5a0270
+    bx lr
+.size glExtGetBuffersQCOM, . - glExtGetBuffersQCOM
+
+.global glExtGetFramebuffersQCOM
+.type glExtGetFramebuffersQCOM, %function
+.p2align 2
+glExtGetFramebuffersQCOM:
+    svc #0x5a0271
+    bx lr
+.size glExtGetFramebuffersQCOM, . - glExtGetFramebuffersQCOM
+
+.global glExtGetProgramBinarySourceQCOM
+.type glExtGetProgramBinarySourceQCOM, %function
+.p2align 2
+glExtGetProgramBinarySourceQCOM:
+    svc #0x5a0272
+    bx lr
+.size glExtGetProgramBinarySourceQCOM, . - glExtGetProgramBinarySourceQCOM
+
+.global glExtGetProgramsQCOM
+.type glExtGetProgramsQCOM, %function
+.p2align 2
+glExtGetProgramsQCOM:
+    svc #0x5a0273
+    bx lr
+.size glExtGetProgramsQCOM, . - glExtGetProgramsQCOM
+
+.global glExtGetRenderbuffersQCOM
+.type glExtGetRenderbuffersQCOM, %function
+.p2align 2
+glExtGetRenderbuffersQCOM:
+    svc #0x5a0274
+    bx lr
+.size glExtGetRenderbuffersQCOM, . - glExtGetRenderbuffersQCOM
+
+.global glExtGetShadersQCOM
+.type glExtGetShadersQCOM, %function
+.p2align 2
+glExtGetShadersQCOM:
+    svc #0x5a0275
+    bx lr
+.size glExtGetShadersQCOM, . - glExtGetShadersQCOM
+
+.global glExtGetTexLevelParameterivQCOM
+.type glExtGetTexLevelParameterivQCOM, %function
+.p2align 2
+glExtGetTexLevelParameterivQCOM:
+    svc #0x5a0276
+    bx lr
+.size glExtGetTexLevelParameterivQCOM, . - glExtGetTexLevelParameterivQCOM
+
+.global glExtGetTexSubImageQCOM
+.type glExtGetTexSubImageQCOM, %function
+.p2align 2
+glExtGetTexSubImageQCOM:
+    svc #0x5a0277
+    bx lr
+.size glExtGetTexSubImageQCOM, . - glExtGetTexSubImageQCOM
+
+.global glExtGetTexturesQCOM
+.type glExtGetTexturesQCOM, %function
+.p2align 2
+glExtGetTexturesQCOM:
+    svc #0x5a0278
+    bx lr
+.size glExtGetTexturesQCOM, . - glExtGetTexturesQCOM
+
+.global glExtIsProgramBinaryQCOM
+.type glExtIsProgramBinaryQCOM, %function
+.p2align 2
+glExtIsProgramBinaryQCOM:
+    svc #0x5a0279
+    bx lr
+.size glExtIsProgramBinaryQCOM, . - glExtIsProgramBinaryQCOM
+
+.global glExtTexObjectStateOverrideiQCOM
+.type glExtTexObjectStateOverrideiQCOM, %function
+.p2align 2
+glExtTexObjectStateOverrideiQCOM:
+    svc #0x5a027a
+    bx lr
+.size glExtTexObjectStateOverrideiQCOM, . - glExtTexObjectStateOverrideiQCOM
+
+.global glFenceSyncAPPLE
+.type glFenceSyncAPPLE, %function
+.p2align 2
+glFenceSyncAPPLE:
+    svc #0x5a027b
+    bx lr
+.size glFenceSyncAPPLE, . - glFenceSyncAPPLE
+
+.global glFinishFenceNV
+.type glFinishFenceNV, %function
+.p2align 2
+glFinishFenceNV:
+    svc #0x5a027c
+    bx lr
+.size glFinishFenceNV, . - glFinishFenceNV
+
+.global glFlushMappedBufferRangeEXT
+.type glFlushMappedBufferRangeEXT, %function
+.p2align 2
+glFlushMappedBufferRangeEXT:
+    svc #0x5a027d
+    bx lr
+.size glFlushMappedBufferRangeEXT, . - glFlushMappedBufferRangeEXT
+
+.global glFogxOES
+.type glFogxOES, %function
+.p2align 2
+glFogxOES:
+    svc #0x5a027e
+    bx lr
+.size glFogxOES, . - glFogxOES
+
+.global glFogxvOES
+.type glFogxvOES, %function
+.p2align 2
+glFogxvOES:
+    svc #0x5a027f
+    bx lr
+.size glFogxvOES, . - glFogxvOES
+
+.global glFramebufferRenderbufferOES
+.type glFramebufferRenderbufferOES, %function
+.p2align 2
+glFramebufferRenderbufferOES:
+    svc #0x5a002e
+    bx lr
+.size glFramebufferRenderbufferOES, . - glFramebufferRenderbufferOES
+
+.global glFramebufferTexture2DMultisampleIMG
+.type glFramebufferTexture2DMultisampleIMG, %function
+.p2align 2
+glFramebufferTexture2DMultisampleIMG:
+    svc #0x5a0280
+    bx lr
+.size glFramebufferTexture2DMultisampleIMG, . - glFramebufferTexture2DMultisampleIMG
+
+.global glFramebufferTexture2DOES
+.type glFramebufferTexture2DOES, %function
+.p2align 2
+glFramebufferTexture2DOES:
+    svc #0x5a002f
+    bx lr
+.size glFramebufferTexture2DOES, . - glFramebufferTexture2DOES
+
+.global glFrustumfOES
+.type glFrustumfOES, %function
+.p2align 2
+glFrustumfOES:
+    svc #0x5a0281
+    bx lr
+.size glFrustumfOES, . - glFrustumfOES
+
+.global glFrustumxOES
+.type glFrustumxOES, %function
+.p2align 2
+glFrustumxOES:
+    svc #0x5a0282
+    bx lr
+.size glFrustumxOES, . - glFrustumxOES
+
+.global glGenFencesNV
+.type glGenFencesNV, %function
+.p2align 2
+glGenFencesNV:
+    svc #0x5a0283
+    bx lr
+.size glGenFencesNV, . - glGenFencesNV
+
+.global glGenFramebuffersOES
+.type glGenFramebuffersOES, %function
+.p2align 2
+glGenFramebuffersOES:
+    svc #0x5a0032
+    bx lr
+.size glGenFramebuffersOES, . - glGenFramebuffersOES
+
+.global glGenRenderbuffersOES
+.type glGenRenderbuffersOES, %function
+.p2align 2
+glGenRenderbuffersOES:
+    svc #0x5a0033
+    bx lr
+.size glGenRenderbuffersOES, . - glGenRenderbuffersOES
+
+.global glGenerateMipmapOES
+.type glGenerateMipmapOES, %function
+.p2align 2
+glGenerateMipmapOES:
+    svc #0x5a0035
+    bx lr
+.size glGenerateMipmapOES, . - glGenerateMipmapOES
+
+.global glGetClipPlanefOES
+.type glGetClipPlanefOES, %function
+.p2align 2
+glGetClipPlanefOES:
+    svc #0x5a0284
+    bx lr
+.size glGetClipPlanefOES, . - glGetClipPlanefOES
+
+.global glGetClipPlanexOES
+.type glGetClipPlanexOES, %function
+.p2align 2
+glGetClipPlanexOES:
+    svc #0x5a0285
+    bx lr
+.size glGetClipPlanexOES, . - glGetClipPlanexOES
+
+.global glGetDriverControlStringQCOM
+.type glGetDriverControlStringQCOM, %function
+.p2align 2
+glGetDriverControlStringQCOM:
+    svc #0x5a0286
+    bx lr
+.size glGetDriverControlStringQCOM, . - glGetDriverControlStringQCOM
+
+.global glGetDriverControlsQCOM
+.type glGetDriverControlsQCOM, %function
+.p2align 2
+glGetDriverControlsQCOM:
+    svc #0x5a0287
+    bx lr
+.size glGetDriverControlsQCOM, . - glGetDriverControlsQCOM
+
+.global glGetFenceivNV
+.type glGetFenceivNV, %function
+.p2align 2
+glGetFenceivNV:
+    svc #0x5a0288
+    bx lr
+.size glGetFenceivNV, . - glGetFenceivNV
+
+.global glGetFixedvOES
+.type glGetFixedvOES, %function
+.p2align 2
+glGetFixedvOES:
+    svc #0x5a0289
+    bx lr
+.size glGetFixedvOES, . - glGetFixedvOES
+
+.global glGetFramebufferAttachmentParameterivOES
+.type glGetFramebufferAttachmentParameterivOES, %function
+.p2align 2
+glGetFramebufferAttachmentParameterivOES:
+    svc #0x5a003e
+    bx lr
+.size glGetFramebufferAttachmentParameterivOES, . - glGetFramebufferAttachmentParameterivOES
+
+.global glGetGraphicsResetStatusEXT
+.type glGetGraphicsResetStatusEXT, %function
+.p2align 2
+glGetGraphicsResetStatusEXT:
+    svc #0x5a028a
+    bx lr
+.size glGetGraphicsResetStatusEXT, . - glGetGraphicsResetStatusEXT
+
+.global glGetInteger64vAPPLE
+.type glGetInteger64vAPPLE, %function
+.p2align 2
+glGetInteger64vAPPLE:
+    svc #0x5a028b
+    bx lr
+.size glGetInteger64vAPPLE, . - glGetInteger64vAPPLE
+
+.global glGetLightxvOES
+.type glGetLightxvOES, %function
+.p2align 2
+glGetLightxvOES:
+    svc #0x5a028c
+    bx lr
+.size glGetLightxvOES, . - glGetLightxvOES
+
+.global glGetMaterialxvOES
+.type glGetMaterialxvOES, %function
+.p2align 2
+glGetMaterialxvOES:
+    svc #0x5a028d
+    bx lr
+.size glGetMaterialxvOES, . - glGetMaterialxvOES
+
+.global glGetRenderbufferParameterivOES
+.type glGetRenderbufferParameterivOES, %function
+.p2align 2
+glGetRenderbufferParameterivOES:
+    svc #0x5a0042
+    bx lr
+.size glGetRenderbufferParameterivOES, . - glGetRenderbufferParameterivOES
+
+.global glGetSyncivAPPLE
+.type glGetSyncivAPPLE, %function
+.p2align 2
+glGetSyncivAPPLE:
+    svc #0x5a028e
+    bx lr
+.size glGetSyncivAPPLE, . - glGetSyncivAPPLE
+
+.global glGetTexEnvxvOES
+.type glGetTexEnvxvOES, %function
+.p2align 2
+glGetTexEnvxvOES:
+    svc #0x5a028f
+    bx lr
+.size glGetTexEnvxvOES, . - glGetTexEnvxvOES
+
+.global glGetTexGenfvOES
+.type glGetTexGenfvOES, %function
+.p2align 2
+glGetTexGenfvOES:
+    svc #0x5a0290
+    bx lr
+.size glGetTexGenfvOES, . - glGetTexGenfvOES
+
+.global glGetTexGenivOES
+.type glGetTexGenivOES, %function
+.p2align 2
+glGetTexGenivOES:
+    svc #0x5a0291
+    bx lr
+.size glGetTexGenivOES, . - glGetTexGenivOES
+
+.global glGetTexGenxvOES
+.type glGetTexGenxvOES, %function
+.p2align 2
+glGetTexGenxvOES:
+    svc #0x5a0292
+    bx lr
+.size glGetTexGenxvOES, . - glGetTexGenxvOES
+
+.global glGetTexParameterxvOES
+.type glGetTexParameterxvOES, %function
+.p2align 2
+glGetTexParameterxvOES:
+    svc #0x5a0293
+    bx lr
+.size glGetTexParameterxvOES, . - glGetTexParameterxvOES
+
+.global glGetnUniformfvEXT
+.type glGetnUniformfvEXT, %function
+.p2align 2
+glGetnUniformfvEXT:
+    svc #0x5a0294
+    bx lr
+.size glGetnUniformfvEXT, . - glGetnUniformfvEXT
+
+.global glGetnUniformivEXT
+.type glGetnUniformivEXT, %function
+.p2align 2
+glGetnUniformivEXT:
+    svc #0x5a0295
+    bx lr
+.size glGetnUniformivEXT, . - glGetnUniformivEXT
+
+.global glIsFenceNV
+.type glIsFenceNV, %function
+.p2align 2
+glIsFenceNV:
+    svc #0x5a0296
+    bx lr
+.size glIsFenceNV, . - glIsFenceNV
+
+.global glIsFramebufferOES
+.type glIsFramebufferOES, %function
+.p2align 2
+glIsFramebufferOES:
+    svc #0x5a0053
+    bx lr
+.size glIsFramebufferOES, . - glIsFramebufferOES
+
+.global glIsRenderbufferOES
+.type glIsRenderbufferOES, %function
+.p2align 2
+glIsRenderbufferOES:
+    svc #0x5a0055
+    bx lr
+.size glIsRenderbufferOES, . - glIsRenderbufferOES
+
+.global glIsSyncAPPLE
+.type glIsSyncAPPLE, %function
+.p2align 2
+glIsSyncAPPLE:
+    svc #0x5a0297
+    bx lr
+.size glIsSyncAPPLE, . - glIsSyncAPPLE
+
+.global glLightModelxOES
+.type glLightModelxOES, %function
+.p2align 2
+glLightModelxOES:
+    svc #0x5a0298
+    bx lr
+.size glLightModelxOES, . - glLightModelxOES
+
+.global glLightModelxvOES
+.type glLightModelxvOES, %function
+.p2align 2
+glLightModelxvOES:
+    svc #0x5a0299
+    bx lr
+.size glLightModelxvOES, . - glLightModelxvOES
+
+.global glLightxOES
+.type glLightxOES, %function
+.p2align 2
+glLightxOES:
+    svc #0x5a029a
+    bx lr
+.size glLightxOES, . - glLightxOES
+
+.global glLightxvOES
+.type glLightxvOES, %function
+.p2align 2
+glLightxvOES:
+    svc #0x5a029b
+    bx lr
+.size glLightxvOES, . - glLightxvOES
+
+.global glLineWidthxOES
+.type glLineWidthxOES, %function
+.p2align 2
+glLineWidthxOES:
+    svc #0x5a029c
+    bx lr
+.size glLineWidthxOES, . - glLineWidthxOES
+
+.global glLoadMatrixxOES
+.type glLoadMatrixxOES, %function
+.p2align 2
+glLoadMatrixxOES:
+    svc #0x5a029d
+    bx lr
+.size glLoadMatrixxOES, . - glLoadMatrixxOES
+
+.global glLoadPaletteFromModelViewMatrixOES
+.type glLoadPaletteFromModelViewMatrixOES, %function
+.p2align 2
+glLoadPaletteFromModelViewMatrixOES:
+    svc #0x5a029e
+    bx lr
+.size glLoadPaletteFromModelViewMatrixOES, . - glLoadPaletteFromModelViewMatrixOES
+
+.global glMapBufferRangeEXT
+.type glMapBufferRangeEXT, %function
+.p2align 2
+glMapBufferRangeEXT:
+    svc #0x5a029f
+    bx lr
+.size glMapBufferRangeEXT, . - glMapBufferRangeEXT
+
+.global glMaterialxOES
+.type glMaterialxOES, %function
+.p2align 2
+glMaterialxOES:
+    svc #0x5a02a0
+    bx lr
+.size glMaterialxOES, . - glMaterialxOES
+
+.global glMaterialxvOES
+.type glMaterialxvOES, %function
+.p2align 2
+glMaterialxvOES:
+    svc #0x5a02a1
+    bx lr
+.size glMaterialxvOES, . - glMaterialxvOES
+
+.global glMatrixIndexPointerOES
+.type glMatrixIndexPointerOES, %function
+.p2align 2
+glMatrixIndexPointerOES:
+    svc #0x5a02a2
+    bx lr
+.size glMatrixIndexPointerOES, . - glMatrixIndexPointerOES
+
+.global glMultMatrixxOES
+.type glMultMatrixxOES, %function
+.p2align 2
+glMultMatrixxOES:
+    svc #0x5a02a3
+    bx lr
+.size glMultMatrixxOES, . - glMultMatrixxOES
+
+.global glMultiDrawArraysEXT
+.type glMultiDrawArraysEXT, %function
+.p2align 2
+glMultiDrawArraysEXT:
+    svc #0x5a02a4
+    bx lr
+.size glMultiDrawArraysEXT, . - glMultiDrawArraysEXT
+
+.global glMultiDrawElementsEXT
+.type glMultiDrawElementsEXT, %function
+.p2align 2
+glMultiDrawElementsEXT:
+    svc #0x5a02a5
+    bx lr
+.size glMultiDrawElementsEXT, . - glMultiDrawElementsEXT
+
+.global glMultiTexCoord4xOES
+.type glMultiTexCoord4xOES, %function
+.p2align 2
+glMultiTexCoord4xOES:
+    svc #0x5a02a6
+    bx lr
+.size glMultiTexCoord4xOES, . - glMultiTexCoord4xOES
+
+.global glNormal3xOES
+.type glNormal3xOES, %function
+.p2align 2
+glNormal3xOES:
+    svc #0x5a02a7
+    bx lr
+.size glNormal3xOES, . - glNormal3xOES
+
+.global glOrthofOES
+.type glOrthofOES, %function
+.p2align 2
+glOrthofOES:
+    svc #0x5a02a8
+    bx lr
+.size glOrthofOES, . - glOrthofOES
+
+.global glOrthoxOES
+.type glOrthoxOES, %function
+.p2align 2
+glOrthoxOES:
+    svc #0x5a02a9
+    bx lr
+.size glOrthoxOES, . - glOrthoxOES
+
+.global glPointParameterxOES
+.type glPointParameterxOES, %function
+.p2align 2
+glPointParameterxOES:
+    svc #0x5a02aa
+    bx lr
+.size glPointParameterxOES, . - glPointParameterxOES
+
+.global glPointParameterxvOES
+.type glPointParameterxvOES, %function
+.p2align 2
+glPointParameterxvOES:
+    svc #0x5a02ab
+    bx lr
+.size glPointParameterxvOES, . - glPointParameterxvOES
+
+.global glPointSizexOES
+.type glPointSizexOES, %function
+.p2align 2
+glPointSizexOES:
+    svc #0x5a02ac
+    bx lr
+.size glPointSizexOES, . - glPointSizexOES
+
+.global glPolygonOffsetxOES
+.type glPolygonOffsetxOES, %function
+.p2align 2
+glPolygonOffsetxOES:
+    svc #0x5a02ad
+    bx lr
+.size glPolygonOffsetxOES, . - glPolygonOffsetxOES
+
+.global glQueryMatrixxOES
+.type glQueryMatrixxOES, %function
+.p2align 2
+glQueryMatrixxOES:
+    svc #0x5a02ae
+    bx lr
+.size glQueryMatrixxOES, . - glQueryMatrixxOES
+
+.global glReadnPixelsEXT
+.type glReadnPixelsEXT, %function
+.p2align 2
+glReadnPixelsEXT:
+    svc #0x5a02af
+    bx lr
+.size glReadnPixelsEXT, . - glReadnPixelsEXT
+
+.global glRenderbufferStorageMultisampleAPPLE
+.type glRenderbufferStorageMultisampleAPPLE, %function
+.p2align 2
+glRenderbufferStorageMultisampleAPPLE:
+    svc #0x5a02b0
+    bx lr
+.size glRenderbufferStorageMultisampleAPPLE, . - glRenderbufferStorageMultisampleAPPLE
+
+.global glRenderbufferStorageMultisampleIMG
+.type glRenderbufferStorageMultisampleIMG, %function
+.p2align 2
+glRenderbufferStorageMultisampleIMG:
+    svc #0x5a02b1
+    bx lr
+.size glRenderbufferStorageMultisampleIMG, . - glRenderbufferStorageMultisampleIMG
+
+.global glRenderbufferStorageOES
+.type glRenderbufferStorageOES, %function
+.p2align 2
+glRenderbufferStorageOES:
+    svc #0x5a005e
+    bx lr
+.size glRenderbufferStorageOES, . - glRenderbufferStorageOES
+
+.global glResolveMultisampleFramebufferAPPLE
+.type glResolveMultisampleFramebufferAPPLE, %function
+.p2align 2
+glResolveMultisampleFramebufferAPPLE:
+    svc #0x5a02b2
+    bx lr
+.size glResolveMultisampleFramebufferAPPLE, . - glResolveMultisampleFramebufferAPPLE
+
+.global glRotatexOES
+.type glRotatexOES, %function
+.p2align 2
+glRotatexOES:
+    svc #0x5a02b3
+    bx lr
+.size glRotatexOES, . - glRotatexOES
+
+.global glSampleCoveragexOES
+.type glSampleCoveragexOES, %function
+.p2align 2
+glSampleCoveragexOES:
+    svc #0x5a02b4
+    bx lr
+.size glSampleCoveragexOES, . - glSampleCoveragexOES
+
+.global glScalexOES
+.type glScalexOES, %function
+.p2align 2
+glScalexOES:
+    svc #0x5a02b5
+    bx lr
+.size glScalexOES, . - glScalexOES
+
+.global glSetFenceNV
+.type glSetFenceNV, %function
+.p2align 2
+glSetFenceNV:
+    svc #0x5a02b6
+    bx lr
+.size glSetFenceNV, . - glSetFenceNV
+
+.global glStartTilingQCOM
+.type glStartTilingQCOM, %function
+.p2align 2
+glStartTilingQCOM:
+    svc #0x5a02b7
+    bx lr
+.size glStartTilingQCOM, . - glStartTilingQCOM
+
+.global glTestFenceNV
+.type glTestFenceNV, %function
+.p2align 2
+glTestFenceNV:
+    svc #0x5a02b8
+    bx lr
+.size glTestFenceNV, . - glTestFenceNV
+
+.global glTexEnvxOES
+.type glTexEnvxOES, %function
+.p2align 2
+glTexEnvxOES:
+    svc #0x5a02b9
+    bx lr
+.size glTexEnvxOES, . - glTexEnvxOES
+
+.global glTexEnvxvOES
+.type glTexEnvxvOES, %function
+.p2align 2
+glTexEnvxvOES:
+    svc #0x5a02ba
+    bx lr
+.size glTexEnvxvOES, . - glTexEnvxvOES
+
+.global glTexGenfOES
+.type glTexGenfOES, %function
+.p2align 2
+glTexGenfOES:
+    svc #0x5a02bb
+    bx lr
+.size glTexGenfOES, . - glTexGenfOES
+
+.global glTexGenfvOES
+.type glTexGenfvOES, %function
+.p2align 2
+glTexGenfvOES:
+    svc #0x5a02bc
+    bx lr
+.size glTexGenfvOES, . - glTexGenfvOES
+
+.global glTexGeniOES
+.type glTexGeniOES, %function
+.p2align 2
+glTexGeniOES:
+    svc #0x5a02bd
+    bx lr
+.size glTexGeniOES, . - glTexGeniOES
+
+.global glTexGenivOES
+.type glTexGenivOES, %function
+.p2align 2
+glTexGenivOES:
+    svc #0x5a02be
+    bx lr
+.size glTexGenivOES, . - glTexGenivOES
+
+.global glTexGenxOES
+.type glTexGenxOES, %function
+.p2align 2
+glTexGenxOES:
+    svc #0x5a02bf
+    bx lr
+.size glTexGenxOES, . - glTexGenxOES
+
+.global glTexGenxvOES
+.type glTexGenxvOES, %function
+.p2align 2
+glTexGenxvOES:
+    svc #0x5a02c0
+    bx lr
+.size glTexGenxvOES, . - glTexGenxvOES
+
+.global glTexParameterxOES
+.type glTexParameterxOES, %function
+.p2align 2
+glTexParameterxOES:
+    svc #0x5a02c1
+    bx lr
+.size glTexParameterxOES, . - glTexParameterxOES
+
+.global glTexParameterxvOES
+.type glTexParameterxvOES, %function
+.p2align 2
+glTexParameterxvOES:
+    svc #0x5a02c2
+    bx lr
+.size glTexParameterxvOES, . - glTexParameterxvOES
+
+.global glTexStorage1DEXT
+.type glTexStorage1DEXT, %function
+.p2align 2
+glTexStorage1DEXT:
+    svc #0x5a02c3
+    bx lr
+.size glTexStorage1DEXT, . - glTexStorage1DEXT
+
+.global glTextureStorage1DEXT
+.type glTextureStorage1DEXT, %function
+.p2align 2
+glTextureStorage1DEXT:
+    svc #0x5a02c4
+    bx lr
+.size glTextureStorage1DEXT, . - glTextureStorage1DEXT
+
+.global glTextureStorage2DEXT
+.type glTextureStorage2DEXT, %function
+.p2align 2
+glTextureStorage2DEXT:
+    svc #0x5a02c5
+    bx lr
+.size glTextureStorage2DEXT, . - glTextureStorage2DEXT
+
+.global glTextureStorage3DEXT
+.type glTextureStorage3DEXT, %function
+.p2align 2
+glTextureStorage3DEXT:
+    svc #0x5a02c6
+    bx lr
+.size glTextureStorage3DEXT, . - glTextureStorage3DEXT
+
+.global glTranslatexOES
+.type glTranslatexOES, %function
+.p2align 2
+glTranslatexOES:
+    svc #0x5a02c7
+    bx lr
+.size glTranslatexOES, . - glTranslatexOES
+
+.global glWaitSyncAPPLE
+.type glWaitSyncAPPLE, %function
+.p2align 2
+glWaitSyncAPPLE:
+    svc #0x5a02c8
+    bx lr
+.size glWaitSyncAPPLE, . - glWaitSyncAPPLE
+
+.global glWeightPointerOES
+.type glWeightPointerOES, %function
+.p2align 2
+glWeightPointerOES:
+    svc #0x5a02c9
+    bx lr
+.size glWeightPointerOES, . - glWeightPointerOES

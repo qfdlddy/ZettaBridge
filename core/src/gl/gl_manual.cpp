@@ -660,6 +660,23 @@ std::uint64_t gl_pname_count(GlBackend& backend, GLenum pname) {
     case 0x821C:  // GL_MINOR_VERSION
     case 0x821D:  // GL_NUM_EXTENSIONS
         return 1;
+    // GLES 1.1 sizes. These pnames do not exist in GLES 2.0, so adding them cannot change an
+    // ES2 result; without them glGetFloatv(GL_MODELVIEW_MATRIX) would validate four bytes and
+    // let the driver write 64 into guest memory.
+    case 0x0BA6:  // GL_MODELVIEW_MATRIX
+    case 0x0BA7:  // GL_PROJECTION_MATRIX
+    case 0x0BA8:  // GL_TEXTURE_MATRIX
+        return 16;
+    case 0x0B02:  // GL_CURRENT_NORMAL
+        return 3;
+    case 0x0B00:  // GL_CURRENT_COLOR
+    case 0x0B03:  // GL_CURRENT_TEXTURE_COORDS
+    case 0x0B53:  // GL_LIGHT_MODEL_AMBIENT
+    case 0x0B66:  // GL_FOG_COLOR
+        return 4;
+    case 0x0B12:  // GL_POINT_SIZE_RANGE
+    case 0x0B22:  // GL_SMOOTH_LINE_WIDTH_RANGE
+        return 2;
     case kGlCompressedTextureFormats:
     case kGlShaderBinaryFormats:
     case 0x87FF: {  // GL_PROGRAM_BINARY_FORMATS

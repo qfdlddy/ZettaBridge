@@ -126,4 +126,13 @@ done
 "$CC" -shared -fPIC -O2 -Wall -Wextra -Wl,-soname,libzbglcacheprobe.so \
     -o "$OUT/lib/libzbglcacheprobe.so" "$ROOT/guest/testlib/zbglcacheprobe.c" -L"$OUT/lib" -lEGL -lGLESv2
 
+# A guest library's exports are what plugins link against at load time. Compare them with the
+# platform's real export sets now, not on the device: a name we stop exporting is otherwise only
+# visible as `JNI_ERR returned from JNI_OnLoad` in a game. The check reads the built libraries with
+# llvm-nm from the same NDK, so put that toolchain on PATH for it rather than relying on the
+# caller's environment.
+if command -v python >/dev/null 2>&1; then
+    PATH="$TOOLCHAIN/bin:$PATH" python "$ROOT/tools/check_platform_exports.py" --libs "$OUT/lib"
+fi
+
 echo "guest build ok"

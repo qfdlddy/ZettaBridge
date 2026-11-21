@@ -21,6 +21,7 @@ add_library(zbcore STATIC
     src/elf_symbols.cpp
     src/elf_loader.cpp
     src/guest_memory.cpp
+    src/guest_symbols.cpp
     src/guest_thread.cpp
     src/guest_io.cpp
     src/hang_watchdog.cpp
@@ -29,10 +30,12 @@ add_library(zbcore STATIC
     src/gl/gl_manual.cpp
     src/gl/host_egl.cpp
     src/gl/host_gl.cpp
+    src/gl/host_gl1.cpp
     src/initial_stack.cpp
     src/jni/descriptor.cpp
     src/jni/handles.cpp
     src/jni/host_jni.cpp
+    src/jni/host_jni_compat.cpp
     src/jni/host_jni_data.cpp
     src/jni/host_jni_natives.cpp
     src/jni/host_jni_objects.cpp
@@ -70,16 +73,18 @@ if (ANDROID)
     # android/jni_env_backend.cpp: the JniBackend over the real JNIEnv, used by the JNI bridge (4d).
     # android/guest_jni_runtime.cpp: the process-lifetime runtime behind ZBridge.onProxyLoaded (4d).
     add_library(zbridge SHARED src/zbridge_c_api.cpp android/zbridge_jni.cpp android/jni_env_backend.cpp
-        android/guest_jni_runtime.cpp android/gl_driver_backend.cpp android/asset_driver_backend.cpp
+        android/guest_jni_runtime.cpp android/gl_driver_backend.cpp android/gl1_driver_backend.cpp
+        android/asset_driver_backend.cpp
         android/egl_driver_backend.cpp android/native_window_driver_backend.cpp
         android/looper_driver_backend.cpp android/native_activity_glue.cpp
         android/opensl_driver_backend.cpp)
     # GLESv3 for the GLES 3.0 half of GlDriverBackend. On the device both live in the one real
-    # libGLESv2.so; the NDK splits the stub libraries by version.
+    # libGLESv2.so; the NDK splits the stub libraries by version. GLESv1_CM is the separate
+    # fixed-function driver behind Gl1DriverBackend; it is not part of libGLESv2.so.
     # core/src for the generated dispatch and driver .inc files the Android backends include.
     target_include_directories(zbridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_options(zbridge PRIVATE -Wall -Wextra $<$<CONFIG:Release>:-O3>)
-    target_link_libraries(zbridge PRIVATE zbcore GLESv2 GLESv3 EGL android OpenSLES)
+    target_link_libraries(zbridge PRIVATE zbcore GLESv2 GLESv3 GLESv1_CM EGL android OpenSLES)
     set_target_properties(zbridge PROPERTIES CXX_VISIBILITY_PRESET hidden)
     target_compile_definitions(zbridge PRIVATE ZB_EXPORT_C_API)
     # --exclude-libs keeps the statically linked libc++ and friends from being exported, so

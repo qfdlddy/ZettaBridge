@@ -18,6 +18,8 @@
 
 namespace zb {
 
+class Gl1Backend;
+
 // GLES 2.0 + 3.0 host-call dispatcher. Guest code passes AAPCS32 words in r0-r3 and on its stack;
 // HostGl translates those words to the portable GlBackend seam after Dynarmic has stopped.
 // GL visibility diagnostics in the runtime report (gl_diagnostics.cpp). Off by default: they
@@ -139,8 +141,9 @@ public:
     std::uint64_t id() const { return id_; }
     const std::shared_ptr<MirrorPoolState>& mirror_pool_state() const { return mirror_pool_state_; }
 
-    // Serves the two GLES ranges (2.0 at 0-141, 3.0 at 228-331) and leaves 142-160 for
-    // HostAssets, 160-167 for HostNativeWindow and 168-211 for HostEgl.
+    // Serves the two GLES ranges (2.0 at 0-141, 3.0 at 228-331), the curated extensions
+    // (332-343) and the GLES 1.1-only block (492-578), and leaves 142-160 for HostAssets,
+    // 160-167 for HostNativeWindow and 168-211 for HostEgl.
     bool handle_host_call(std::uint32_t index, GuestThread& thread);
     // Synchronous in-JIT fast path for pure-leaf GL calls that never invoke call_on_current.
     // Returns false for calls needing guest allocation/freeing, trace/diagnostics, or EGL epoch sync.
@@ -158,6 +161,10 @@ public:
     void invalidate_state_filter();
     LibraryRuntime& runtime() { return runtime_; }
     GlBackend& backend() { return backend_; }
+    // The GLES 1.1 fixed-function seam. Optional: without it every GLES 1.1 host call is
+    // rejected with GL_INVALID_OPERATION (once) instead of being silently ignored.
+    void set_gl1_backend(Gl1Backend* backend) { gl1_backend_ = backend; }
+    Gl1Backend* gl1_backend() const { return gl1_backend_; }
     std::uintptr_t egl_context() const { return egl_context_probe_ ? egl_context_probe_() : 0; }
     void reject(Call& call, GLenum error, const char* reason);
     void note_pixel_store(GLenum pname, GLint param);
@@ -197,10 +204,12 @@ private:
     bool try_skip_redundant_call(std::uint32_t index, GuestThread& thread, std::uint64_t egl_generation);
     void note_after_dispatch(std::uint32_t index, Call& call, std::uint64_t egl_generation);
     bool dispatch(Call& call);
+    bool dispatch_gl1(Call& call);
 
     std::uint64_t id_;
     LibraryRuntime& runtime_;
     GlBackend& backend_;
+    Gl1Backend* gl1_backend_ = nullptr;
     GuestAllocator allocator_;
     EglContextProbe egl_context_probe_;
     std::atomic<bool> egl_context_checked_{false};

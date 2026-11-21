@@ -633,6 +633,10 @@ int main() {
     // or unmap.
     zb::runtime_report().clear();
     zb::enable_gl_diagnostics();
+    // The visibility diagnostics only run on an OpenGL ES 2.0+ context (they query ES 2.0 entry
+    // points, and on an ES 1.1 context those crash the driver). This test drives them, so the
+    // mock backend must report a modern GL_VERSION.
+    backend.set_string(0x1F02 /* GL_VERSION */, "OpenGL ES 3.2");
     std::array<std::uint8_t, 16> diagnosed_range;
     diagnosed_range.fill(0x11);
     backend.clear_calls();

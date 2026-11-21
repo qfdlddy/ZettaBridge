@@ -907,6 +907,28 @@ void Process::add_path_alias(std::string guest_prefix, std::string host_prefix) 
     path_aliases_.emplace_back(std::move(guest_prefix), std::move(host_prefix));
 }
 
+void Process::add_library_dir(std::string dir) {
+    if (dir.empty()) return;
+    while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+    std::lock_guard<std::mutex> lock(path_aliases_mutex_);
+    for (const std::string& existing : library_dirs_) {
+        if (existing == dir) return;
+    }
+    library_dirs_.push_back(std::move(dir));
+}
+
+// True for a guest path that names a shared object in a system library directory
+// (/system/lib/libfoo.so, /vendor/lib64/libfoo.so, /system/lib/arm/libfoo.so). Other kinds of
+// file - fonts, configuration, application data - are not looked up in add_library_dir().
+static bool is_system_library_path(std::string_view path) {
+    if (path.size() < 4 || path.back() == '/') return false;
+    if (path.find(".so") == std::string_view::npos) return false;
+    const std::string_view dir = path.substr(0, path.find_last_of('/'));
+    const std::size_t slash = dir.find_last_of('/');
+    const std::string_view component = slash == std::string_view::npos ? dir : dir.substr(slash + 1);
+    return component == "lib" || component == "lib64";
+}
+
 std::string Process::translate_path(const char* guest_path) const {
     const std::string_view path(guest_path);
     if (path == "/proc/self/exe") return exe_path_;
@@ -936,6 +958,21 @@ std::string Process::translate_path(const char* guest_path) const {
                 // its icons (a font inside the APK) and no text at all until this fallback
                 // existed, because every /system/fonts lookup landed in the sysroot and failed.
                 if (::access(out.c_str(), F_OK) == 0) return out;
+                // The libraries the bridge implements itself are not in the sysroot either: they
+                // live in the runtime's guest library directory. A guest that names one by a
+                // system path - Topsoil's OpenAL probe dlopen()s "/system/lib/libOpenSLES.so"
+                // directly - would otherwise get the device's file, which is built for the host
+                // architecture and cannot be loaded by the guest's linker.
+                if (is_system_library_path(path)) {
+                    const std::string_view name = path.substr(path.find_last_of('/') + 1);
+                    std::lock_guard<std::mutex> lock(path_aliases_mutex_);
+                    for (const std::string& dir : library_dirs_) {
+                        std::string candidate = dir;
+                        candidate += '/';
+                        candidate += name;
+                        if (::access(candidate.c_str(), F_OK) == 0) return candidate;
+                    }
+                }
                 static std::atomic<unsigned> fallbacks{0};
                 const unsigned seen = fallbacks.fetch_add(1) + 1;
                 if (seen <= 8) log("sysroot has no %.*s; using the device file",

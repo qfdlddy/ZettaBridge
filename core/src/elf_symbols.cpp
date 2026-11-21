@@ -67,12 +67,12 @@ T object_at(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
     return value;
 }
 
-ElfSymbolReport skipped(std::string message) {
-    return {ElfSymbolStatus::Skipped, {}, std::move(message)};
+ElfSymbolTable table_skipped(std::string message) {
+    return {ElfSymbolStatus::Skipped, {}, {}, std::move(message)};
 }
 
-ElfSymbolReport error(std::string message) {
-    return {ElfSymbolStatus::Error, {}, std::move(message)};
+ElfSymbolTable table_error(std::string message) {
+    return {ElfSymbolStatus::Error, {}, {}, std::move(message)};
 }
 
 bool map_address(const std::vector<Elf32_Phdr>& loads, std::uint32_t address,
@@ -185,36 +185,36 @@ bool gnu_symbol_count(const std::vector<std::uint8_t>& bytes, const FileRange& h
 
 }  // namespace
 
-ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
+ElfSymbolTable scan_elf32_symbols(const std::string& path) {
     const int raw_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (raw_fd < 0) return error("open failed: " + std::string(std::strerror(errno)));
+    if (raw_fd < 0) return table_error("open failed: " + std::string(std::strerror(errno)));
     ScopedFd fd(raw_fd);
     struct stat st {};
-    if (::fstat(fd.get(), &st) != 0) return error("stat failed: " + std::string(std::strerror(errno)));
+    if (::fstat(fd.get(), &st) != 0) return table_error("stat failed: " + std::string(std::strerror(errno)));
     if (st.st_size < 0 || static_cast<std::uint64_t>(st.st_size) > kMaxFileSize) {
-        return error("file size is outside the supported range");
+        return table_error("file size is outside the supported range");
     }
     const auto file_size = static_cast<std::size_t>(st.st_size);
     std::vector<std::uint8_t> bytes(file_size);
     if (!bytes.empty() && !read_exact(fd.get(), bytes.data(), bytes.size())) {
-        return error("read failed: " + std::string(std::strerror(errno)));
+        return table_error("read failed: " + std::string(std::strerror(errno)));
     }
     if (file_size < SELFMAG || std::memcmp(bytes.data(), ELFMAG, SELFMAG) != 0) {
-        return skipped("not an ELF file");
+        return table_skipped("not an ELF file");
     }
-    if (file_size < sizeof(Elf32_Ehdr)) return error("truncated ELF header");
+    if (file_size < sizeof(Elf32_Ehdr)) return table_error("truncated ELF header");
 
     const Elf32_Ehdr eh = object_at<Elf32_Ehdr>(bytes, 0);
     if (eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB) {
-        return skipped("not a little-endian ELF32 file");
+        return table_skipped("not a little-endian ELF32 file");
     }
-    if (eh.e_machine != EM_ARM) return skipped("not an ARM ELF file");
+    if (eh.e_machine != EM_ARM) return table_skipped("not an ARM ELF file");
     if (eh.e_ident[EI_VERSION] != EV_CURRENT || eh.e_version != EV_CURRENT ||
         eh.e_phnum == 0 || eh.e_phnum > 1024) {
-        return error("invalid ELF header");
+        return table_error("invalid ELF header");
     }
     const std::uint64_t phdr_size = static_cast<std::uint64_t>(eh.e_phnum) * sizeof(Elf32_Phdr);
-    if (!range_fits(eh.e_phoff, phdr_size, file_size)) return error("truncated program headers");
+    if (!range_fits(eh.e_phoff, phdr_size, file_size)) return table_error("truncated program headers");
 
     std::vector<Elf32_Phdr> loads;
     FileRange dynamic;
@@ -222,20 +222,20 @@ ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
     for (std::size_t i = 0; i < eh.e_phnum; ++i) {
         const auto phdr = object_at<Elf32_Phdr>(bytes, eh.e_phoff + i * sizeof(Elf32_Phdr));
         if (phdr.p_type == PT_LOAD) {
-            if (!range_fits(phdr.p_offset, phdr.p_filesz, file_size)) return error("PT_LOAD exceeds the file");
+            if (!range_fits(phdr.p_offset, phdr.p_filesz, file_size)) return table_error("PT_LOAD exceeds the file");
             loads.push_back(phdr);
         } else if (phdr.p_type == PT_DYNAMIC) {
-            if (has_dynamic) return error("multiple PT_DYNAMIC segments");
+            if (has_dynamic) return table_error("multiple PT_DYNAMIC segments");
             if (phdr.p_filesz == 0 || phdr.p_filesz > kMaxDynamicSize ||
                 phdr.p_filesz % sizeof(Elf32_Dyn) != 0 ||
                 !range_fits(phdr.p_offset, phdr.p_filesz, file_size)) {
-                return error("invalid PT_DYNAMIC segment");
+                return table_error("invalid PT_DYNAMIC segment");
             }
             has_dynamic = true;
             dynamic = {phdr.p_offset, phdr.p_filesz};
         }
     }
-    if (!has_dynamic) return skipped("no PT_DYNAMIC segment");
+    if (!has_dynamic) return table_skipped("no PT_DYNAMIC segment");
 
     bool terminated = false;
     bool has_strtab = false;
@@ -267,20 +267,20 @@ ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
         default: break;
         }
     }
-    if (!terminated) return error("unterminated dynamic table");
-    if (!has_symtab) return {ElfSymbolStatus::Ok, {}, "no dynamic symbol table"};
+    if (!terminated) return table_error("unterminated dynamic table");
+    if (!has_symtab) return {ElfSymbolStatus::Ok, {}, {}, "no dynamic symbol table"};
     if (!has_strtab || !has_strsz || strtab_size == 0 || !has_syment || symbol_size != sizeof(Elf32_Sym)) {
-        return error("incomplete dynamic symbol metadata");
+        return table_error("incomplete dynamic symbol metadata");
     }
 
     FileRange strings;
     FileRange symbols;
     if (!map_address(loads, strtab_address, file_size, &strings) || strtab_size > strings.size) {
-        return error("DT_STRTAB is not fully file-backed");
+        return table_error("DT_STRTAB is not fully file-backed");
     }
     strings.size = strtab_size;
     if (!map_address(loads, symtab_address, file_size, &symbols)) {
-        return error("DT_SYMTAB is not file-backed");
+        return table_error("DT_SYMTAB is not file-backed");
     }
 
     std::uint32_t symbol_count = 0;
@@ -289,41 +289,71 @@ ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
     if (has_sysv_hash) {
         if (!map_address(loads, sysv_hash_address, file_size, &hash) ||
             !sysv_symbol_count(bytes, hash, &symbol_count, &count_error)) {
-            return error(count_error.empty() ? "DT_HASH is not file-backed" : count_error);
+            return table_error(count_error.empty() ? "DT_HASH is not file-backed" : count_error);
         }
     } else if (has_gnu_hash) {
         if (!map_address(loads, gnu_hash_address, file_size, &hash) ||
             !gnu_symbol_count(bytes, hash, &symbol_count, &count_error)) {
-            return error(count_error.empty() ? "DT_GNU_HASH is not file-backed" : count_error);
+            return table_error(count_error.empty() ? "DT_GNU_HASH is not file-backed" : count_error);
         }
     } else {
-        return error("dynamic symbol table has no supported hash table");
+        return table_error("dynamic symbol table has no supported hash table");
     }
     const std::uint64_t symbol_bytes = static_cast<std::uint64_t>(symbol_count) * sizeof(Elf32_Sym);
-    if (!range_fits(0, symbol_bytes, symbols.size)) return error("truncated dynamic symbol table");
+    if (!range_fits(0, symbol_bytes, symbols.size)) return table_error("truncated dynamic symbol table");
 
-    std::vector<std::string> exports;
-    std::unordered_set<std::string> seen;
+    ElfSymbolTable table;
+    table.status = ElfSymbolStatus::Ok;
+    table.message = "ok";
+    std::unordered_set<std::string> defined_seen;
+    std::unordered_set<std::string> undefined_seen;
     for (std::uint32_t i = 0; i < symbol_count; ++i) {
         const auto symbol = object_at<Elf32_Sym>(bytes, symbols.offset + i * sizeof(Elf32_Sym));
         const unsigned visibility = symbol.st_other & 0x3U;
-        if (symbol.st_name >= strings.size) return error("dynamic symbol name is outside DT_STRTAB");
+        if (symbol.st_name >= strings.size) return table_error("dynamic symbol name is outside DT_STRTAB");
         const auto first = bytes.begin() + static_cast<std::ptrdiff_t>(strings.offset + symbol.st_name);
         const auto end = bytes.begin() + static_cast<std::ptrdiff_t>(strings.offset + strings.size);
         const auto nul = std::find(first, end, 0);
-        if (nul == end) return error("unterminated dynamic symbol name");
-        if (symbol.st_shndx == SHN_UNDEF ||
-            (ELF32_ST_BIND(symbol.st_info) != STB_GLOBAL && ELF32_ST_BIND(symbol.st_info) != STB_WEAK) ||
-            (ELF32_ST_TYPE(symbol.st_info) != STT_FUNC && ELF32_ST_TYPE(symbol.st_info) != STT_NOTYPE) ||
+        if (nul == end) return table_error("unterminated dynamic symbol name");
+        const unsigned bind = ELF32_ST_BIND(symbol.st_info);
+        if ((bind != STB_GLOBAL && bind != STB_WEAK) ||
             (visibility != STV_DEFAULT && visibility != STV_PROTECTED)) {
             continue;
         }
         const std::string name(first, nul);
-        const bool wanted = name == "JNI_OnLoad" ||
-                            (name.starts_with("Java_") && decode_jni_export(name).has_value());
-        if (wanted && seen.insert(name).second) exports.push_back(name);
+        // Symbol 0 is the reserved null entry; st_name 0 also names the empty string.
+        if (name.empty()) continue;
+        const auto type = static_cast<std::uint8_t>(ELF32_ST_TYPE(symbol.st_info));
+        if (symbol.st_shndx == SHN_UNDEF) {
+            // A weak reference may legally stay unresolved (bionic binds it to null), so only
+            // strong references can make a BIND_NOW load fail.
+            if (bind == STB_GLOBAL && undefined_seen.insert(name).second) {
+                table.undefined.push_back(ElfSymbol{name, type});
+            }
+            continue;
+        }
+        if (defined_seen.insert(name).second) table.defined.push_back(ElfSymbol{name, type});
     }
-    return {ElfSymbolStatus::Ok, std::move(exports), "ok"};
+    return table;
+}
+
+ElfSymbolReport scan_elf32_jni_exports(const std::string& path) {
+    const ElfSymbolTable table = scan_elf32_symbols(path);
+    if (table.status != ElfSymbolStatus::Ok) {
+        ElfSymbolReport report;
+        report.status = table.status;
+        report.message = table.message;
+        return report;
+    }
+    std::vector<std::string> exports;
+    for (const ElfSymbol& symbol : table.defined) {
+        if (symbol.type != STT_FUNC && symbol.type != STT_NOTYPE) continue;
+        const bool wanted = symbol.name == "JNI_OnLoad" ||
+                            (symbol.name.starts_with("Java_") &&
+                             decode_jni_export(symbol.name).has_value());
+        if (wanted) exports.push_back(symbol.name);
+    }
+    return {ElfSymbolStatus::Ok, std::move(exports), table.message};
 }
 
 }  // namespace zb

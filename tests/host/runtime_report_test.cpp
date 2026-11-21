@@ -290,6 +290,30 @@ void check_loads_and_natives() {
     CHECK(line_with(text, "registered-natives:") == "registered-natives: 20");
 }
 
+void check_guest_dlopen_failures() {
+    zb::RuntimeReport report;
+    CHECK(line_with(report.text(), "guest-dlopen-failures:") == "guest-dlopen-failures: 0");
+    CHECK(!contains(report.text(), "guest-dlopen-failed:"));
+
+    report.note_guest_dlopen_failed("libflutter.so", "library \"libEGL.so\" not found");
+    report.note_guest_dlopen_failed("libunity.so", "cannot locate symbol \"X\"\nreferenced by ...");
+    std::string text = report.text();
+    CHECK(line_with(text, "guest-dlopen-failures:") == "guest-dlopen-failures: 2");
+    CHECK(contains(text, "guest-dlopen-failed: libflutter.so library \"libEGL.so\" not found"));
+    // The linker's own multi-line text is folded onto the one record line.
+    CHECK(contains(text, "guest-dlopen-failed: libunity.so cannot locate symbol \"X\" referenced by ..."));
+
+    // The list is bounded, and the overflow is still visible as a count.
+    for (int i = 0; i < 10; ++i) report.note_guest_dlopen_failed("libx.so", "failure");
+    text = report.text();
+    CHECK(line_with(text, "guest-dlopen-failures:") == "guest-dlopen-failures: 12");
+    CHECK(line_with(text, "guest-dlopen-more:") == "guest-dlopen-more: 4");
+
+    report.clear();
+    CHECK(line_with(report.text(), "guest-dlopen-failures:") == "guest-dlopen-failures: 0");
+    CHECK(!contains(report.text(), "guest-dlopen-failed:"));
+}
+
 void check_jni_null_section() {
     zb::RuntimeReport report;
     CHECK(!contains(report.text(), "jni-null-results:"));
@@ -557,6 +581,7 @@ int main() {
     check_unimplemented_host_calls();
     check_host_call_bound();
     check_loads_and_natives();
+    check_guest_dlopen_failures();
     check_jni_null_section();
     check_native_calls_and_opens();
     check_exit_reason();

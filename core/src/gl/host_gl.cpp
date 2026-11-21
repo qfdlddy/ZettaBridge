@@ -10,12 +10,23 @@
 
 #include "gl/frame_probe.h"
 #include "gl/gl_diagnostics.h"
+#include "zb/gles1_hostcalls.h"
 #include "zb/gl_hostcalls.h"
 #include "zb/library_protocol.h"
 #include "zb/log.h"
 #include "zb/runtime_report.h"
 
 namespace zb {
+
+namespace {
+
+// One name lookup for both GL profiles: the 2.0/3.0/extension blocks and the GLES 1.1-only
+// block never overlap, so the order is free.
+const char* gl_profile_name(std::uint32_t index) {
+    return is_gl1_host_call(index) ? gl1_host_call_name(index) : gl_host_call_name(index);
+}
+
+}  // namespace
 
 HostGl::Call::Call(HostGl& host, GuestThread& thread, std::uint32_t index)
     : host_(host), thread_(thread), index_(index),
@@ -50,7 +61,7 @@ void HostGl::Call::fail(GLenum error, const char* reason) {
 }
 
 void HostGl::reject(Call& call, GLenum error, const char* reason) {
-    const char* name = gl_host_call_name(call.index());
+    const char* name = gl_profile_name(call.index());
     log("GLES %s rejected: %s", name, reason);
     // Guests rarely call glGetError, so a rejection is otherwise silent (a texture that never
     // got its pixels renders black). Count them, and keep the first few with their arguments.
@@ -85,8 +96,9 @@ inline void record_gl_census(std::uint32_t, std::uint32_t, std::uint64_t) {}
 #else
 void record_gl_census(std::uint32_t index, std::uint32_t flush_batch, std::uint64_t report_stride) {
     // Per-function census. Accumulated in thread-local counters to avoid shared cache-line
-    // contention on every GL call, then flushed in batches to the global report.
-    constexpr std::uint32_t kCensusSlotLimit = 512;
+    // contention on every GL call, then flushed in batches to the global report. The limit
+    // covers the highest GL range (GLES 1.1 at 492-578); every other stub range is below it.
+    constexpr std::uint32_t kCensusSlotLimit = 640;
     struct GlobalCensus {
         std::atomic<std::uint64_t> counts[kCensusSlotLimit]{};
         std::atomic<std::uint64_t> total{0};
@@ -130,7 +142,7 @@ void record_gl_census(std::uint32_t index, std::uint32_t flush_batch, std::uint6
                     if (n == 0) continue;
                     if (chunk.size() > 300) flush_chunk();
                     if (!chunk.empty()) chunk += " ";
-                    chunk += gl_host_call_name(i);
+                    chunk += gl_profile_name(i);
                     chunk += "=";
                     chunk += std::to_string(n);
                 }
@@ -624,10 +636,11 @@ bool HostGl::handle_fast_host_call(std::uint32_t index, GuestThread& thread) {
 }
 
 bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
-    if (!is_gl_host_call(index)) return false;
+    const bool gl1 = is_gl1_host_call(index);
+    if (!gl1 && !is_gl_host_call(index)) return false;
     const std::uint64_t host_enter_ticks = frame_probe_call_now_ticks();
     flush_batch(thread);
-    const char* name = gl_host_call_name(index);
+    const char* name = gl_profile_name(index);
     if (__builtin_expect(gl_trace_enabled(), 0)) {
         log("GLES trace: %s(0x%x, 0x%x, 0x%x, 0x%x)", name, thread.regs()[0], thread.regs()[1],
             thread.regs()[2], thread.regs()[3]);
@@ -646,7 +659,7 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
             runtime_report().note_gl_egl_context(egl_context() != 0);
         }
     }
-    if (state_filter_enabled_ && !gl_diagnostics_enabled() &&
+    if (state_filter_enabled_ && !gl1 && !gl_diagnostics_enabled() &&
         try_skip_redundant_call(index, thread, egl_generation)) {
         thread.regs()[0] = 0;
         thread.regs()[1] = 0;
@@ -654,12 +667,12 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
         return true;
     }
     Call call(*this, thread, index);
-    if (__builtin_expect(gl_diagnostics_enabled(), 0)) gl_diagnose_before(*this, call);
-    if (dispatch(call)) {
-        if (state_filter_enabled_) note_after_dispatch(index, call, egl_generation);
+    if (!gl1 && __builtin_expect(gl_diagnostics_enabled(), 0)) gl_diagnose_before(*this, call);
+    if (gl1 ? dispatch_gl1(call) : dispatch(call)) {
+        if (state_filter_enabled_ && !gl1) note_after_dispatch(index, call, egl_generation);
         // Visibility diagnostics query the driver, so they run only once the Android runtime
         // enables them; mock-backend tests keep exact call logs.
-        if (call.valid() && __builtin_expect(gl_diagnostics_enabled(), 0)) gl_diagnose(*this, call);
+        if (!gl1 && call.valid() && __builtin_expect(gl_diagnostics_enabled(), 0)) gl_diagnose(*this, call);
         if (call.valid() && index == ZB_GL_HC_glGetError) {
             const std::uint32_t error = thread.regs()[0];
             if (error != 0) runtime_report().note_gl_error(name, error);

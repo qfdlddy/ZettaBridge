@@ -11,6 +11,7 @@
 #include "zb/android_looper_backend.h"
 #include "zb/asset_backend.h"
 #include "zb/egl_backend.h"
+#include "zb/gl1_backend.h"
 #include "zb/gl_backend.h"
 #include "zb/host_assets.h"
 #include "zb/host_egl.h"
@@ -176,6 +177,8 @@ class GuestJniEngine : public ProxyLoadEngine {
 public:
     // gl_backend is optional: nullptr (the host build) chains only HostJni. Android supplies the
     // real driver backend (and an EGL-current probe) so GLES host calls reach the driver too.
+    // gl1_backend is the separate GLES 1.1 fixed-function seam; without it the GLES 1.1 host
+    // calls are rejected with GL_INVALID_OPERATION instead of being silently ignored.
     // asset_backend, egl_backend and window_backend are likewise optional: nullptr leaves the
     // corresponding host-call range unimplemented. looper_backend, when given, lets guest loopers
     // prepared on a host thread attach to that thread's real Android looper; nullptr keeps every
@@ -187,7 +190,8 @@ public:
                             AndroidLooperBackend* looper_backend = nullptr,
                             InputBackend* input_backend = nullptr,
                             ConfigurationBackend* configuration_backend = nullptr,
-                            OpenSlBackend* opensl_backend = nullptr);
+                            OpenSlBackend* opensl_backend = nullptr,
+                            Gl1Backend* gl1_backend = nullptr);
     ~GuestJniEngine() override;
     GuestJniEngine(const GuestJniEngine&) = delete;
     GuestJniEngine& operator=(const GuestJniEngine&) = delete;

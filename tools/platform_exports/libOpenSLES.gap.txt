@@ -1,0 +1,6 @@
+# Platform libOpenSLES.so names our guest library does not export (yet).
+# Everything here is a known gap: a plugin that imports one of these names cannot
+# load under BIND_NOW. Shrink this file by implementing a name; never grow it without
+# recording why in the commit that does so. Do not edit by hand.
+slQueryNumSupportedEngineInterfaces
+slQuerySupportedEngineInterfaces

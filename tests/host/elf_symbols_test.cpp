@@ -158,6 +158,37 @@ void check_duplicates() {
     CHECK(report.exports.size() == 2);
 }
 
+void check_symbol_table() {
+    TempFile file(make_symbols(false));
+    const auto table = zb::scan_elf32_symbols(file.path);
+    CHECK(table.status == zb::ElfSymbolStatus::Ok);
+    // Java_zb_Natives_run, JNI_OnLoad and Java_bad are defined; the empty symbol 0 is not a name.
+    CHECK(table.defined.size() == 3);
+    CHECK(table.defined[0].name == "Java_zb_Natives_run");
+    CHECK(table.defined[0].type == STT_FUNC);
+    CHECK(table.defined[2].name == "Java_bad");
+    // Java_zb_Natives_missing is the one strong external reference.
+    CHECK(table.undefined.size() == 1);
+    CHECK(table.undefined[0].name == "Java_zb_Natives_missing");
+
+    // A weak reference may legally resolve to null, so it is never a hard requirement. A plugin
+    // library with one must not be reported as unloadable.
+    auto bytes = make_symbols(false);
+    auto weak = get<Elf32_Sym>(bytes, kSymbolOffset + 3 * sizeof(Elf32_Sym));
+    weak.st_info = ELF32_ST_INFO(STB_WEAK, STT_FUNC);
+    put(bytes, kSymbolOffset + 3 * sizeof(Elf32_Sym), weak);
+    TempFile weak_file(bytes);
+    CHECK(zb::scan_elf32_symbols(weak_file.path).undefined.empty());
+
+    // A hidden data object is not part of the export set a plugin can link against.
+    auto hidden_bytes = make_symbols(false);
+    auto hidden = get<Elf32_Sym>(hidden_bytes, kSymbolOffset + 4 * sizeof(Elf32_Sym));
+    hidden.st_other = STV_HIDDEN;
+    put(hidden_bytes, kSymbolOffset + 4 * sizeof(Elf32_Sym), hidden);
+    TempFile hidden_file(hidden_bytes);
+    CHECK(zb::scan_elf32_symbols(hidden_file.path).defined.size() == 2);
+}
+
 void check_skips_and_errors() {
     auto bytes = make_symbols(false);
     bytes[EI_CLASS] = ELFCLASS64;
@@ -265,6 +296,7 @@ int main() {
     check_scan(false);
     check_scan(true);
     check_duplicates();
+    check_symbol_table();
     check_skips_and_errors();
     check_gnu_hash_work_is_bounded();
     check_obfuscated_phentsize();

@@ -617,6 +617,15 @@ __attribute__((visibility("default"))) void glBindFramebuffer(GLenum target, GLu
     }
 }
 
+/* GL_OES_framebuffer_object is the GLES 1 spelling of the same GLES 2 core call. It is a thin
+ * wrapper on purpose: the generated alias thunk would jump straight to the host call and the
+ * cache above would never learn about the new binding, so a later glBindFramebuffer could be
+ * elided while the driver sits on a different framebuffer. */
+__attribute__((visibility("default"))) void glBindFramebufferOES(GLenum target,
+                                                                 GLuint framebuffer) {
+    glBindFramebuffer(target, framebuffer);
+}
+
 __attribute__((visibility("default"))) void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
     __zb_svc_glDeleteBuffers(n, buffers);
     if (n > 0) __atomic_fetch_add(&g_delete_epoch, 1u, __ATOMIC_RELEASE);
@@ -626,6 +635,12 @@ __attribute__((visibility("default"))) void glDeleteFramebuffers(GLsizei n,
                                                                  const GLuint* framebuffers) {
     __zb_svc_glDeleteFramebuffers(n, framebuffers);
     if (n > 0) __atomic_fetch_add(&g_delete_epoch, 1u, __ATOMIC_RELEASE);
+}
+
+/* See glBindFramebufferOES: deleting through the ES1 name must bump the same delete epoch. */
+__attribute__((visibility("default"))) void glDeleteFramebuffersOES(
+    GLsizei n, const GLuint* framebuffers) {
+    glDeleteFramebuffers(n, framebuffers);
 }
 
 __attribute__((visibility("default"))) void glDeleteTextures(GLsizei n, const GLuint* textures) {
@@ -1096,6 +1111,12 @@ __attribute__((visibility("default"))) void glBlendEquation(GLenum mode) {
     if (s != 0) scalar_hit_or_store(s, SCALAR_BLEND_EQ, mode, mode, 0u, 0u);
 }
 
+/* ES1 spelling of glBlendEquation: goes through the cache so a later core call is still elided
+ * only when the driver really holds this state. */
+__attribute__((visibility("default"))) void glBlendEquationOES(GLenum mode) {
+    glBlendEquation(mode);
+}
+
 __attribute__((visibility("default"))) void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {
     struct GlTlsSlot* s = acquire_slot();
     if (s != 0 && (s->scalar_known & (1u << SCALAR_BLEND_EQ)) != 0u &&
@@ -1108,6 +1129,11 @@ __attribute__((visibility("default"))) void glBlendEquationSeparate(GLenum modeR
         __zb_svc_glBlendEquationSeparate(modeRGB, modeAlpha);
     }
     if (s != 0) scalar_hit_or_store(s, SCALAR_BLEND_EQ, modeRGB, modeAlpha, 0u, 0u);
+}
+
+__attribute__((visibility("default"))) void glBlendEquationSeparateOES(GLenum modeRGB,
+                                                                       GLenum modeAlpha) {
+    glBlendEquationSeparate(modeRGB, modeAlpha);
 }
 
 __attribute__((visibility("default"))) void glBlendFunc(GLenum sfactor, GLenum dfactor) {
@@ -1139,6 +1165,11 @@ __attribute__((visibility("default"))) void glBlendFuncSeparate(GLenum sr, GLenu
         __zb_svc_glBlendFuncSeparate(sr, dr, sa, da);
     }
     if (s != 0) scalar_hit_or_store(s, SCALAR_BLEND_FUNC, sr, dr, sa, da);
+}
+
+__attribute__((visibility("default"))) void glBlendFuncSeparateOES(GLenum sr, GLenum dr,
+                                                                   GLenum sa, GLenum da) {
+    glBlendFuncSeparate(sr, dr, sa, da);
 }
 
 __attribute__((visibility("default"))) void glColorMask(GLboolean r, GLboolean g, GLboolean b,

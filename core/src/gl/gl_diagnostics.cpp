@@ -27,6 +27,7 @@ namespace {
 
 constexpr GLenum kCompileStatus = 0x8B81;
 constexpr GLenum kLinkStatus = 0x8B82;
+constexpr GLenum kVersionString = 0x1F02;
 constexpr GLenum kFramebufferBinding = 0x8CA6;
 constexpr GLenum kViewport = 0x0BA2;
 constexpr GLenum kScissorBox = 0x0C10;
@@ -371,6 +372,15 @@ struct State {
     // (called from the EGL side, which has no GlBackend of its own) can issue its own readbacks.
     // Never owned here; it outlives the process the same way HostGl does.
     GlBackend* backend_cache = nullptr;
+
+    // These diagnostics use OpenGL ES 2.0 entry points (framebuffer status, block readback of
+    // GL_RGBA, pixel-store and uniform queries). A guest can hand the bridge an OpenGL ES 1.1
+    // context - a GLES 1.1 game does - and on device glCheckFramebufferStatus inside such a
+    // context crashed the driver at address 0. So the profile is decided once per GlBackend from
+    // its GL_VERSION and cached here; anything that is not ES 2.0+ skips the diagnostics.
+    GlBackend* profile_backend = nullptr;
+    bool profile_known = false;
+    bool profile_gles2plus = false;
 
     // Whole-frame presented-content diagnostics: counts every eglSwapBuffers of the default
     // framebuffer so the 60th and 200th can be captured right before the swap.
@@ -819,15 +829,40 @@ void enable_gl_diagnostics() { g_enabled.store(true, std::memory_order_relaxed);
 
 bool gl_diagnostics_enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
+namespace {
+
+// Whether the driver behind `gl` is an OpenGL ES 2.0+ context, which is the only profile the
+// visibility diagnostics are written for. Decided once per backend from GL_VERSION and recorded,
+// so a report without any gl-* visibility line says why: diagnostics were off, or the guest's
+// context is legacy. Callers hold State::mutex. A missing context (null version) is not cached
+// and not recorded, so the first diagnosed call on a live context decides.
+bool diagnostics_profile_ok(GlBackend& gl) {
+    State& s = state();
+    if (s.profile_backend == &gl && s.profile_known) return s.profile_gles2plus;
+    const GLubyte* raw = gl.glGetString(kVersionString);
+    if (raw == nullptr || raw[0] == '\0') return false;
+    const std::string version(reinterpret_cast<const char*>(raw));
+    const bool supported =
+        version.rfind("OpenGL ES 2", 0) == 0 || version.rfind("OpenGL ES 3", 0) == 0;
+    s.profile_backend = &gl;
+    s.profile_known = true;
+    s.profile_gles2plus = supported;
+    detail("diagnostics", version + (supported ? " profile on" : " profile skip"), true);
+    return supported;
+}
+
+}  // namespace
+
 GlMapDiagnostic gl_diagnose_map(HostGl& host, GLenum target, GLintptr offset, GLsizeiptr length,
                                 GLbitfield access, std::uint32_t guest, const std::uint8_t* mirror,
                                 const std::uint8_t* driver) {
     if (!gl_diagnostics_enabled()) return {};
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!diagnostics_profile_ok(host.backend())) return {};
     GlMapDiagnostic diagnostic;
     diagnostic.context = host.egl_context();
     diagnostic.buffer = current_buffer(host, target);
-    State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
     diagnostic.id = ++s.map_calls;
     if (diagnostic.id > 12) return {};
     const std::string key = "map-" + std::to_string(diagnostic.id);
@@ -866,10 +901,11 @@ void gl_diagnose_map_unmap(const GlMapDiagnostic& mapping, std::uint64_t length,
 void gl_diagnose_map_collision(HostGl& host, GLenum target,
                                const GlMapDiagnostic& existing) {
     if (!gl_diagnostics_enabled()) return;
-    const std::uintptr_t context = host.egl_context();
-    const GLuint buffer = current_buffer(host, target);
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    if (!diagnostics_profile_ok(host.backend())) return;
+    const std::uintptr_t context = host.egl_context();
+    const GLuint buffer = current_buffer(host, target);
     const std::uint64_t number = ++s.map_collisions;
     if (number > 4) return;
     const std::string key = "map-collision-" + std::to_string(number);
@@ -895,6 +931,7 @@ void gl_diagnose(HostGl& host, HostGl::Call& call) {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.backend_cache = &gl;
+    if (!diagnostics_profile_ok(gl)) return;
     switch (call.index()) {
     case ZB_GL_HC_glCompileShader: {
         const GLuint shader = call.arg(0);
@@ -1861,6 +1898,7 @@ void gl_diagnose_before(HostGl& host, HostGl::Call& call) {
     std::lock_guard<std::mutex> lock(s.mutex);
     GlBackend& gl = host.backend();
     s.backend_cache = &gl;
+    if (!diagnostics_profile_ok(gl)) return;
 
     // Whole-framebuffer before/after diff at scheduled draws, independent of which texture is
     // bound: answers whether an onscreen draw changes the presented image at all, and to what.
@@ -2196,6 +2234,9 @@ void gl_diagnose_swap() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     const std::uint64_t swap = ++s.swap_count;
+    // Every readback below is an ES 2.0+ query. A cached legacy backend keeps the swap counter
+    // (harmless) and nothing else.
+    if (s.backend_cache != nullptr && !diagnostics_profile_ok(*s.backend_cache)) return;
 
     // What the surface holds immediately before it is presented. This is the one sample that
     // separates "the guest draws black" from "the guest draws content that never reaches the

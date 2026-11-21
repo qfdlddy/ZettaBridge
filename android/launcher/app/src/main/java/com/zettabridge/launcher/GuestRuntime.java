@@ -7,6 +7,7 @@ import android.app.Instrumentation;
 import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInfo;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.ContextThemeWrapper;
@@ -134,6 +135,25 @@ final class GuestRuntime {
     synchronized boolean isRunning(String packageName) {
         java.util.Set<Activity> set = liveActivities.get(packageName);
         return set != null && !set.isEmpty();
+    }
+
+    /**
+     * The imported plugin that declares a receiver class. A notification alarm wakes this process
+     * from cold, so nothing is loaded yet: the manifest of every imported plugin is consulted,
+     * from its cached parse, and the owner is then loaded normally.
+     */
+    synchronized LoadedPlugin pluginForReceiver(String className) throws Exception {
+        for (LoadedPlugin p : plugins.values()) {
+            if (p.receivers.containsKey(className)) return p;
+        }
+        for (PluginRecord record : PluginStore.list(host)) {
+            PackageInfo info = PluginStore.loadPackageInfo(host, record);
+            if (info == null || info.receivers == null) continue;
+            for (ActivityInfo receiver : info.receivers) {
+                if (className.equals(receiver.name)) return load(record.packageName);
+            }
+        }
+        return null;
     }
 
     /** Rewrites an intent that names a plugin activity to the matching stub; others pass through. */

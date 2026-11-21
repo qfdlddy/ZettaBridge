@@ -42,22 +42,45 @@ bool HostJni::Impl::serve_objects(JniCall& call) {
         const std::optional<std::string> shorty = shorty_from_signature(signature);
         if (!shorty) fatal(env, "GetMethodID: the backend accepted a malformed signature %s", signature.c_str());
         write_shorty(env, call.arg(4), *shorty, name);
-        AudioMethodHook audio_hook = AudioMethodHook::None;
+        MethodHook hook = MethodHook::None;
         if (!is_static) {
             if ((method == "isBluetoothA2dpOn" || method == "isBluetoothScoOn") && signature == "()Z") {
-                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::IsBluetoothOn;
+                if (backend.is_audio_manager_class(env, cls)) hook = MethodHook::IsBluetoothOn;
             } else if (method == "getDevices" && signature == "(I)[Landroid/media/AudioDeviceInfo;") {
-                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::GetDevices;
+                if (backend.is_audio_manager_class(env, cls)) hook = MethodHook::GetDevices;
             } else if ((method == "registerAudioDeviceCallback" &&
                         signature == "(Landroid/media/AudioDeviceCallback;Landroid/os/Handler;)V") ||
                        (method == "unregisterAudioDeviceCallback" &&
                         signature == "(Landroid/media/AudioDeviceCallback;)V")) {
-                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::DeviceCallbackNoop;
+                if (backend.is_audio_manager_class(env, cls)) hook = MethodHook::DeviceCallbackNoop;
             } else if (method == "getProperty" && signature == "(Ljava/lang/String;)Ljava/lang/String;") {
-                if (backend.is_audio_manager_class(env, cls)) audio_hook = AudioMethodHook::GetProperty;
+                if (backend.is_audio_manager_class(env, cls)) hook = MethodHook::GetProperty;
+            } else if (method == "build" && signature == "()Landroid/app/Notification;") {
+                // Verified against the receiver's class at call time: other builders have a
+                // build() with this shape.
+                hook = MethodHook::NotificationChannel;
+            } else if (method == "notify" &&
+                       (signature == "(ILandroid/app/Notification;)V" ||
+                        signature == "(Ljava/lang/String;ILandroid/app/Notification;)V")) {
+                hook = MethodHook::NotificationNotify;
+            } else if (method == "setNotification" &&
+                       signature == "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V") {
+                // Verified against the receiver at call time: it has to be an Activity. This one
+                // shape is the whole signature Topsoil and its siblings use; anything else with a
+                // setNotification keeps its own implementation.
+                hook = MethodHook::LegacyNotification;
+            }
+        } else if (signature == "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;" ||
+                   signature == "(Landroid/content/Context;I[Landroid/content/Intent;I)Landroid/app/PendingIntent;") {
+            // The five PendingIntent factories share these two descriptors. getBroadcast also
+            // needs its intent routed to a receiver that exists in this package.
+            if (method == "getActivity" || method == "getBroadcast" || method == "getService" ||
+                method == "getForegroundService" || method == "getActivities") {
+                hook = method == "getBroadcast" ? MethodHook::PendingIntentRelay
+                                                : MethodHook::PendingIntentFlags;
             }
         }
-        call.set(intern_method(id, *shorty, audio_hook, method, signature));
+        call.set(intern_method(id, *shorty, hook, method, signature));
         return true;
     }
     case ZB_JNI_HC_GetFieldID: {

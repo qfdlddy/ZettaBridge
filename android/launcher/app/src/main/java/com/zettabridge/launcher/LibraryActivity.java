@@ -12,6 +12,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Log;
@@ -40,6 +41,9 @@ public class LibraryActivity extends Activity {
     private static final String TAG = "zb-launcher";
     private static final int REQUEST_IMPORT = 1;
     private static final int REQUEST_EXPORT = 2;
+    private static final int REQUEST_NOTIFICATIONS = 3;
+    private static final String PREFS = "zb";
+    private static final String PREF_NOTIFICATIONS_ASKED = "notification-permission-asked";
 
     private static final String STATE_EXPORT_RECORD = "zb.export.record";
     private static final String STATE_EXPORT_PACKAGE = "zb.export.package";
@@ -107,6 +111,7 @@ public class LibraryActivity extends Activity {
         });
         root.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
+        requestNotificationPermission();
         // Pre-install the guest runtime bundle in the background so cold-launching a game after an
         // app update does not stall the :guest main thread.
         new Thread(() -> {
@@ -130,6 +135,22 @@ public class LibraryActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refresh();
+    }
+
+    /**
+     * Android 13+ will not post a notification without a runtime grant. A translated guest asks
+     * for none (it was built for an older target), so the launcher asks once on its behalf.
+     */
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (prefs.getBoolean(PREF_NOTIFICATIONS_ASKED, false)) return;
+        prefs.edit().putBoolean(PREF_NOTIFICATIONS_ASKED, true).apply();
+        requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
     }
 
     private void refresh() {
@@ -215,6 +236,8 @@ public class LibraryActivity extends Activity {
         }
         holder.title.setText(r.label);
         holder.details.setText(r.packageName + (r.versionName != null ? " " + r.versionName : "") + "\n" + r.status());
+        final String warning = r.symbolWarning();
+        if (warning != null) holder.details.setText(holder.details.getText() + "\n" + warning);
         return rowView;
     }
 
@@ -248,6 +271,8 @@ public class LibraryActivity extends Activity {
             try {
                 PluginRecord r = PluginStore.importApk(app, uri);
                 success = "Imported " + r.label + " (" + r.status() + ")";
+                final String warning = r.symbolWarning();
+                if (warning != null) success += "\n" + warning;
             } catch (Exception e) {
                 Log.e(TAG, "import failed", e);
                 Diagnostics.report(app, "import failed", e, false);

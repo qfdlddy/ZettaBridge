@@ -21,6 +21,10 @@ struct LibraryRuntimeOptions {
     std::string sysroot;  // host directory with the arm32 system files
     std::uint32_t target_sdk = 0;
     std::vector<std::string> guest_environment;  // guest environment, e.g. LD_LIBRARY_PATH=...
+    // Host directories holding the arm32 libraries the bridge provides (libEGL.so, libGLESv2.so,
+    // libOpenSLES.so, ...). A guest path the sysroot lacks but that names one of these libraries
+    // resolves here (Process::add_library_dir).
+    std::vector<std::string> guest_library_dirs;
     std::string preload;            // guest path dlopen'ed RTLD_GLOBAL before READY; empty: none
     std::chrono::milliseconds ready_timeout{10000};
 };

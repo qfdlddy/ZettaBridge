@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 
+#include "zb/log.h"
 #include "zb/runtime_report.h"
 
 namespace zb {
@@ -155,12 +156,29 @@ bool HostJni::Impl::serve_values(JniCall& call) {
         }
         const JniBackend::Id id = record->id;
         const std::string& shorty = record->shorty;
-        const AudioMethodHook audio_hook = record->audio_hook;
+        const MethodHook hook = record->hook;
         if (!record->name.empty()) jni_note_call_name(record->name);
         // A constructor returns V; NewObject asks for the new object ('L').
         const bool matches = kind == ZB_JNI_CALL_NEW_OBJECT ? shorty[0] == 'V' && type == 'L' : shorty[0] == type;
-        if (!matches) {
-            fatal(env, "CallMethodA: result type %c does not match the method shorty %s", type, shorty.c_str());
+        // A guest built against an older ART may call a method through a different result type than
+        // the method really has: Topsoil's lime layer calls the void setNotification(...) through
+        // CallIntMethodA. Release ART performs no such check - it runs the method and returns
+        // whatever the result register happens to hold - so the call has to succeed here too.
+        // Run it with the real return type and hand the guest a neutral value.
+        const char call_type = (!matches && kind != ZB_JNI_CALL_NEW_OBJECT) ? shorty[0] : type;
+        // A call this bridge answers itself (LegacyNotification) has no real result type to report.
+        if (!matches && hook != MethodHook::LegacyNotification) {
+            static std::atomic<unsigned> mismatches{0};
+            const unsigned seen = mismatches.fetch_add(1) + 1;
+            if (seen <= 8) {
+                log("JNI CallMethodA: %s%s returns %c but the guest asked for %c; calling it as %c",
+                    record->name.c_str(), record->signature.c_str(), shorty[0], type, call_type);
+            }
+            if (seen == 1) {
+                runtime_report().note_jni_detail(
+                    "result-mismatch",
+                    record->name + record->signature + " returns " + shorty[0] + ", asked " + type, true);
+            }
         }
         const JniBackend::Ref obj = ref(2);
         const JniBackend::Ref cls = ref(3);
@@ -177,19 +195,53 @@ bool HostJni::Impl::serve_values(JniCall& call) {
                                 : value_from_bits(letter, bits);
             }
         }
-        if (audio_hook != AudioMethodHook::None && kind != ZB_JNI_CALL_STATIC && obj != 0) {
-            if (!audio_bt_shield_noted.exchange(true, std::memory_order_relaxed)) {
-                runtime_report().note_audio_detail("bt-shield", "active", false);
-            }
-            if (audio_hook == AudioMethodHook::IsBluetoothOn) {
+        const JniBackend::Ref guest_intent = values[2].l;
+        if (hook == MethodHook::LegacyNotification && kind != ZB_JNI_CALL_STATIC && obj != 0) {
+            // The guest's own notification helper cannot run on this platform (see the hook
+            // comment); the launcher builds and posts the notification it was asking for.
+            if (post_legacy_notification(env, obj, values.data())) {
                 call.set64(0);
                 return true;
             }
-            if (audio_hook == AudioMethodHook::DeviceCallbackNoop) {
+        }
+        if (hook == MethodHook::PendingIntentFlags || hook == MethodHook::PendingIntentRelay) {
+            // API 31+ rejects the flags an old guest passes; see fix_pending_intent_flags.
+            fix_pending_intent_flags(env, *record, values.data());
+            if (hook == MethodHook::PendingIntentRelay) {
+                values[2].l = relay_broadcast_intent(env, guest_intent);
+            }
+        } else if (hook == MethodHook::NotificationChannel && kind != ZB_JNI_CALL_STATIC && obj != 0) {
+            prepare_notification(env, obj);
+        }
+        if (hook == MethodHook::IsBluetoothOn || hook == MethodHook::DeviceCallbackNoop ||
+            hook == MethodHook::GetDevices || hook == MethodHook::GetProperty) {
+            if (!audio_bt_shield_noted.exchange(true, std::memory_order_relaxed)) {
+                runtime_report().note_audio_detail("bt-shield", "active", false);
+            }
+            if (hook == MethodHook::IsBluetoothOn) {
+                call.set64(0);
+                return true;
+            }
+            if (hook == MethodHook::DeviceCallbackNoop) {
                 return true;
             }
         }
-        JValue result = backend.call_method(env, static_cast<JniCallKind>(kind), type, obj, cls, id, values.data());
+        if (hook == MethodHook::NotificationNotify && kind != ZB_JNI_CALL_STATIC && obj != 0) {
+            // The channel has to exist before the notification is posted, not when it is built.
+            ensure_notification_channel(env, obj);
+        }
+        JValue result = backend.call_method(env, static_cast<JniCallKind>(kind), call_type, obj, cls, id, values.data());
+        if (values[2].l != guest_intent) backend.delete_local_ref(env, values[2].l);
+        if (!matches) {
+            // The guest's requested type does not describe the real result, so there is nothing
+            // meaningful to hand back. Release ART would leave whatever the result register holds;
+            // a neutral zero is the closest safe answer. A reference the real method produced must
+            // not reach the guest as a fake integer, so drop it rather than intern it.
+            if (call_type == 'L' && result.l != 0) backend.delete_local_ref(env, result.l);
+            if (type == 'L') call.set(0);
+            else if (type != 'V') call.set64(0);
+            return true;
+        }
         if (type == 'L' && result.l == 0 && !backend.exception_check(env)) {
             // A null object where the guest asked for one. The guest usually dereferences it much
             // later and in a different library, so name the method and its signature here (the
@@ -216,9 +268,9 @@ bool HostJni::Impl::serve_values(JniCall& call) {
             }
             note_null_result(what);
         }
-        if (audio_hook == AudioMethodHook::GetDevices && type == 'L' && result.l != 0) {
+        if (hook == MethodHook::GetDevices && type == 'L' && result.l != 0) {
             result.l = backend.filter_bluetooth_audio_devices(env, result.l);
-        } else if (audio_hook == AudioMethodHook::GetProperty && kind != ZB_JNI_CALL_STATIC && obj != 0 &&
+        } else if (hook == MethodHook::GetProperty && kind != ZB_JNI_CALL_STATIC && obj != 0 &&
                    type == 'L' && count == 1 && result.l != 0) {
             result.l = maybe_adjust_audio_property(backend, env, values[0].l, result.l);
         }

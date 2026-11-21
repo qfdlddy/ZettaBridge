@@ -74,6 +74,10 @@ int main(int argc, char** argv) {
     // diagnostics switched on and one diagnosed call to learn the backend: without them it
     // records "no-gl-backend-seen-yet", which is a real device-mode answer, not this test's intent.
     zb::enable_gl_diagnostics();
+    // The visibility diagnostics only run on an OpenGL ES 2.0+ context; they query ES 2.0
+    // entry points that crash a legacy ES 1.1 driver. This test exercises them, so the mock
+    // must answer GL_VERSION as a modern context.
+    backend->set_string(0x1F02 /* GL_VERSION */, "OpenGL ES 3.2");
     // A default context binds framebuffer 0, which is what the presentation sample must see; the
     // mock answers driver queries only from values a test provides.
     backend->set_integer(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, 0);

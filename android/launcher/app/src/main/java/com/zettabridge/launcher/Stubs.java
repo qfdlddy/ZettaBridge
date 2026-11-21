@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.widget.Toast;
 
+import java.util.List;
+
 /**
  * Manifest-declared placeholder activities in :guest, one per launch mode plus fixed
  * orientations. GuestInstrumentation instantiates the plugin activity in their place, so these
@@ -31,6 +33,15 @@ public final class Stubs {
     public static class SingleTop extends Base {}
 
     public static class SingleTask extends Base {}
+    public static class SingleTask2 extends Base {}
+    public static class SingleTask3 extends Base {}
+    public static class SingleTask4 extends Base {}
+
+    // Android reuses a singleTask activity by its manifest component, so guest singleTask
+    // activities that shared one stub would receive each other's intents. Each distinct guest
+    // component gets its own slot for the lifetime of the guest process.
+    static final List<Class<? extends Activity>> SINGLE_TASK =
+            List.of(SingleTask.class, SingleTask2.class, SingleTask3.class, SingleTask4.class);
 
     public static class SingleInstance extends Base {}
 }

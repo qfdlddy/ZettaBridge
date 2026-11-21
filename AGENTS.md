@@ -2007,3 +2007,31 @@ come from the SDK (`<sdk>/cmake/3.22.1/bin`), and Dynarmic requires Boost header
 installed: `build/boost-headers` was filled from the `boost_1_83_0` release archive and
 `-DBoost_INCLUDE_DIR=<repo>/build/boost-headers` is passed to the configure step. `build/` is
 ignored, so neither is a repository artifact.
+
+## 2026-11-21: singleTask guest activities get four manifest slots
+
+A guest that declares two `singleTask` activities used to hand both of them the same
+`Stubs$SingleTask` component. Android reuses a `singleTask` activity **by manifest component**, so
+the second launch landed in the first activity's task with the first activity's intent - the shape
+of the Jelly Jump startup failure on the stable line.
+
+`Stubs` now declares `SingleTask2..4` next to `SingleTask` and exposes them as
+`Stubs.SINGLE_TASK`; all four are real `<activity>` entries in the launcher manifest with
+`launchMode="singleTask"`, `process=":guest"` and the guest task affinity. `GuestRuntime.stubFor`
+keys the slots by `ComponentName(plugin package, activity name)` and assigns one per distinct guest
+component for the lifetime of the guest process. A fifth `singleTask` component logs
+`No singleTask slot for ...; launching as standard` and falls back to `Stubs.Standard`, which
+keeps the old behaviour rather than failing the launch.
+
+`stubFor` therefore takes the `LoadedPlugin` as well; `stubIntent` is its only caller.
+
+Verification: `:app:assembleLauncherRelease` PASS, the signed APK installed over the previous
+build, and `aapt2 dump xmltree` on the **installed** `base.apk` lists all four slots. Punch Quest
+(`com.noodlecake.punchquest`, whose one activity is `launchMode=2`) launches into
+`com.zettabridge.launcher/.Stubs$SingleTask`, keeps drawing (`gl-calls` 20,770 -> 51,310),
+`guest-exit: (none)`, `unimplemented-host-calls: 0`.
+
+`tests/launcher/run_tests.sh` cannot pass on this Windows checkout: `PluginFiles.libraryFileName`
+uses `System.mapLibraryName`, which answers `lime.dll` on the desktop JVM where the test expects
+`liblime.so`. That failure predates this change; the launcher's own Java is compiled by the Gradle
+build instead.

@@ -42,12 +42,14 @@ public class LibraryActivity extends Activity {
     private static final int REQUEST_IMPORT = 1;
     private static final int REQUEST_EXPORT = 2;
     private static final int REQUEST_NOTIFICATIONS = 3;
+    private static final int REQUEST_IMPORT_OBB = 4;
     private static final String PREFS = "zb";
     private static final String PREF_NOTIFICATIONS_ASKED = "notification-permission-asked";
 
     private static final String STATE_EXPORT_RECORD = "zb.export.record";
     private static final String STATE_EXPORT_PACKAGE = "zb.export.package";
     private static final String STATE_EXPORT_LABEL = "zb.export.label";
+    private static final String STATE_OBB_PACKAGE = "zb.obb.package";
 
     private final List<PluginRecord> plugins = new ArrayList<>();
     private BaseAdapter adapter;
@@ -55,6 +57,7 @@ public class LibraryActivity extends Activity {
     private String pendingExportRecordPackage;
     private String pendingExportPackage;
     private String pendingExportLabel;
+    private String pendingObbPackage;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -63,6 +66,7 @@ public class LibraryActivity extends Activity {
             pendingExportRecordPackage = state.getString(STATE_EXPORT_RECORD);
             pendingExportPackage = state.getString(STATE_EXPORT_PACKAGE);
             pendingExportLabel = state.getString(STATE_EXPORT_LABEL);
+            pendingObbPackage = state.getString(STATE_OBB_PACKAGE);
         }
         int pad = dp(16);
         LinearLayout root = new LinearLayout(this);
@@ -129,6 +133,7 @@ public class LibraryActivity extends Activity {
         if (pendingExportRecordPackage != null) outState.putString(STATE_EXPORT_RECORD, pendingExportRecordPackage);
         if (pendingExportPackage != null) outState.putString(STATE_EXPORT_PACKAGE, pendingExportPackage);
         if (pendingExportLabel != null) outState.putString(STATE_EXPORT_LABEL, pendingExportLabel);
+        if (pendingObbPackage != null) outState.putString(STATE_OBB_PACKAGE, pendingObbPackage);
     }
 
     @Override
@@ -257,7 +262,49 @@ public class LibraryActivity extends Activity {
             importApk(data.getData());
         } else if (requestCode == REQUEST_EXPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
             startExport(data.getData());
+        } else if (requestCode == REQUEST_IMPORT_OBB) {
+            // The picker can be cancelled or the activity recreated while it is open, so the
+            // package is restored from saved state and looked up again.
+            PluginRecord record = pendingObbPackage == null ? null : PluginStore.find(this, pendingObbPackage);
+            pendingObbPackage = null;
+            if (record != null && resultCode == RESULT_OK && data != null && data.getData() != null) {
+                importObb(record, data.getData());
+            }
         }
+    }
+
+    private void pickObb(PluginRecord r) {
+        pendingObbPackage = r.packageName;
+        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), REQUEST_IMPORT_OBB);
+    }
+
+    /**
+     * Copies an expansion file next to the plugin's saved game data. The file keeps its own name,
+     * because that name is how the guest's storage APIs find it; PluginFiles refuses one that does
+     * not belong to this package.
+     */
+    private void importObb(PluginRecord r, Uri uri) {
+        // A running guest has the old file open: stop it before the directory changes underneath.
+        stopGuestProcess();
+        final android.content.Context app = getApplicationContext();
+        AlertDialog progress = new AlertDialog.Builder(this).setMessage("Importing OBB...").setCancelable(false).show();
+        new Thread(() -> {
+            String message;
+            try {
+                message = "Imported " + PluginStore.importObb(app, r, uri);
+            } catch (Exception failure) {
+                Log.e(TAG, "OBB import failed", failure);
+                Diagnostics.report(app, "OBB import failed", failure, false);
+                message = "OBB import failed: " + failure.getMessage();
+            }
+            final String shown = message;
+            runOnUiThread(() -> {
+                if (progress.isShowing()) progress.dismiss();
+                if (isFinishing() || isDestroyed()) return;
+                Toast.makeText(this, shown, Toast.LENGTH_LONG).show();
+            });
+        }, "zb-obb-import").start();
     }
 
     private void importApk(Uri uri) {
@@ -329,6 +376,7 @@ public class LibraryActivity extends Activity {
                                         r.unsafeFp ? "Fast FP: on" : "Fast FP (off)",
                                         r.unityMt ? "Unity MT: on" : "Unity MT (off)",
                                         "Export APK",
+                                        "Import OBB",
                                         "Delete"},
                         (dialog, which) -> {
                             if (which == 0) launch(r);
@@ -340,7 +388,8 @@ public class LibraryActivity extends Activity {
                             if (which == 6) toggleUnsafeFp(r);
                             if (which == 7) toggleUnityMt(r);
                             if (which == 8) promptExport(r);
-                            if (which == 9) confirmDelete(r);
+                            if (which == 9) pickObb(r);
+                            if (which == 10) confirmDelete(r);
                         })
                 .show();
     }

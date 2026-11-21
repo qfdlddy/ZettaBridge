@@ -161,6 +161,25 @@ public final class LauncherContractsTest {
             testNamesAndDelegation();
             testExtractionAndMetadata(root);
             testProxy(root);
+            File obb = new File(root, "obb");
+            String obbName = "main.79.com.example.plugin.obb";
+            byte[] obbContents = {1, 2, 3};
+            PluginFiles.importObb(new java.io.ByteArrayInputStream(obbContents), obb,
+                                  "com.example.plugin", obbName);
+            check(java.util.Arrays.equals(obbContents,
+                                          Files.readAllBytes(new File(obb, obbName).toPath())),
+                  "expansion file is copied intact");
+            // A name that Android would never look up is refused, and the refusal must not leave a
+            // half-written or misplaced file behind.
+            for (String invalid : new String[] {"../" + obbName, "main.79.com.other.app.obb"}) {
+                try {
+                    PluginFiles.importObb(new java.io.ByteArrayInputStream(obbContents), obb,
+                                          "com.example.plugin", invalid);
+                    throw new AssertionError("invalid expansion filename accepted");
+                } catch (java.io.IOException expected) {
+                    check(obb.list().length == 1, "invalid expansion import leaves existing data alone");
+                }
+            }
             testDirectoryPublication(root);
         } finally {
             PluginFiles.deleteRecursive(root);

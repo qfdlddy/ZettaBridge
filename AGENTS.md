@@ -2088,3 +2088,38 @@ Device: Topsoil (`com.kneeko.topsoil`) still renders and takes touch with this b
 input through Java, so the NativeActivity input path itself is unexercised by that run; Zombie
 Road Trip and Punch Quest do not use `AInputQueue` at all. The changed path only acts when a guest
 attaches a queue.
+
+## 2026-11-21: expansion files are imported from the library screen
+
+A game whose assets live in an OBB could not be given one: nothing in the launcher ever wrote to
+the directory the guest reads. The library screen's long-press menu now has **Import OBB** next to
+**Export APK**.
+
+- `PluginFiles.importObb(InputStream, File obbDir, String packageName, String name)` accepts only
+  `(main|patch|extras).<versionCode>.<package>.obb` - the name Android itself looks up - rejects
+  path separators and null names, and publishes with the existing `copyAtomic`, so a refused or
+  failed import leaves the previous file untouched.
+- `PluginStore.obbDir(Context, packageName)` is the one definition of where a plugin's expansion
+  files live: `<host getObbDir()>/<plugin package>`. `ensureBundledObb` now uses it too.
+  `PluginStore.importObb(Context, PluginRecord, Uri)` reads the chosen file's display name and
+  copies it there. That is the same path `PluginContext.getObbDir()` answers the guest with, so an
+  imported file is found without a second mapping.
+- `LibraryActivity` keeps the target package in saved state (the picker can be cancelled or the
+  activity recreated), stops the guest process first because it may hold the old file open, and
+  reports failures through a toast and `Diagnostics`.
+
+Device (MuMu, `com.noodlecake.zombieroadtrip`, versionCode 67): choosing
+`main.67.com.other.app.obb` was refused - `zb-errors.txt` records
+`OBB import failed: java.io.IOException: Choose an expansion file for
+com.noodlecake.zombieroadtrip` from `PluginFiles.importObb` - and no directory was created.
+Choosing `main.67.com.noodlecake.zombieroadtrip.obb` produced the toast
+`Imported main.67.com.noodlecake.zombieroadtrip.obb`, and the 17-byte payload is byte-identical at
+`/sdcard/Android/obb/com.zettabridge.launcher/com.noodlecake.zombieroadtrip/`, the directory
+`PluginContext.getObbDir()` returns. Regression on the same build: the game still renders
+(`gl-calls` 114,612 -> 188,969, `guest-exit: (none)`, `unimplemented-host-calls: 0`).
+
+`tests/launcher/LauncherContractsTest` gained the import cases (intact copy, refused `../` name,
+refused foreign package, existing file untouched). On this Windows checkout that suite still stops
+before them in `testNamesAndDelegation`, because `PluginFiles.libraryFileName` only accepts `.so`
+names and a desktop JVM maps `lime` to `lime.dll`; the new block was exercised through a patched
+copy of the same file, and the same calls were also driven directly by a throwaway probe.

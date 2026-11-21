@@ -245,6 +245,36 @@ final class PluginStore {
         PluginFiles.deleteRecursive(r.dir);
     }
 
+    /**
+     * The directory the framework hands a guest for expansion files. A plugin runs inside the
+     * launcher's storage, so its OBBs live under the launcher's own OBB root, in a directory
+     * named after the plugin; PluginContext.getObbDir answers with this same path.
+     */
+    static File obbDir(Context host, String packageName) {
+        File root = host.getObbDir();
+        return root != null ? new File(root, packageName) : null;
+    }
+
+    /**
+     * Copies a user-chosen expansion file for one plugin. The file name decides where Android will
+     * look for it, so it is validated against the plugin's own package rather than trusted.
+     */
+    static String importObb(Context host, PluginRecord record, Uri uri) throws IOException {
+        String name = null;
+        String column = android.provider.OpenableColumns.DISPLAY_NAME;
+        try (android.database.Cursor cursor = host.getContentResolver().query(
+                uri, new String[] {column}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
+        }
+        File target = obbDir(host, record.packageName);
+        if (target == null) throw new IOException("OBB storage is unavailable");
+        try (InputStream in = host.getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("cannot open expansion file");
+            PluginFiles.importObb(in, target, record.packageName, name);
+        }
+        return name;
+    }
+
     private static boolean hasActivity(PackageInfo info, String name) {
         if (info == null || info.activities == null) return false;
         for (ActivityInfo a : info.activities) {
@@ -256,10 +286,9 @@ final class PluginStore {
     /** Extracts a 5play/mod bundled assets/obb payload once if the plugin's OBB directory is empty. */
     static void ensureBundledObb(Context c, PluginRecord r, PackageInfo info) {
         if (r == null || info == null) return;
-        File obbRoot = c.getObbDir();
-        if (obbRoot == null) return;
-        File obbDir = new File(obbRoot, r.packageName);
-        File[] existing = obbDir.listFiles();
+        File dir = obbDir(c, r.packageName);
+        if (dir == null) return;
+        File[] existing = dir.listFiles();
         if (existing != null) {
             for (File f : existing) {
                 if (f.isFile() && f.getName().endsWith(".obb") && f.length() > 0) return;
@@ -270,9 +299,9 @@ final class PluginStore {
         try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(apk)) {
             java.util.zip.ZipEntry entry = zip.getEntry("assets/obb");
             if (entry == null || entry.isDirectory() || entry.getSize() <= 0) return;
-            if (!obbDir.isDirectory() && !obbDir.mkdirs()) return;
+            if (!dir.isDirectory() && !dir.mkdirs()) return;
             String obbName = "patch." + info.getLongVersionCode() + "." + c.getPackageName() + ".obb";
-            File out = new File(obbDir, obbName);
+            File out = new File(dir, obbName);
             if (out.isFile() && out.length() == entry.getSize()) return;
             try (InputStream in = zip.getInputStream(entry)) {
                 PluginFiles.copyAtomic(in, out);

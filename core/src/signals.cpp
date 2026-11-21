@@ -193,6 +193,31 @@ bool Process::deliver_fault(GuestThread& thread, const Stop& stop) {
         thread.regs()[15] = stop.pc;
     } else {
         const bool breakpoint = stop.exception == Dynarmic::A32::Exception::Breakpoint;
+        if (!breakpoint) {
+            // An instruction the translator does not know. The guest often has a handler for it -
+            // Mono turns it into an ExecutionEngineException and aborts much later, far from the
+            // cause - so without this the report says nothing about where it happened. The
+            // instruction word and the caller are what a new decoder entry is written from.
+            static std::atomic<std::uint32_t> undefined_seen{0};
+            const std::uint32_t number = undefined_seen.fetch_add(1) + 1;
+            if (number <= 4) {
+                std::uint32_t word = 0;
+                if (const std::uint8_t* code = mem_.host_ptr(stop.pc, 4, kPageRead)) {
+                    std::memcpy(&word, code, sizeof word);
+                }
+                const std::uint32_t lr = thread.regs()[14];
+                char detail[320];
+                std::snprintf(detail, sizeof detail,
+                              "pc 0x%08x %s bytes %08x%s called from 0x%08x %s", stop.pc,
+                              describe_address(stop.pc).c_str(), word,
+                              (thread.cpsr() & kCpsrThumb) != 0 ? " thumb" : " arm", lr,
+                              describe_address(lr & ~1u).c_str());
+                log("undefined instruction: %s", detail);
+                runtime_report().note_crash_detail("undefined-instruction-" + std::to_string(number),
+                                                   detail);
+            }
+            runtime_report().note_crash_detail("undefined-instructions", std::to_string(number));
+        }
         info.si_signo = breakpoint ? SIGTRAP : SIGILL;
         info.si_code = breakpoint ? static_cast<std::int32_t>(TRAP_BRKPT) : static_cast<std::int32_t>(ILL_ILLOPC);
         info.fields[0] = stop.pc;

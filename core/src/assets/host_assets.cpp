@@ -254,6 +254,15 @@ bool HostAssets::handle_host_call(std::uint32_t index, GuestThread& thread) {
         regs[0] = static_cast<std::uint32_t>(static_cast<std::int32_t>(length));
         return true;
     }
+    case ZB_ASSET_HC_AAsset_getLength64: {
+        // int64_t return in r0:r1. A handle the bridge no longer knows answers -1, as the NDK
+        // does for a null asset; no 32-bit clamp applies here.
+        const std::uint64_t asset = require_asset(regs[0]);
+        const std::uint64_t length = static_cast<std::uint64_t>(asset != 0 ? backend_.length(asset) : -1);
+        regs[0] = static_cast<std::uint32_t>(length);
+        regs[1] = static_cast<std::uint32_t>(length >> 32);
+        return true;
+    }
     case ZB_ASSET_HC_AAsset_read: {
         const std::uint64_t asset = require_asset(regs[0]);
         const std::uint32_t buf_addr = regs[1];

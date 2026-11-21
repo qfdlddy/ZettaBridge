@@ -1,7 +1,7 @@
 // AAsset* host calls against the mock AssetBackend (Phase 5 Task 7): open/getLength/read/close
-// round trip, a missing file, an out-of-bounds buffer, a closed handle, 32-bit
-// AAsset_openFileDescriptor outputs, and that GuestJniEngine chains HostAssets the way it chains
-// HostGl and HostJni.
+// round trip, a missing file, an out-of-bounds buffer, a closed handle, the 64-bit length split,
+// 32-bit AAsset_openFileDescriptor outputs, and that GuestJniEngine chains HostAssets the way it
+// chains HostGl and HostJni.
 #include <sys/mman.h>
 
 #include <cstdint>
@@ -66,6 +66,24 @@ int main() {
     thread.regs()[0] = asset;
     CHECK(assets.handle_host_call(zb::ZB_ASSET_HC_AAsset_getLength, thread));
     CHECK(thread.regs()[0] == std::strlen("hello asset bridge"));
+
+    // AAsset_getLength64 returns an int64_t in r0:r1. A length above INT32_MAX is preserved
+    // here, while the legacy AAsset_getLength call still clamps it to -1.
+    backend->length_override = 0x100000005LL;
+    thread.regs()[0] = asset;
+    CHECK(assets.handle_host_call(zb::ZB_ASSET_HC_AAsset_getLength64, thread));
+    CHECK(thread.regs()[0] == 5);
+    CHECK(thread.regs()[1] == 1);
+    thread.regs()[0] = asset;
+    CHECK(assets.handle_host_call(zb::ZB_ASSET_HC_AAsset_getLength, thread));
+    CHECK(static_cast<std::int32_t>(thread.regs()[0]) == -1);
+    backend->length_override = -1;
+
+    // An unknown handle answers -1 in both halves, matching the NDK's null-asset result.
+    thread.regs()[0] = 0x7FFFFFFFu;
+    CHECK(assets.handle_host_call(zb::ZB_ASSET_HC_AAsset_getLength64, thread));
+    CHECK(thread.regs()[0] == 0xFFFFFFFFu);
+    CHECK(thread.regs()[1] == 0xFFFFFFFFu);
 
     const std::uint32_t buffer_addr = 0x11100;
     thread.regs()[0] = asset;

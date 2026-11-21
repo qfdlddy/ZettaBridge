@@ -32,6 +32,7 @@ public:
     std::int64_t length(std::uint64_t asset) override {
         auto it = open_.find(asset);
         if (it == open_.end()) return -1;
+        if (length_override >= 0) return length_override;
         return static_cast<std::int64_t>(it->second.content.size());
     }
 
@@ -71,6 +72,9 @@ public:
     int fake_fd = 3;
     std::int64_t fake_fd_start = 1000;
     std::int64_t fake_fd_length = 42;
+    // A negative value reports the real content size; otherwise this is what length() answers,
+    // so the 64-bit output split can be tested without materializing a 4 GiB file.
+    std::int64_t length_override = -1;
 
 private:
     struct OpenAsset {

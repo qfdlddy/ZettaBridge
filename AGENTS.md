@@ -1967,3 +1967,43 @@ guarded `setNotification` signature is answered, and anything else keeps ART's b
 This checkout has no host C++ toolchain (no `clang++`/`cmake`/`ninja`/WSL), so the host suite
 cannot run here. The compile gate is the Android arm64 build plus the generators; the functional
 gate is the emulator.
+
+## 2026-11-21: 0.1.1 stable-line backports, part one
+
+Four small fixes were taken from the `0.1.1` stable line (`ZettaBridge-main`) because they cost
+little and each removed a known device-side limit. Nothing here was redesigned.
+
+- **`AAsset_getLength64`.** Host-call index 151 is now served by `HostAssets`. It returns an
+  `int64_t` in `r0:r1` and answers `-1` for a handle the bridge no longer knows.
+  `AndroidAssetBackend::length` calls the real 64-bit NDK function, so an asset or an OBB larger
+  than `INT32_MAX` no longer reaches the driver clamped. The legacy `AAsset_getLength` case keeps
+  its deliberate `-1` clamp and its overflow log.
+- **`RuntimeReport::kMaxNativeCalls` 32 -> 128.** A Unity guest registers about forty natives and
+  used to spill the rest into `(other)`, which hid the call that was actually stuck.
+- **`guest/tests/exclusive_lock_dynamic.c`** (6 threads of LDREX/STREX against a plain store, the
+  shape Mono's test-and-set lock uses) and its expected output, registered in
+  `tools/run_guest_tests.sh`. It exercises the exclusive path the bridge already has; it does not
+  change it.
+- **Launcher `versionCode 2` / `versionName "0.1.1"`**, matching the stable line.
+
+Verification on this machine:
+
+```text
+Android arm64 zbridge + zbproxy                link OK, zbproxy structure check PASS
+tools/build_guest.sh                           PASS, includes exclusive_lock_dynamic
+gen_gles.py / gen_egl.py / gen_jni.py --check   PASS
+check_gles1_hostcalls.py                       87 names, 492-578
+Gradle :app:assembleLauncherRelease            PASS, signed with the debug key
+```
+
+The signed APK installed over `0.1.0` (same debug key) and Zombie Road Trip
+(`com.noodlecake.zombieroadtrip`) still renders: `gl-calls` rose past 390k while the app was in the
+foreground, `guest-exit: (none)`, `unimplemented-host-calls: 0`, `gl-first-error: (none)`,
+`proxy-loads: 17`, `registered-natives: 24`. The host suite and `run_guest_tests.sh` cannot run
+here (no host toolchain, no `zbrun`), so the new guest case is compiled but not executed locally.
+
+Building the Android core here needs two things `CLAUDE.md` assumes are in place. CMake and Ninja
+come from the SDK (`<sdk>/cmake/3.22.1/bin`), and Dynarmic requires Boost headers, which are not
+installed: `build/boost-headers` was filled from the `boost_1_83_0` release archive and
+`-DBoost_INCLUDE_DIR=<repo>/build/boost-headers` is passed to the configure step. `build/` is
+ignored, so neither is a repository artifact.

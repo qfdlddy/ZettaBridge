@@ -91,21 +91,50 @@ void HostInput::report_queue_state() {
 
 std::optional<HostInput::Ready> HostInput::ready_on(std::uint64_t real_looper) {
     if (real_looper == 0) return std::nullopt;
-    std::vector<std::pair<std::uint32_t, Attachment>> candidates;
+    std::vector<std::uint32_t> candidates;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [handle, attachment] : attachments_) {
-            if (attachment.real_looper == real_looper) candidates.emplace_back(handle, attachment);
+        for (const auto& [handle, loopers] : attachments_) {
+            const auto entry = loopers.find(real_looper);
+            if (entry != loopers.end() && !entry->second.announced) candidates.push_back(handle);
         }
     }
     // The backend is asked outside the lock: it is the platform, and nothing guest-facing should
     // wait on this unit's own mutex.
-    for (const auto& [handle, attachment] : candidates) {
+    for (const auto handle : candidates) {
         void* queue = queue_for(handle);
         if (queue == nullptr) continue;
-        if (backend_.queue_has_events(queue) > 0) return Ready{attachment.ident, attachment.data};
+        if (backend_.queue_has_events(queue) <= 0) continue;
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto queue_entry = attachments_.find(handle);
+        if (queue_entry == attachments_.end()) continue;
+        const auto entry = queue_entry->second.find(real_looper);
+        if (entry == queue_entry->second.end() || entry->second.announced) continue;
+        Attachment& attachment = entry->second;
+        attachment.announced = true;
+        return Ready{attachment.ident, attachment.data};
     }
     return std::nullopt;
+}
+
+bool HostInput::accept_platform_ready(std::uint64_t real_looper, std::int32_t ident,
+                                      std::uint32_t data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Attachment* match = nullptr;
+    for (auto& entry : attachments_) {
+        const auto found = entry.second.find(real_looper);
+        if (found == entry.second.end() || found->second.ident != ident ||
+            found->second.data != data) {
+            continue;
+        }
+        // Without a unique match, let the guest handle the platform result as usual.
+        if (match != nullptr) return true;
+        match = &found->second;
+    }
+    if (match == nullptr) return true;
+    if (match->announced) return false;
+    match->announced = true;
+    return true;
 }
 
 bool HostInput::reject(const char* function, std::uint32_t handle) {
@@ -151,10 +180,21 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
             std::lock_guard<std::mutex> lock(mutex_);
             live_events_[handle] = bad;
             ++events_gotten_;
+            // The guest just took an event, so this queue may announce itself again.
+            const auto attachment = attachments_.find(bad);
+            if (attachment != attachments_.end()) {
+                for (auto& entry : attachment->second) entry.second.announced = false;
+            }
         }
         std::memcpy(out, &handle, sizeof handle);
         regs[0] = static_cast<std::uint32_t>(status);
-        if (event != nullptr) report_queue_state();
+        if (event != nullptr) {
+            report_queue_state();
+        } else {
+            // How often the guest asked and there was nothing left, which is the shape of a
+            // polling loop that never blocks.
+            runtime_report().note_jni_detail("input-get-empty", std::to_string(status), false);
+        }
         return true;
     }
     case ZB_INPUT_HC_AInputQueue_preDispatchEvent: {
@@ -238,11 +278,13 @@ bool HostInput::handle_host_call(std::uint32_t index, GuestThread& thread) {
                                      reinterpret_cast<void*>(static_cast<std::uintptr_t>(guest_data)), real_looper);
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            attachments_[queue_handle] = Attachment{real_looper, static_cast<std::int32_t>(regs[2]), guest_data};
+            attachments_[queue_handle].try_emplace(
+                real_looper, Attachment{static_cast<std::int32_t>(regs[2]), guest_data});
         }
-        char detail[160];
-        std::snprintf(detail, sizeof detail, "ident %u looper 0x%08x owner-tid %d caller-tid %d%s",
-                      regs[2], regs[1], looper_owner_ ? looper_owner_(regs[1]) : 0, thread.tid,
+        char detail[192];
+        std::snprintf(detail, sizeof detail,
+                      "ident %u looper 0x%08x owner-tid %d caller-tid %d data 0x%08x%s", regs[2],
+                      regs[1], looper_owner_ ? looper_owner_(regs[1]) : 0, thread.tid, guest_data,
                       real_looper != 0 ? "" : " (no real looper)");
         runtime_report().note_jni_detail("input-attach", detail, true);
         regs[0] = 0;

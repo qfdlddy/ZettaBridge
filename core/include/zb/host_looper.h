@@ -43,6 +43,12 @@ public:
     };
     using InputProbe = std::function<std::optional<InputReady>(std::uint64_t real_looper)>;
     void set_input_probe(InputProbe probe);
+    // Filters a readiness the real looper itself reported, so the same input queue is not
+    // presented to the guest on every poll while its descriptor stays readable. False means
+    // "reported already": the poll answers a wake and the guest takes the event.
+    using PlatformInputFilter =
+        std::function<bool(std::uint64_t real_looper, std::int32_t ident, std::uint32_t data)>;
+    void set_platform_input_filter(PlatformInputFilter filter);
 
     // The guest tid that owns a guest looper handle, or 0. The attach records it: a queue
     // attached to a looper nobody polls never delivers, and which thread owns what is the first

@@ -2063,3 +2063,28 @@ staying at exactly 1 across samples rather than climbing, which is the guard pai
 `unimplemented-host-calls: 0`, and `gl-calls` rose 166,401 -> 222,790 during the sampling.
 
 `watch-render:` is not exercised by a healthy run and stays unproven until a real freeze.
+
+## 2026-11-21: one input readiness is presented once
+
+A Unity guest polls its input queue in a loop. The queue's descriptor stays readable until an
+event is taken, so every poll answered "your ident is ready" even when the guest had just taken
+the event: the device report showed 124583 idents against 903 events taken, with the game hung and
+its audio thread still running.
+
+- `HostInput::attachments_` is now keyed by queue *and* real looper, because Android can attach
+  one queue to several loopers.
+- An `Attachment` carries `announced`: `ready_on` sets it when it reports a queue, and
+  `AInputQueue_getEvent` clears it for every looper that queue is attached to. A queue already
+  announced is skipped, so the probe has nothing to say.
+- `HostInput::accept_platform_ready` filters what the *real* looper reported before the guest sees
+  it. A second identical readiness returns false and `HostLooper` answers a wake instead, which
+  sends the guest back to its own loop to take the event. A readiness the unit does not own is
+  left alone.
+- `HostInput` reports `jni-input-get-empty:` with the platform status the first time the guest asks
+  an empty queue for an event, which is the signature of a poll loop that never blocks.
+
+Device: Topsoil (`com.kneeko.topsoil`) still renders and takes touch with this build (`gl-calls`
+446k -> 512k, `egl-swaps` 707, `guest-exit: (none)`, `unimplemented-host-calls: 0`). It delivers
+input through Java, so the NativeActivity input path itself is unexercised by that run; Zombie
+Road Trip and Punch Quest do not use `AInputQueue` at all. The changed path only acts when a guest
+attaches a queue.

@@ -131,6 +131,7 @@ struct HostLooper::Impl {
     };
 
     InputProbe input_probe;
+    PlatformInputFilter platform_input_filter;
 
     Impl(LibraryRuntime& runtime_, AndroidLooperBackend* backend_, GuestInvoker invoker_,
          BorrowerProbe borrower_probe_)
@@ -717,6 +718,14 @@ struct HostLooper::Impl {
             int ready_events = 0;
             void* ready_data = nullptr;
             int result = backend->poll_once(timeout, &ready_fd, &ready_events, &ready_data);
+            if (result >= 0 && platform_input_filter &&
+                !platform_input_filter(backend->for_thread(), result,
+                                       static_cast<std::uint32_t>(
+                                           reinterpret_cast<std::uintptr_t>(ready_data)))) {
+                // The queue's descriptor stays readable until an event is taken. Return to the
+                // guest loop instead of presenting the same input readiness indefinitely.
+                return finish(kPollWake);
+            }
             if (result < 0 && input_probe) {
                 // A wake-up with an input queue holding events is that queue reporting itself.
                 std::uint64_t real = 0;
@@ -873,6 +882,10 @@ std::int32_t HostLooper::owner_of(std::uint32_t looper_handle) {
 
 void HostLooper::set_input_probe(InputProbe probe) {
     impl_->input_probe = std::move(probe);
+}
+
+void HostLooper::set_platform_input_filter(PlatformInputFilter filter) {
+    impl_->platform_input_filter = std::move(filter);
 }
 
 bool HostLooper::ensure_real_looper(GuestThread& thread, std::uint32_t looper_handle, std::uint64_t& real) {

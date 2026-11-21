@@ -61,6 +61,9 @@ int main() {
     std::uint32_t handle = 0;
     std::memcpy(&handle, runtime.memory().base() + kData, sizeof handle);
     CHECK(handle == 0);
+    // An empty poll is what a guest that never blocks on its queue looks like, so the first one
+    // is in the report with the platform's own status.
+    CHECK(zb::runtime_report().text().find("jni-input-get-empty: -1") != std::string::npos);
 
     // A queued event arrives as a handle written through the guest's own pointer.
     backend.queue_event({2 /* motion */, 11, 2.5f, 0x0000'0007'0000'0009LL});
@@ -126,6 +129,23 @@ int main() {
     const auto ready = input.ready_on(0x5100);
     CHECK(ready.has_value() && ready->ident == 42 && ready->data == 0xCAFE);
     CHECK(!input.ready_on(0x9999).has_value());
+    // One readiness is presented once. A queue's descriptor stays readable until an event is
+    // taken, so answering every poll reported 124583 idents against 903 events taken on the
+    // device, with the game hung while its audio thread kept running.
+    CHECK(!input.ready_on(0x5100).has_value());
+    // A platform ident for a queue already announced becomes a wake, so the guest returns to its
+    // own loop and takes the event instead of being handed the same readiness again.
+    CHECK(!input.accept_platform_ready(0x5100, 42, 0xCAFE));
+    // Taking the event clears both announcements, so the next readiness is news again.
+    CHECK(call_input(input, thread, zb::ZB_INPUT_HC_AInputQueue_getEvent, {queue, kData}) == 0);
+    std::memcpy(&handle, runtime.memory().base() + kData, sizeof handle);
+    CHECK(handle != 0);
+    CHECK(input.accept_platform_ready(0x5100, 42, 0xCAFE));
+    CHECK(!input.accept_platform_ready(0x5100, 42, 0xCAFE));
+    // A readiness this unit does not own is left to the guest's own handling.
+    CHECK(input.accept_platform_ready(0x5100, 77, 0xCAFE));
+    CHECK(input.accept_platform_ready(0x9999, 42, 0xCAFE));
+    CHECK(call_input(input, thread, zb::ZB_INPUT_HC_AInputQueue_finishEvent, {queue, handle, 1}) == 0);
 
     CHECK(call_input(input, thread, zb::ZB_INPUT_HC_AInputQueue_detachLooper, {queue}) == 0);
     CHECK(!backend.attached);
